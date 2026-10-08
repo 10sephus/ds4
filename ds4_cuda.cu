@@ -6795,9 +6795,10 @@ __global__ static void matmul_q8_0_mma_exact_kernel(
         uint64_t out_dim,
         uint64_t n_tok,
         uint64_t blocks,
+        uint64_t w_stride_blocks,
         uint64_t a_stride_blocks, /* activation row stride in blocks (>= blocks) */
         uint64_t out_stride) {    /* output token stride in floats (>= out_dim) */
-    w += (uint64_t)blockIdx.z * out_dim * blocks * 34u;
+    w += (uint64_t)blockIdx.z * out_dim * w_stride_blocks * 34u;
     xq += (uint64_t)blockIdx.z * blocks * 32u;
     xscale += (uint64_t)blockIdx.z * blocks;
     out += (uint64_t)blockIdx.z * out_dim;
@@ -6821,7 +6822,7 @@ __global__ static void matmul_q8_0_mma_exact_kernel(
         const uint32_t b = idx - rl * (uint32_t)blocks;
         uint64_t row = row_base + rl;
         if (row >= out_dim) row = out_dim - 1u;
-        sh_ws[rl * ws_pitch + b] = *(const __half *)(w + row * blocks * 34u + (uint64_t)b * 34u);
+        sh_ws[rl * ws_pitch + b] = *(const __half *)(w + row * w_stride_blocks * 34u + (uint64_t)b * 34u);
     }
     for (uint32_t idx = threadIdx.x; idx < 16u * (uint32_t)blocks; idx += blockDim.x) {
         const uint32_t tl = idx / (uint32_t)blocks;
@@ -6847,7 +6848,7 @@ __global__ static void matmul_q8_0_mma_exact_kernel(
     /* B source row for loads: row lane>>2 within the warp tile */
     uint64_t b_row = row0 + (lane >> 2u);
     if (b_row >= out_dim) b_row = out_dim - 1u;
-    const unsigned char *b_wr = w + b_row * blocks * 34u;
+    const unsigned char *b_wr = w + b_row * w_stride_blocks * 34u;
 
     /* per-element (4) x per-(j&3) accumulators */
     float acc00 = 0.0f, acc01 = 0.0f, acc02 = 0.0f, acc03 = 0.0f;
@@ -6984,11 +6985,14 @@ static int cuda_q8_mma_try_launch(
         uint64_t a_stride_blocks,
         uint64_t out_stride,
         uint32_t T,
-        uint32_t groups = 1) {
+        uint32_t groups = 1,
+        uint64_t w_stride_blocks = 0) {
     static int disabled = -1;
     if (disabled < 0) disabled = getenv("DS4_CUDA_NO_Q8_MMA") != NULL ? 1 : 0;
     if (disabled || !cuda_q4_mma_ok()) return 0;
     if ((in_dim & 31u) != 0u || blocks > 256u || n_tok < 8u) return 0;
+    if (!w_stride_blocks) w_stride_blocks = blocks;
+    if (w_stride_blocks < blocks) return 0;
     if (((uintptr_t)w & 1u) || ((uintptr_t)xq & 3u) || ((uintptr_t)xscale & 3u)) return 0;
     const size_t shmem = (size_t)(64u * (blocks + 2u) * 2u + 16u * (blocks + 1u) * 4u);
     int dev = 0;
@@ -7021,7 +7025,7 @@ static int cuda_q8_mma_try_launch(
         } \
         matmul_q8_0_mma_exact_kernel<TT><<<grid, 256, shmem>>>( \
                 out, w, xq, xscale, in_dim, out_dim, n_tok, blocks, \
-                a_stride_blocks, out_stride); \
+                w_stride_blocks, a_stride_blocks, out_stride); \
     } while (0)
     if (T == 32u) DS4_Q8_MMA_LAUNCH(32u);
     else if (T == 64u) DS4_Q8_MMA_LAUNCH(64u);
@@ -16832,6 +16836,14 @@ extern "C" int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
             in_count,
             slice_blocks);
     if (!cuda_ok(cudaGetLastError(), "matmul_q8_0_kslice quantize launch")) return 0;
+    /* Keep the scalar block reductions while sharing each weight tile across
+     * prefill rows. The selected K slice retains the full matrix row stride. */
+    if (use_dp4a && cuda_decode_stream() == 0) {
+        const int mma = cuda_q8_mma_try_launch((float *)out->ptr,
+            wptr + block_start * 34u, xq, xscale, in_count, out_dim,
+            n_tok, slice_blocks, slice_blocks, out_dim, 32u, 1u, full_blocks);
+        if (mma != 0) return mma > 0;
+    }
     if (ds4_gpu_device_is_spark() && use_dp4a && n_tok >= 2u && n_tok <= 6u &&
         ((uintptr_t)xq & 15u) == 0u) {
         cuda_grouped_q8_short_launch((float *)out->ptr, wptr + block_start * 34u,
