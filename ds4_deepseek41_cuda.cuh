@@ -12,6 +12,50 @@ __device__ static float dsv41_bf16(float x) {
     return __uint_as_float(bits & 0xffff0000u);
 }
 
+extern "C" int ds4_gpu_dsv41_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const void *map, uint64_t size, uint64_t offset,
+        uint32_t width, uint32_t rows, float eps) {
+    const uint64_t count = (uint64_t)width * rows;
+    if (!map || !width || !rows || !dsv41_has_floats(out, count) ||
+        !dsv41_has_floats(x, count) || offset > size ||
+        (uint64_t)width * 4u > size - offset) return 0;
+    const float *w = (const float *)cuda_resolve_weight_ptr(map, offset,
+        (uint64_t)width * 4u, ds4_tensor_device_idx(out), "V4.1 norm");
+    if (!w) return 0;
+    rms_norm_weight_kernel<true><<<rows, 256, 0, cuda_decode_stream()>>>(
+        (float *)out->ptr, (const float *)x->ptr, w, width, rows, eps);
+    return cuda_ok(cudaGetLastError(), "V4.1 BF16 norm");
+}
+
+extern "C" int ds4_gpu_dsv41_hc_sum(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *weights, uint32_t width, uint32_t rows,
+        uint32_t weight_stride) {
+    const uint64_t count = (uint64_t)width * rows;
+    if (!width || !rows || (weight_stride != 4 && weight_stride != 24) ||
+        (count + 255u) / 256u > INT32_MAX || !dsv41_has_floats(out, count) ||
+        !dsv41_has_floats(x, count * 4u) ||
+        !dsv41_has_floats(weights, (uint64_t)(rows - 1u) * weight_stride + 4u)) return 0;
+    hc_weighted_sum_kernel<true><<<(count + 255u) / 256u, 256, 0, cuda_decode_stream()>>>(
+        (float *)out->ptr, (const float *)x->ptr, (const float *)weights->ptr,
+        width, 4u, rows, weight_stride);
+    return cuda_ok(cudaGetLastError(), "V4.1 BF16 HC sum");
+}
+
+extern "C" int ds4_gpu_dsv41_hc_expand(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
+        const ds4_gpu_tensor *residual, const ds4_gpu_tensor *split,
+        uint32_t width, uint32_t rows) {
+    const uint64_t count = (uint64_t)width * rows;
+    if (!width || !rows || count > (uint64_t)INT32_MAX * 64u ||
+        !dsv41_has_floats(out, count * 4u) || !dsv41_has_floats(residual, count * 4u) ||
+        !dsv41_has_floats(block, count) || !dsv41_has_floats(split, (uint64_t)rows * 24u)) return 0;
+    const float *sp = (const float *)split->ptr;
+    hc_expand_kernel<true><<<(count * 4u + 255u) / 256u, 256, 0, cuda_decode_stream()>>>(
+        (float *)out->ptr, (const float *)block->ptr, NULL, NULL,
+        (const float *)residual->ptr, sp + 4u, sp + 8u,
+        width, 4u, rows, 24u, 24u, 0, 0);
+    return cuda_ok(cudaGetLastError(), "V4.1 BF16 HC expansion");
+}
+
 __device__ static float dsv41_pow2_ceil(float x) {
     const uint32_t bits = __float_as_uint(x);
     return __uint_as_float((bits & 0x7f800000u) +

@@ -7398,6 +7398,9 @@ __global__ static void rms_norm_plain_f16_batch8_kernel(
     }
 }
 
+__device__ static float dsv41_bf16(float x);
+
+template <bool BF16 = false>
 __global__ static void rms_norm_weight_kernel(float *out, const float *x, const float *w, uint32_t n, uint32_t rows, float eps) {
     uint32_t row = blockIdx.x;
     if (row >= rows) return;
@@ -7412,7 +7415,8 @@ __global__ static void rms_norm_weight_kernel(float *out, const float *x, const 
     sum = block_sum_f32_256(sum, partial);
     float scale = rsqrtf(sum / (float)n + eps);
     for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
-        orow[i] = xr[i] * scale * w[i];
+        const float value = xr[i] * scale * w[i];
+        orow[i] = BF16 ? dsv41_bf16(value) : value;
     }
 }
 
@@ -12886,6 +12890,7 @@ __global__ static void hc_split_sinkhorn_kernel(float *out, const float *mix, co
     hc4_split_one(out + (uint64_t)row * 24, mix + (uint64_t)row * 24, scale, base, sinkhorn_iters, epsv);
 }
 
+template <bool BF16 = false>
 __global__ static void hc_weighted_sum_kernel(float *out, const float *x, const float *w, uint32_t n_embd, uint32_t n_hc, uint32_t n_tokens, uint32_t weight_stride_f32) {
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)n_embd * n_tokens;
@@ -12897,9 +12902,10 @@ __global__ static void hc_weighted_sum_kernel(float *out, const float *x, const 
         acc += x[(uint64_t)t * n_hc * n_embd + (uint64_t)h * n_embd + d] *
                w[(uint64_t)t * weight_stride_f32 + h];
     }
-    out[(uint64_t)t * n_embd + d] = acc;
+    out[(uint64_t)t * n_embd + d] = BF16 ? dsv41_bf16(acc) : acc;
 }
 
+template <bool BF16 = false>
 __global__ static void hc_expand_kernel(
         float *out_hc,
         const float *block_out,
@@ -12935,7 +12941,8 @@ __global__ static void hc_expand_kernel(
         float res_v = residual_hc[(uint64_t)t * n_hc * n_embd + (uint64_t)src_hc * n_embd + d];
         acc += comb_v * res_v;
     }
-    out_hc[(uint64_t)t * n_hc * n_embd + (uint64_t)dst_hc * n_embd + d] = acc;
+    out_hc[(uint64_t)t * n_hc * n_embd + (uint64_t)dst_hc * n_embd + d] =
+        BF16 ? dsv41_bf16(acc) : acc;
 }
 
 __global__ static void hc_split_weighted_sum_fused_kernel(
