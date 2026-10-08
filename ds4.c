@@ -42904,6 +42904,13 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
         }
         if (ok) ok = ds41_before_attention_batch(g, &active, model, l, il, rows) &&
             ds41_attention_project_batch(g, model, l, rows);
+        bool batch_output = false;
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        batch_output = g->tp_world == 2 && ds4_gpu_device_is_spark() &&
+            l->attn_output_a->type == DS4_TENSOR_Q8_0 &&
+            l->attn_output_b->type == DS4_TENSOR_Q8_0 &&
+            !getenv("DS4_CUDA_DISABLE_V41_BATCH_OUTPUT");
+#endif
         for (int i = 0; ok && i < count; i++) {
             ds41_gpu_graph row = *graphs[i];
             row.pos = positions[i];
@@ -42913,8 +42920,14 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
             row.q = queries[i];
             row.heads = heads[i];
             ok = ds41_attention(&row, model, l, il, true) &&
-                ds41_attention_output(&row, model, l);
+                (batch_output || ds41_attention_output(&row, model, l));
         }
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        if (ok && batch_output)
+            ok = ds4_gpu_dsv41_attention_output_tp_batch(active.block, active.low,
+                model->map, model->size, l->attn_output_a->abs_offset,
+                l->attn_output_b->abs_offset, g->batch.heads, rows, g->tp_rank);
+#endif
         if (ok) ok = ds41_sum_partial_batch(g, active.block, il, rows);
         if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
             ds41_after_attention_batch(&active, model, l, rows) &&
