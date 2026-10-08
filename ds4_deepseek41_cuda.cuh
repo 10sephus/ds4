@@ -119,10 +119,14 @@ __global__ static void dsv41_shared_gate_up_kernel(
         float *gate, float *up, float *mid,
         const unsigned char *wg, const unsigned char *wu,
         const int8_t *xq, const float *xs,
-        uint32_t blocks, uint32_t hidden, float clamp, int dp4a) {
+        uint32_t blocks, uint32_t hidden, float clamp, int dp4a, const int *enabled) {
     const uint32_t row = blockIdx.x * 8u + threadIdx.x / 32u;
     const uint32_t lane = threadIdx.x & 31u;
     if (row >= hidden) return;
+    if (enabled && !*enabled) {
+        if (lane == 0) mid[row] = 0.0f;
+        return;
+    }
     float g = 0, u = 0;
     for (uint32_t b = lane; b < blocks; b += 32u) {
         const uint64_t off = ((uint64_t)row * blocks + b) * 34u;
@@ -146,10 +150,15 @@ __global__ static void dsv41_shared_gate_up_kernel(
 }
 
 __global__ static void dsv41_shared_down_kernel(float *out, const unsigned char *w,
-        const int8_t *xq, const float *xs, uint32_t blocks, uint32_t width, int dp4a) {
+        const int8_t *xq, const float *xs, uint32_t blocks, uint32_t width, int dp4a,
+        const int *enabled) {
     const uint32_t row = blockIdx.x * 8u + threadIdx.x / 32u;
     const uint32_t lane = threadIdx.x & 31u;
     if (row >= width) return;
+    if (enabled && !*enabled) {
+        if (lane == 0) out[row] = 0.0f;
+        return;
+    }
     float sum = 0;
     for (uint32_t b = lane; b < blocks; b += 32u) {
         const uint64_t off = ((uint64_t)row * blocks + b) * 34u;
@@ -163,7 +172,8 @@ __global__ static void dsv41_shared_down_kernel(float *out, const unsigned char 
 static bool dsv41_shared_fused(ds4_gpu_tensor *out, ds4_gpu_tensor *gate,
         ds4_gpu_tensor *up, ds4_gpu_tensor *mid, const ds4_gpu_tensor *x,
         const void *map, uint64_t size, uint64_t gate_off, uint64_t up_off,
-        uint64_t down_off, uint32_t width, uint32_t hidden, float clamp) {
+        uint64_t down_off, uint32_t width, uint32_t hidden, float clamp,
+        const int *enabled) {
     const uint64_t gu_bytes = (uint64_t)hidden * (width / 32u) * 34u;
     const uint64_t down_bytes = (uint64_t)width * (hidden / 32u) * 34u;
     if (!map || gate_off > size || gu_bytes > size - gate_off ||
@@ -181,12 +191,47 @@ static bool dsv41_shared_fused(ds4_gpu_tensor *out, ds4_gpu_tensor *gate,
         xq, xs, (const float *)x->ptr, width, width / 32u);
     dsv41_shared_gate_up_kernel<<<(hidden + 7u) / 8u, 256, 0, stream>>>(
         (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
-        wg, wu, xq, xs, width / 32u, hidden, clamp, dp4a);
+        wg, wu, xq, xs, width / 32u, hidden, clamp, dp4a, enabled);
     quantize_q8_0_f32_kernel<<<hidden / 32u, 32, 0, stream>>>(
         xq, xs, (const float *)mid->ptr, hidden, hidden / 32u);
     dsv41_shared_down_kernel<<<(width + 7u) / 8u, 256, 0, stream>>>(
-        (float *)out->ptr, wd, xq, xs, hidden / 32u, width, dp4a);
+        (float *)out->ptr, wd, xq, xs, hidden / 32u, width, dp4a, enabled);
     return cuda_ok(cudaGetLastError(), "V4.1 fused shared expert");
+}
+
+__device__ static uint32_t dsv41_shared_owner(const int32_t *selected,
+        uint32_t experts, uint32_t active, uint32_t tie) {
+    uint32_t left = 0;
+    for (uint32_t i = 0; i < active; i++) left += (uint32_t)selected[i] < experts / 2u;
+    return left * 2u == active ? tie : left * 2u < active ? 0u : 1u;
+}
+
+__global__ static void dsv41_shared_owner_kernel(int *enabled, const int32_t *selected,
+        uint32_t experts, uint32_t active, uint32_t rank, uint32_t tie) {
+    *enabled = rank == dsv41_shared_owner(selected, experts, active, tie);
+}
+
+__global__ static void dsv41_shared_mask_kernel(float *shared, const int32_t *selected,
+        uint32_t width, uint32_t experts, uint32_t active, uint32_t rank, uint32_t tie) {
+    const uint32_t row = blockIdx.x;
+    __shared__ bool enabled;
+    if (!threadIdx.x) enabled = rank == dsv41_shared_owner(selected + row * active, experts, active, tie);
+    __syncthreads();
+    if (!enabled) for (uint32_t i = threadIdx.x; i < width; i += blockDim.x)
+        shared[(uint64_t)row * width + i] = 0.0f;
+}
+
+extern "C" int ds4_gpu_dsv41_shared_mask(ds4_gpu_tensor *shared, const ds4_gpu_tensor *selected,
+        uint32_t width, uint32_t rows, uint32_t experts, uint32_t active,
+        uint32_t rank, uint32_t tie_owner) {
+    if (!width || !rows || rows > 8u || !experts || experts % 2u ||
+        !active || active > experts || rank > 1u || tie_owner > 1u ||
+        !dsv41_has_floats(shared, (uint64_t)width * rows) ||
+        !dsv41_has_floats(selected, (uint64_t)active * rows)) return 0;
+    dsv41_shared_mask_kernel<<<rows, 256, 0, cuda_decode_stream()>>>(
+        (float *)shared->ptr, (const int32_t *)selected->ptr,
+        width, experts, active, rank, tie_owner);
+    return cuda_ok(cudaGetLastError(), "V4.1 batched shared owner");
 }
 
 extern "C" int ds4_gpu_dsv41_shared_start(
@@ -194,24 +239,39 @@ extern "C" int ds4_gpu_dsv41_shared_start(
         ds4_gpu_tensor *mid, const ds4_gpu_tensor *x,
         const void *model_map, uint64_t model_size,
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
-        uint32_t width, uint32_t hidden, float clamp) {
+        uint32_t width, uint32_t hidden, float clamp,
+        const ds4_v41_shared_owner *owner) {
     if (!ds4_gpu_device_is_spark()) return 0;
     if (g_dsv41_shared.active || g_dsv41_shared.pending || !width || !hidden ||
         !dsv41_has_floats(x, width) || !dsv41_has_floats(out, width) ||
         !dsv41_has_floats(gate, hidden) || !dsv41_has_floats(up, hidden) ||
         !dsv41_has_floats(mid, hidden)) return -1;
     const uint64_t blocks = ((uint64_t)std::max(width, hidden) + 31u) / 32u;
-    if (blocks * 36u > CUDA_DSV41_SHARED_SCRATCH ||
+    if (owner && (!owner->experts || owner->experts % 2u || !owner->active ||
+        owner->active > owner->experts || owner->rank > 1u || owner->tie_owner > 1u ||
+        !dsv41_has_floats(owner->selected, owner->active))) return -1;
+    if (blocks * 36u > CUDA_DSV41_SHARED_SCRATCH - sizeof(int) ||
         !cuda_dsv41_shared_prepare()) return 0;
     const cudaStream_t main = cuda_decode_stream();
+    const bool fused = width % 32u == 0 && hidden % 32u == 0 &&
+        !getenv("DS4_CUDA_DISABLE_V41_SHARED_FUSION");
+    if (owner && !fused) return 0;
+    int *enabled = owner ? (int *)((char *)g_dsv41_shared.scratch +
+                                  CUDA_DSV41_SHARED_SCRATCH - sizeof(int)) : NULL;
+    /* Decide before the owned-expert filter mutates selected on the main
+     * stream. The ready event publishes this decision to the side stream. */
+    if (owner) {
+        dsv41_shared_owner_kernel<<<1, 1, 0, main>>>(enabled,
+            (const int32_t *)owner->selected->ptr, owner->experts, owner->active,
+            owner->rank, owner->tie_owner);
+        if (!cuda_ok(cudaGetLastError(), "V4.1 shared expert owner")) return -1;
+    }
     if (!cuda_ok(cudaEventRecord(g_dsv41_shared.ready, main), "shared expert ready") ||
         !cuda_ok(cudaStreamWaitEvent(g_dsv41_shared.stream, g_dsv41_shared.ready, 0),
                  "shared expert input wait")) return -1;
     g_dsv41_shared.active = true;
-    const bool fused = width % 32u == 0 && hidden % 32u == 0 &&
-        !getenv("DS4_CUDA_DISABLE_V41_SHARED_FUSION");
     const bool ok = fused ? dsv41_shared_fused(out, gate, up, mid, x, model_map,
-        model_size, gate_offset, up_offset, down_offset, width, hidden, clamp) :
+        model_size, gate_offset, up_offset, down_offset, width, hidden, clamp, enabled) :
         ds4_gpu_matmul_q8_0_tensor(gate, model_map, model_size,
                                    gate_offset, width, hidden, x, 1) &&
         ds4_gpu_dsv41_quantize(gate, hidden, 1, DS4_V41_BF16) &&

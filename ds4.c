@@ -41518,6 +41518,24 @@ static bool ds41_attention(ds41_gpu_graph *g, const ds4_model *m,
            ds41_bf16(g->block, DS4_N_EMBD);
 }
 
+static bool ds41_shared_balance_enabled(void) {
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    return ds4_gpu_device_is_spark() &&
+        !getenv("DS4_CUDA_DISABLE_V41_SHARED_BALANCE") &&
+        !getenv("DS4_CUDA_DISABLE_V41_SHARED_FUSION");
+#else
+    return false;
+#endif
+}
+
+static bool ds41_balance_shared(const ds41_gpu_graph *g, const ds4_layer_weights *l,
+                                uint32_t count) {
+    return g->tp_world == 2 && count <= DS4_TP_BATCH_MAX_ROWS &&
+        l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 &&
+        l->ffn_up_shexp->type == DS4_TENSOR_Q8_0 &&
+        l->ffn_down_shexp->type == DS4_TENSOR_Q8_0 && ds41_shared_balance_enabled();
+}
+
 static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
                      const ds4_layer_weights *l, uint32_t il, uint32_t token) {
     uint64_t gate_row = 0, down_row = 0;
@@ -41533,20 +41551,25 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
             m->map, m->size, bias->abs_offset, 0, 0, token,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
             g->route_logits)) return false;
-    const bool shared_here = !shared_owner || g->tp_rank == (il & 1u);
+    bool shared_here = !shared_owner || g->tp_rank == (il & 1u);
     bool shared_queued = false;
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
-    if (shared_owner && shared_here &&
+    const bool balance_shared = shared_owner && ds41_balance_shared(g, l, 1);
+    if (shared_owner && (shared_here || balance_shared) &&
         l->ffn_gate_shexp->type == DS4_TENSOR_Q8_0 &&
         l->ffn_up_shexp->type == DS4_TENSOR_Q8_0 &&
         l->ffn_down_shexp->type == DS4_TENSOR_Q8_0) {
+        const ds4_v41_shared_owner owner = {.selected = g->selected,
+            .experts = DS4_N_EXPERT, .active = DS4_N_EXPERT_USED,
+            .rank = g->tp_rank, .tie_owner = il & 1u};
         const int rc = ds4_gpu_dsv41_shared_start(g->shared, g->shared_gate,
             g->shared_up, g->shared_mid, g->norm, m->map, m->size,
             l->ffn_gate_shexp->abs_offset, l->ffn_up_shexp->abs_offset,
             l->ffn_down_shexp->abs_offset, DS4_N_EMBD, DS4_N_FF_EXP,
-            DS4_SWIGLU_CLAMP_EXP);
-        if (rc < 0) return false;
+            DS4_SWIGLU_CLAMP_EXP, balance_shared ? &owner : NULL);
+        if (rc < 0 || (balance_shared && !rc)) return false;
         shared_queued = rc > 0;
+        if (shared_queued && balance_shared) shared_here = true;
     }
 #endif
     if (shared_here && !shared_queued &&
@@ -41579,9 +41602,9 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
     if (shared_queued && !ds4_gpu_dsv41_shared_join()) return false;
 #endif
     if (!routed_ok) return false;
-    /* Keep the shared expert's BF16 boundary, then include it exactly once
-     * in the existing F32 reduction. Alternate ownership across layers. */
-    if (shared_owner && g->tp_rank == (il & 1u) &&
+    /* The balanced path writes zero on the non-owning rank. Keep the shared
+     * expert's BF16 boundary, then include it once in the F32 rank reduction. */
+    if (shared_owner && shared_here &&
         !ds4_gpu_add_tensor(routed, routed, g->shared, DS4_N_EMBD)) return false;
     return true;
 }
@@ -42007,16 +42030,21 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
     ds41_prefill_row *b = &g->batch;
     const uint64_t gate_row = routed_expert_row_bytes(l->ffn_gate_exps);
     const uint64_t down_row = routed_expert_row_bytes(l->ffn_down_exps);
+    const bool balance_shared = shared_owner && ds41_balance_shared(g, l, count);
     bool mid_f16 = false;
     return ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, count, false) &&
         ds41_route_batch(g, m, l, count) &&
-        ((shared_owner && g->tp_rank != (il & 1u)) ||
+        ((shared_owner && !balance_shared && g->tp_rank != (il & 1u)) ||
         (ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, count, true) &&
         ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, count, true) &&
         ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up,
             count * DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
         ds4_gpu_dsv41_quantize(b->shared_mid, DS4_N_FF_EXP, count, DS4_V41_BF16) &&
         ds41_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, count, true))) &&
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        (!balance_shared || ds4_gpu_dsv41_shared_mask(b->shared, b->selected,
+            DS4_N_EMBD, count, DS4_N_EXPERT, DS4_N_EXPERT_USED, g->tp_rank, il & 1u)) &&
+#endif
         (
 #ifndef __APPLE__
         g->tp_world == 2 ?
@@ -42035,7 +42063,7 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
             DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, b->selected, b->route_weights,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP, b->norm,
             il, count, &mid_f16, true)) &&
-        (!shared_owner || g->tp_rank != (il & 1u) ||
+        (!shared_owner || (!balance_shared && g->tp_rank != (il & 1u)) ||
             ds4_gpu_add_tensor(b->routed, b->routed, b->shared, count * DS4_N_EMBD)) &&
         ds41_sum_partial_batch(g, b->routed, il, count);
 }
@@ -73689,9 +73717,14 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
         snprintf(err, errlen, "tensor parallelism already bound");
         return 0;
     }
-    if (!ds4_tp_agree_execution_mode(tp,
-            e->cuda_tp_expert_split ? DS4_TP_MODE_EXPERT_INTERMEDIATE_SPLIT : 0u,
-            err, errlen)) return 0;
+    uint32_t execution_mode = e->cuda_tp_expert_split ?
+        DS4_TP_MODE_EXPERT_INTERMEDIATE_SPLIT : 0u;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
+        !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER")) {
+        execution_mode |= DS4_TP_MODE_V41_SHARED_OWNER;
+        if (ds41_shared_balance_enabled()) execution_mode |= DS4_TP_MODE_V41_SHARED_BALANCE;
+    }
+    if (!ds4_tp_agree_execution_mode(tp, execution_mode, err, errlen)) return 0;
     const uint32_t slots = (uint32_t)DS4_N_LAYER * DS4_TP_GATES_PER_LAYER;
     const uint64_t vec_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
     const uint64_t slab_bytes = ds4_tp_slab_bytes((uint32_t)DS4_N_LAYER, (uint32_t)DS4_N_EMBD);

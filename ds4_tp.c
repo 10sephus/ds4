@@ -2521,12 +2521,12 @@ int ds4_tp_agree_execution_mode(ds4_tp *tp, uint32_t flags, char *err, size_t er
         tp_set_err(err, errlen, "tp execution mode exchange failed");
         return 0;
     }
-    if (peer[0] != mine[0] || peer[1] != flags ||
-        (flags & ~DS4_TP_MODE_EXPERT_INTERMEDIATE_SPLIT) != 0) {
+    const uint32_t known = DS4_TP_MODE_EXPERT_INTERMEDIATE_SPLIT |
+        DS4_TP_MODE_V41_SHARED_OWNER | DS4_TP_MODE_V41_SHARED_BALANCE;
+    if (peer[0] != mine[0] || peer[1] != flags || (flags & ~known) != 0) {
         ds4_tp_mark_failed(tp);
         tp_set_err(err, errlen, "tp execution mode mismatch (peer 0x%x, local 0x%x); "
-                   "set DS4_CUDA_DISABLE_TP_EXPERT_SPLIT=1 on both ranks "
-                   "for 50/50 expert ownership",
+                   "use matching builds and expert ownership settings on both ranks",
                    peer[1], flags);
         return 0;
     }
