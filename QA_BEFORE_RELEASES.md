@@ -1683,7 +1683,47 @@ the long sparse-boundary tests; neither substitutes for the other.
 - Unsupported backends, pipeline and speculative modes must fail explicitly until
   their V4.1 implementation is validated; an older graph/drafter is not a fallback.
 
-#### Metal Reference Checks
+### DSpark
+
+Use `DeepSeek-V4.1-Flash-DSpark.gguf`, not a V4.0 drafter. The native support
+model is 8.04 GiB and remains resident while the target can use SSD streaming.
+On 128 GiB hosts, leave room for both models and context buffers. This path
+supports one Metal, CUDA or ROCm host; TP plus DSpark must fail explicitly.
+
+- Run `python3 tests/test_deepseek41_dspark_conversion.py` and audit every
+  real tensor with `gguf-tools/deepseek41_dspark.py --hf SOURCE --out DSPARK
+  --verify`. The source must be pinned and the three native draft shards
+  present. Preserve MXFP4 experts and all source values; no extra quantization.
+- Build `tests/test_deepseek41_dspark` for the backend under test. Run
+  `tests/test_deepseek41_dspark TARGET DSPARK DUMP_DIRECTORY`, then
+  `python3 tests/deepseek41_dspark_reference.py SOURCE DUMP_DIRECTORY`.
+  CUDA uses `--expert-activation q8-mmq`; ROCm uses `--expert-activation q8-k`
+  for its existing expert activation policy. This independent native-weight oracle checks target
+  feature capture, all three stages, Markov logits and confidence.
+- Run `tests/test_deepseek41_dspark TARGET DSPARK --runtime`. Require causal
+  logits when rejected future tokens change, every retained prefix from zero
+  through six, direct stop-boundary rewinds, continued decoding and save/load
+  after verification. Exercise opportunistic and exact sampling. Loading an
+  older target snapshot must warm missing draft features rather than reuse
+  stale ones. Repeat the backend primitives, including 128-expert/top-3 routing.
+- Build `gguf-tools/quality-testing/score_official_verify`. Compare the matching
+  official manifest with `--mtp-model DSPARK` against the same command plus
+  `--verify-batch 6`. Keep `--ssd-streaming --ssd-streaming-cache-experts 40gb`
+  and context identical. Score the short/boundary fixture above and
+  `deepseek-v4.1-flash-20260919-router/manifest-sensitivity.tsv` at context
+  34816; also repeat its `manifest-long.tsv` with `--continued-prefill 32`.
+  Report paired teacher-forced NLL and API top-token agreement. Greedy sampled
+  prefix length and scalar-versus-verifier text equality are not quality gates.
+- Run real CLI and agent code/prose requests at temperature zero and above
+  zero, including `--mtp-exact-sampling`. Against an otherwise idle speculative
+  server, run `tests/test_server_speculative_stop.py --model deepseek-v4.1-flash
+  --output OUTPUT_DIRECTORY`. Require correct retrieval, tool results, SSE
+  completion, prompt-prefix reuse and bounded finish latency. Repeat a real
+  coding client's edit/build/test loop and cancellation near context capacity.
+  Record acceptance and end-to-end timing; working speculation does not by
+  itself establish a speedup.
+
+### Metal Reference Checks
 
 The calibrated Q2 main weights occupy about 151.8 GiB, Q4 about 294.15 GiB;
 188.8 GiB of Engram remains disk-only. Validate the release artifacts with
