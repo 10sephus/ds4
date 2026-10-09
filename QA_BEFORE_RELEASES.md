@@ -1691,8 +1691,9 @@ On 128 GiB hosts, leave room for both models and context buffers. This path
 supports one Metal, CUDA or ROCm host; TP plus DSpark must fail explicitly.
 
 - Run `python3 tests/test_deepseek41_dspark_conversion.py` and audit every
-  real tensor with `gguf-tools/deepseek41_dspark.py --hf SOURCE --out DSPARK
-  --verify`. The source must be pinned and the three native draft shards
+  real tensor with `python3 gguf-tools/deepseek41_dspark.py --hf SOURCE
+  --source-revision REVISION --out DSPARK --verify`. The source must be
+  pinned and the three native draft shards
   present. Preserve MXFP4 experts and all source values; no extra quantization.
 - Build `tests/test_deepseek41_dspark` for the backend under test. Run
   `tests/test_deepseek41_dspark --candidate-mask` to check the all-blocks
