@@ -1695,6 +1695,8 @@ supports one Metal, CUDA or ROCm host; TP plus DSpark must fail explicitly.
   --verify`. The source must be pinned and the three native draft shards
   present. Preserve MXFP4 experts and all source values; no extra quantization.
 - Build `tests/test_deepseek41_dspark` for the backend under test. Run
+  `tests/test_deepseek41_dspark --candidate-mask` to check the all-blocks
+  shortcut and both sides of the 16K candidate-selection boundary. Run
   `tests/test_deepseek41_dspark TARGET DSPARK DUMP_DIRECTORY`, then
   `python3 tests/deepseek41_dspark_reference.py SOURCE DUMP_DIRECTORY`.
   CUDA uses `--expert-activation q8-mmq`; ROCm uses `--expert-activation q8-k`
