@@ -76,10 +76,30 @@ def swiglu(gate, up):
     return gate / (1 + np.exp(-gate)) * up
 
 
+def q8_mmq(x):
+    """CUDA MXFP4 MMQ: 32 values, FP32 scale, round away from zero."""
+    blocks = np.asarray(x, np.float32).reshape(-1, 32)
+    maximum = abs(blocks).max(axis=-1, keepdims=True)
+    inverse = np.divide(127.0, maximum, out=np.ones_like(maximum), where=maximum != 0)
+    scaled = blocks * inverse
+    quantized = np.copysign(np.floor(abs(scaled) + 0.5), scaled)
+    return (quantized / inverse).reshape(x.shape)
+
+
+def q8_k(x):
+    """ROCm routed experts: 256 values, FP32 scale, round to nearest even."""
+    blocks = np.asarray(x, np.float32).reshape(-1, 256)
+    maximum = abs(blocks).max(axis=-1, keepdims=True)
+    inverse = np.divide(127.0, maximum, out=np.ones_like(maximum), where=maximum != 0)
+    return (np.rint(blocks * inverse) / inverse).reshape(x.shape)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("source", type=Path)
     ap.add_argument("dumps", type=Path)
+    ap.add_argument("--expert-activation", choices=("f32", "q8-mmq", "q8-k"), default="f32",
+                    help="activation arithmetic used by the backend's native MXFP4 experts")
     args = ap.parse_args()
     db = SourceDB(str(args.source), index_validator=lambda _: None, scale_validator=lambda _: None,
                   tensor_prefix="mtp.")
@@ -155,10 +175,16 @@ def main():
         for token in range(5):
             for j, expert in enumerate(selected[token]):
                 e = f"ffn.experts.{expert}."
-                # The expanded-weight backend keeps expert intermediates FP32.
-                mid = swiglu(linear(x[token], e + "w1.weight", False),
-                             linear(x[token], e + "w3.weight", False))
-                routed[token] += linear(mid, e + "w2.weight", False) * rw[token, j]
+                if args.expert_activation != "f32":
+                    quantize = q8_mmq if args.expert_activation == "q8-mmq" else q8_k
+                    qx = quantize(x[token])
+                    mid = swiglu(linear(qx, e + "w1.weight", False),
+                                 linear(qx, e + "w3.weight", False)) * rw[token, j]
+                    routed[token] += linear(quantize(mid), e + "w2.weight", False)
+                else:
+                    mid = swiglu(linear(x[token], e + "w1.weight", False),
+                                 linear(x[token], e + "w3.weight", False))
+                    routed[token] += linear(mid, e + "w2.weight", False) * rw[token, j]
         routed = check(f"stage{stage}_routed", routed, 0.008)
         residual = check(f"stage{stage}_residual", expand(bf16(shared + routed), after, post, comb))
         # Production split stores pre/post/comb consecutively.

@@ -17,7 +17,144 @@ static bool dump_tensor(const char *dir, const char *name, ds4_gpu_tensor *x, si
     return ok;
 }
 
+static bool cancel_now(void *unused) {
+    (void)unused;
+    return true;
+}
+
+static int check_runtime(const char *target, const char *draft) {
+    int rc = 1;
+    ds4_engine *engine = NULL;
+    ds4_session *a = NULL, *b = NULL;
+    ds4_tokens prompt = {0};
+    FILE *snapshot = NULL;
+    char err[256] = {0};
+    ds4_engine_options opt = {.model_path = target, .mtp_path = draft,
+#ifdef __APPLE__
+        .backend = DS4_BACKEND_METAL,
+#else
+        .backend = DS4_BACKEND_CUDA,
+#endif
+        .context_size = 2048, .power_percent = 100, .ssd_streaming = true,
+        .ssd_streaming_cache_bytes = UINT64_C(40) << 30, .dspark = true};
+    REQUIRE(!ds4_engine_open(&engine, &opt));
+    REQUIRE(!ds4_session_create(&a, engine, 2048));
+    REQUIRE(!ds4_session_create(&b, engine, 2048));
+    for (unsigned i = 0; i < 127; i++) ds4_tokens_push(&prompt, 300 + i % 23);
+    REQUIRE(!ds4_session_sync(a, &prompt, err, sizeof(err)));
+    snapshot = tmpfile();
+    REQUIRE(snapshot && !ds4_session_save_payload(a, snapshot, err, sizeof(err)));
+    const uint64_t bytes = ds4_session_payload_bytes(a);
+    for (unsigned keep = 0; keep <= 6; keep++) {
+        rewind(snapshot);
+        REQUIRE(!ds4_session_load_payload(a, snapshot, bytes, err, sizeof(err)));
+        rewind(snapshot);
+        REQUIRE(!ds4_session_load_payload(b, snapshot, bytes, err, sizeof(err)));
+        int ta[6], tb[6];
+        for (unsigned i = 0; i < 6; i++) {
+            ta[i] = 700 + i;
+            tb[i] = i < keep ? ta[i] : 900 + (int)i;
+        }
+        ds41_dspark *da = a->ds41_graph.dspark, *db = b->ds41_graph.dspark;
+        REQUIRE(ds41_dspark_verify(da, &a->ds41_graph, &engine->model, &engine->weights, ta, 6));
+        REQUIRE(ds41_dspark_verify(db, &b->ds41_graph, &engine->model, &engine->weights, tb, 6));
+        double worst = 0;
+        for (uint64_t i = 0; i < (uint64_t)keep * DS4_N_VOCAB; i++)
+            worst = fmax(worst, fabs(da->host_verified[i] - db->host_verified[i]));
+        fprintf(stderr, "verify prefix=%u causal max=%.8g\n", keep, worst);
+        REQUIRE(worst < 0.0001);
+        REQUIRE(ds41_dspark_commit(da, &a->ds41_graph, 6, a->logits));
+        REQUIRE(ds41_dspark_commit(db, &b->ds41_graph, keep, b->logits));
+        for (unsigned i = 0; i < 6; i++) ds4_tokens_push(&a->checkpoint, ta[i]);
+        if (keep < 6) REQUIRE(ds4_session_rewind_speculative(a, 127 + keep));
+        for (unsigned i = 0; i < keep; i++) {
+            ds4_tokens_push(&b->checkpoint, tb[i]);
+        }
+        REQUIRE(a->checkpoint.len == b->checkpoint.len && a->checkpoint_valid);
+        REQUIRE(!memcmp(a->logits, b->logits, DS4_N_VOCAB * sizeof(float)));
+        for (unsigned i = 0; i < 8; i++) {
+            REQUIRE(!ds4_session_eval(a, 1200 + i, err, sizeof(err)));
+            REQUIRE(!ds4_session_eval(b, 1200 + i, err, sizeof(err)));
+            worst = 0;
+            for (uint32_t v = 0; v < DS4_N_VOCAB; v++)
+                worst = fmax(worst, fabs(a->logits[v] - b->logits[v]));
+            REQUIRE(worst < 0.0001);
+        }
+        REQUIRE(!ds4_session_rewind_speculative(a, a->checkpoint.len - 1));
+        fprintf(stderr, "verify prefix=%u rollback and 8 continuation steps PASS\n", keep);
+    }
+    puts("V4.1 DSpark causal verification, all prefix commits/rewinds and snapshot load: PASS");
+    for (unsigned exact = 0; exact < 2; exact++) {
+        ds4_session_invalidate(a);
+        REQUIRE(!ds4_session_sync(a, &prompt, err, sizeof(err)));
+        engine->dspark_exact_sampling = exact != 0;
+        engine->dspark_confidence_threshold = 0;
+        uint64_t rng = 12345;
+        for (unsigned cycle = 0; cycle < 8; cycle++) {
+            const int seed = sample_argmax(a->logits, DS4_N_VOCAB);
+            const int before = a->checkpoint.len;
+            int accepted[6];
+            const int count = ds4_session_eval_speculative(a, seed, 6, -1,
+                0.7f, 0, 0.95f, 0, &rng, accepted, 6, err, sizeof(err));
+            REQUIRE(count >= 1 && count <= 6 && accepted[0] == seed);
+            REQUIRE(a->checkpoint.len == before + count &&
+                    a->ds41_graph.pos == (uint32_t)a->checkpoint.len);
+            for (int i = 0; i < count; i++)
+                REQUIRE(a->checkpoint.v[before + i] == accepted[i]);
+            if (count > 1) {
+                REQUIRE(ds4_session_rewind_speculative(a, before + count - 1));
+                REQUIRE(!ds4_session_eval(a, accepted[count - 1], err, sizeof(err)));
+                REQUIRE(a->checkpoint.len == before + count);
+            }
+        }
+        rewind(snapshot);
+        REQUIRE(!ds4_session_save_payload(a, snapshot, err, sizeof(err)));
+        const uint64_t saved_bytes = ds4_session_payload_bytes(a);
+        rewind(snapshot);
+        REQUIRE(!ds4_session_load_payload(b, snapshot, saved_bytes, err, sizeof(err)));
+        REQUIRE(!b->ds41_graph.dspark->kv_valid);
+        for (unsigned i = 0; i < 3; i++) {
+            REQUIRE(!ds4_session_eval(a, 1500 + i, err, sizeof(err)));
+            REQUIRE(!ds4_session_eval(b, 1500 + i, err, sizeof(err)));
+            REQUIRE(!memcmp(a->logits, b->logits, DS4_N_VOCAB * sizeof(float)));
+        }
+        fprintf(stderr, "V4.1 DSpark exact=%u sampling, frontier and post-verify snapshot: PASS\n", exact);
+    }
+    {
+        int accepted[6];
+        uint64_t rng = 71;
+        const int pos = a->checkpoint.len;
+        ds4_session_set_cancel(a, cancel_now, NULL);
+        REQUIRE(ds4_session_eval_speculative(a, sample_argmax(a->logits, DS4_N_VOCAB),
+            6, -1, 0.7f, 0, 0.95f, 0, &rng, accepted, 6, err, sizeof(err)) < 0);
+        REQUIRE(a->checkpoint_valid && a->checkpoint.len == pos);
+        ds4_session_set_cancel(a, NULL, NULL);
+        err[0] = '\0';
+        REQUIRE(!ds4_session_eval(a, 1600, err, sizeof(err)));
+        while (prompt.len < 2043) ds4_tokens_push(&prompt, 300 + prompt.len % 23);
+        ds4_session_invalidate(a);
+        REQUIRE(!ds4_session_sync(a, &prompt, err, sizeof(err)));
+        while (a->checkpoint.len < 2048) {
+            const int before = a->checkpoint.len;
+            const int n = ds4_session_eval_speculative(a, sample_argmax(a->logits, DS4_N_VOCAB),
+                6, -1, 0.7f, 0, 0.95f, 0, &rng, accepted, 6, err, sizeof(err));
+            REQUIRE(n >= 1 && n <= 2048 - before && a->checkpoint.len == before + n);
+        }
+        REQUIRE(ds4_session_eval_speculative(a, 1600, 6, -1, 0.7f, 0, 0.95f, 0,
+            &rng, accepted, 6, err, sizeof(err)) == 0);
+        fprintf(stderr, "V4.1 DSpark cancellation and context-limit clamping: PASS\n");
+    }
+    rc = 0;
+done:
+    if (err[0]) fprintf(stderr, "%s\n", err);
+    if (snapshot) fclose(snapshot);
+    ds4_tokens_free(&prompt);
+    ds4_session_free(b); ds4_session_free(a); ds4_engine_close(engine);
+    return rc;
+}
+
 int main(int argc, char **argv) {
+    if (argc == 4 && !strcmp(argv[3], "--runtime")) return check_runtime(argv[1], argv[2]);
     if (argc != 4) {
         fprintf(stderr, "usage: %s TARGET_GGUF DSPARK_GGUF OUTPUT_DIRECTORY\n", argv[0]);
         return 2;
@@ -41,9 +178,12 @@ int main(int argc, char **argv) {
     REQUIRE(ds4_gpu_init());
     const uint64_t offsets[] = {tw.token_embd->abs_offset, tw.output->abs_offset};
     const uint64_t sizes[] = {tw.token_embd->bytes, tw.output->bytes};
+    REQUIRE(ds4_gpu_set_model_fd_for_map(target.fd, target.map));
     REQUIRE(ds4_gpu_set_model_map_spans(target.map, target.size, offsets, sizes, 2, tw.token_embd->bytes));
+    REQUIRE(ds4_gpu_set_model_fd_for_map(draft.fd, draft.map));
     REQUIRE(ds4_gpu_set_model_map_range(draft.map, draft.size, draft.tensor_data_pos,
         draft.size - draft.tensor_data_pos, draft.max_tensor_bytes));
+    REQUIRE(ds4_gpu_set_model_fd_for_map(target.fd, target.map));
     d = ds41_dspark_alloc(&dw);
     REQUIRE(d);
     enum { ROWS = 137 };

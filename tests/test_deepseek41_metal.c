@@ -71,7 +71,8 @@ static int check_router(void) {
     ds4_gpu_tensor *tok = upload(tokens, sizeof(tokens));
     CHECK(x && p && ids && weights && tok);
     const unsigned counts[] = {1, 3, 17, ROWS};
-    for (unsigned n = 256; n <= MAX_EXPERTS; n += 128) {
+    for (unsigned n = 128; n <= MAX_EXPERTS; n += 128) {
+        const unsigned USED = n == 128 ? 3 : 6;
         for (unsigned mode = 0; mode < 3; mode++) {
             for (unsigned i = 0; i < ROWS * n; i++) logits[i] = mode == 1 ? 0 :
                 mode == 2 ? (i % 2 ? -80 : 40) : random_value() * 8;
@@ -614,6 +615,7 @@ static int check_attention_output(bool large) {
         0, a_bytes, xt, ROWS));
     CHECK(!ds4_gpu_dsv41_attention_output_batch(out, low, model, a_bytes + b_bytes,
         0, a_bytes, xt, ROWS + 1));
+#ifndef DS4_ROCM_BUILD
     ds4_gpu_tensor *packed = upload(NULL, xb / 2);
     ds4_gpu_tensor *partial[2] = {upload(NULL, ob), upload(NULL, ob)};
     CHECK(packed && partial[0] && partial[1]);
@@ -696,6 +698,9 @@ static int check_attention_output(bool large) {
     CHECK(!ds4_gpu_dsv41_attention_output_tp_batch(out, low, model, a_bytes + b_bytes,
         0, a_bytes, packed, ROWS + 1, 0));
     ds4_gpu_tensor_free(partial[0]); ds4_gpu_tensor_free(partial[1]); ds4_gpu_tensor_free(packed);
+#else
+    fprintf(stderr, "V4.1 TP output projection: skipped (ROCm has no network TP)\n");
+#endif
     ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(low); ds4_gpu_tensor_free(out);
     ds4_gpu_cleanup();
     free(x); free(reference); free(reference_low); free(model);
@@ -1061,6 +1066,7 @@ static int check_causal_topk(void) {
                 CHECK(ds4_gpu_synchronize());
                 CHECK(ids[rows * 512u] == 123456);
                 for (uint32_t t = 0; t < rows; t++) {
+                    CHECK(s[(size_t)t * width + width - 1u] == 12345.0f);
                     for (uint32_t k = 0; k < 512u; k++) {
                         if (ids[t * 512u + k] != ref[t * 512u + k]) {
                             fprintf(stderr, "top-k mismatch ratio=%u visible=%u rows=%u pattern=%u row=%u rank=%u: %d vs %d\n",

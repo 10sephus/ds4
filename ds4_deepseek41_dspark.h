@@ -4,6 +4,7 @@
 
 #define DS41_DRAFT_WINDOW 128u
 #define DS41_DRAFT_ROWS 5u
+#define DS41_VERIFY_ROWS (DS41_DRAFT_ROWS + 1u)
 
 struct ds41_dspark {
     const ds4_dspark_weights *weights;
@@ -14,7 +15,13 @@ struct ds41_dspark {
     bool kv_valid;
     ds4_gpu_tensor *mean_weights, *mean, *input, *projected, *main_x, *main_kv;
     ds4_gpu_tensor *logits, *tokens, *markov_embed, *markov_logits, *confidence_input, *confidence;
-    float *host_logits;
+    float *host_logits, *draft_probs;
+    ds4_gpu_tensor *verify_residual, *verify_pre, *verify_logits, *verify_pool;
+    ds4_gpu_tensor *old_raw, *old_features;
+    uint32_t old_positions[3][DS41_VERIFY_ROWS];
+    ds41_gpu_graph verified[DS41_VERIFY_ROWS + 1u];
+    float *host_verified;
+    uint32_t verify_start, verify_count, rewind_end;
 };
 
 static void ds41_dspark_reset(ds41_dspark *d) {
@@ -22,6 +29,8 @@ static void ds41_dspark_reset(ds41_dspark *d) {
     memset(d->positions, 0xff, sizeof(d->positions));
     d->kv_valid = false;
     d->kv_end = 0;
+    d->verify_count = 0;
+    d->rewind_end = 0;
 }
 
 static void ds41_dspark_free(ds41_dspark *d) {
@@ -40,7 +49,21 @@ static void ds41_dspark_free(ds41_dspark *d) {
     ds4_gpu_tensor_free(d->tokens);
     ds4_gpu_tensor_free(d->markov_logits); ds4_gpu_tensor_free(d->confidence_input);
     ds4_gpu_tensor_free(d->confidence);
+    for (unsigned i = 0; i <= DS41_VERIFY_ROWS; i++) {
+        ds41_gpu_graph *g = &d->verified[i];
+        ds4_gpu_tensor_free(g->residual); ds4_gpu_tensor_free(g->pre);
+        ds4_gpu_tensor_free(g->logits);
+        for (unsigned j = 0; j < 4; j++) {
+            ds4_gpu_tensor_free(g->verify_previous_kv[j]);
+            ds4_gpu_tensor_free(g->verify_previous_score[j]);
+        }
+    }
+    ds4_gpu_tensor_free(d->verify_residual); ds4_gpu_tensor_free(d->verify_pre);
+    ds4_gpu_tensor_free(d->verify_logits); ds4_gpu_tensor_free(d->verify_pool);
+    ds4_gpu_tensor_free(d->old_raw); ds4_gpu_tensor_free(d->old_features);
+    free(d->host_verified);
     free(d->host_logits);
+    free(d->draft_probs);
     free(d);
 }
 
@@ -74,9 +97,17 @@ static DS4_MAYBE_UNUSED ds41_dspark *ds41_dspark_alloc(const ds4_dspark_weights 
     DS41_DRAFT_A(markov_logits, DS4_N_VOCAB)
     DS41_DRAFT_A(confidence_input, DS4_N_EMBD + dw->markov_rank)
     DS41_DRAFT_A(confidence, 1)
+    DS41_DRAFT_A(verify_residual, (DS41_VERIFY_ROWS + 1u) * DS4_N_HC * DS4_N_EMBD)
+    DS41_DRAFT_A(verify_pre, (DS41_VERIFY_ROWS + 1u) * DS4_N_HC)
+    DS41_DRAFT_A(verify_logits, (DS41_VERIFY_ROWS + 1u) * DS4_N_VOCAB)
+    DS41_DRAFT_A(verify_pool, (DS41_VERIFY_ROWS + 1u) * 8u * DS4_N_HEAD_DIM)
+    DS41_DRAFT_A(old_raw, 40u * DS41_VERIFY_ROWS * DS4_N_HEAD_DIM)
+    DS41_DRAFT_A(old_features, 3u * DS41_VERIFY_ROWS * DS4_N_EMBD)
 #undef DS41_DRAFT_A
     d->host_logits = malloc((uint64_t)DS41_DRAFT_ROWS * DS4_N_VOCAB * sizeof(float));
-    if (!d->host_logits || !ds4_gpu_tensor_fill_f32(d->mean_weights,
+    d->draft_probs = malloc((uint64_t)DS41_DRAFT_ROWS * DS4_N_VOCAB * sizeof(float));
+    d->host_verified = malloc((uint64_t)(DS41_VERIFY_ROWS + 1u) * DS4_N_VOCAB * sizeof(float));
+    if (!d->host_logits || !d->draft_probs || !d->host_verified || !ds4_gpu_tensor_fill_f32(d->mean_weights,
         1.0f / DS4_N_HC, DS41_DRAFT_WINDOW * DS4_N_HC) ||
         !ds4_gpu_tensor_fill_f32(d->tokens, 0, DS41_DRAFT_ROWS)) goto fail;
     ds41_dspark_reset(d);
@@ -89,6 +120,7 @@ fail:
 static bool ds41_dspark_capture(ds41_dspark *d, uint32_t layer, uint32_t pos,
                                 const ds4_gpu_tensor *residual, uint32_t rows) {
     if (!d) return true;
+    d->rewind_end = 0;
     unsigned stage = 0;
     while (stage < 3 && d->weights->target_layers[stage] != layer) stage++;
     if (stage == 3) return true;
@@ -197,28 +229,37 @@ static bool ds41_dspark_stage(ds41_dspark *d, const ds4_model *m, uint32_t stage
         !ds4_gpu_dsv41_quantize(b->heads, DS4_N_HEAD * DS4_N_HEAD_DIM, n, DS4_V41_BF16) ||
         !ds4_gpu_dsv41_rope(b->heads, DS4_N_HEAD_DIM, DS4_N_HEAD, n, pos, false, true) ||
         !ds41_dspark_attention_output(b, m, l) ||
-        !ds41_after_attention_batch(b, m, l, n)) return false;
+        !ds41_after_attention_batch(b, m, l, n)) {
+        fprintf(stderr, "ds4: V4.1 draft attention failed\n");
+        return false;
+    }
     const uint32_t experts = d->weights->n_experts, active = d->weights->n_experts_used;
     const uint64_t gate_row = routed_expert_row_bytes(l->ffn_gate_exps);
     const uint64_t down_row = routed_expert_row_bytes(l->ffn_down_exps);
     bool mid_f16 = false;
-    return ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, n, false) &&
+    if (!(ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, n, false) &&
         ds4_gpu_router_select_batch_tensor(b->selected, b->route_weights, b->route_probs,
             m->map, m->size, l->ffn_exp_probs_b->abs_offset, 0, 0, 0, 0, true, false,
-            b->route_logits, d->tokens, experts, active, DS4_EXPERT_WEIGHT_SCALE, n) &&
-        ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, n, true) &&
+            b->route_logits, d->tokens, experts, active, DS4_EXPERT_WEIGHT_SCALE, n))) {
+        fprintf(stderr, "ds4: V4.1 draft routing failed\n"); return false;
+    }
+    if (!(ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, n, true) &&
         ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, n, true) &&
         ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up,
             n * DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
         ds4_gpu_dsv41_quantize(b->shared_mid, DS4_N_FF_EXP, n, DS4_V41_BF16) &&
-        ds41_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, n, true) &&
-        ds4_gpu_routed_moe_batch_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
+        ds41_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, n, true))) {
+        fprintf(stderr, "ds4: V4.1 draft shared expert failed\n"); return false;
+    }
+    if (!ds4_gpu_routed_moe_batch_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
             m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
             l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type,
             gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
             DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, b->selected, b->route_weights,
-            experts, active, DS4_SWIGLU_CLAMP_EXP, b->norm, stage, n, &mid_f16, true) &&
-        ds4_gpu_add_tensor(b->block, b->routed, b->shared, n * DS4_N_EMBD) &&
+            experts, active, DS4_SWIGLU_CLAMP_EXP, b->norm, stage, n, &mid_f16, true)) {
+        fprintf(stderr, "ds4: V4.1 draft routed experts failed\n"); return false;
+    }
+    return ds4_gpu_add_tensor(b->block, b->routed, b->shared, n * DS4_N_EMBD) &&
         ds4_gpu_dsv41_quantize(b->block, DS4_N_EMBD, n, DS4_V41_BF16) &&
         ds4_gpu_hc_expand_split_tensor(b->residual, b->block, b->after_attn,
             b->ffn_split, DS4_N_EMBD, DS4_N_HC) &&
@@ -233,6 +274,7 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_forward(ds41_dspark *d, const ds4_model
     if (!d || !pos || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
     ds41_prefill_row *b = &d->batch;
     bool ok = ds4_gpu_begin_commands() && ds41_dspark_seed(d, draft, pos);
+    if (!ok) fprintf(stderr, "ds4: V4.1 DSpark seed failed\n");
     const float pre[DS41_DRAFT_ROWS][4] = {{1, 0, 0, 0}, {1, 0, 0, 0}, {1, 0, 0, 0}, {1, 0, 0, 0}, {1, 0, 0, 0}};
     if (ok) ok = ds4_gpu_tensor_write(b->pre, 0, pre, sizeof(pre));
     for (uint32_t row = 0; ok && row < DS41_DRAFT_ROWS; row++) {
@@ -243,8 +285,10 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_forward(ds41_dspark *d, const ds4_model
             DS4_N_EMBD, DS4_N_HC);
         ds4_gpu_tensor_free(out);
     }
-    for (uint32_t stage = 0; ok && stage < 3; stage++)
+    for (uint32_t stage = 0; ok && stage < 3; stage++) {
         ok = ds41_dspark_stage(d, draft, stage, pos);
+        if (!ok) fprintf(stderr, "ds4: V4.1 DSpark stage %u failed\n", stage);
+    }
     if (ok) ok = ds4_gpu_hc_weighted_sum_split_tensor(b->x, b->residual,
         b->ffn_split, DS4_N_EMBD, DS4_N_HC) &&
         ds4_gpu_dsv41_quantize(b->x, DS4_N_EMBD, DS41_DRAFT_ROWS, DS4_V41_BF16) &&
@@ -279,6 +323,109 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_markov(ds41_dspark *d, const ds4_model 
     if (ok) ok = ds4_gpu_tensor_read(logits, 0, d->host_logits + (uint64_t)row * DS4_N_VOCAB, bytes) &&
         ds4_gpu_tensor_read(d->confidence, 0, confidence, sizeof(*confidence));
     ds4_gpu_tensor_free(logits);
+    return ok;
+}
+
+/* Cache appends beyond the accepted frontier are invisible. Only the six
+ * overwritten raw-ring slots and pooling carries need rollback; no compressed
+ * cache proportional to the context is copied. */
+static DS4_MAYBE_UNUSED bool ds41_dspark_verify(ds41_dspark *d, ds41_gpu_graph *g,
+        const ds4_model *m, const ds4_weights *w, const int *tokens, uint32_t count) {
+    if (!d || !g->valid || count < 2 || count > DS41_VERIFY_ROWS ||
+        g->pos > g->ctx || count > g->ctx - g->pos || g->tp_logits_half) return false;
+    const uint64_t kv = DS4_N_HEAD_DIM * 4u, feature = DS4_N_EMBD * 4u;
+    ds41_gpu_graph *graphs[DS41_VERIFY_ROWS];
+    bool ok = ds4_gpu_begin_commands();
+    d->verify_start = g->pos;
+    d->verify_count = 0;
+    d->rewind_end = 0;
+    for (uint32_t i = 0; ok && i <= DS41_VERIFY_ROWS; i++) {
+        if (i >= count && i != DS41_VERIFY_ROWS) continue;
+        const uint32_t slot = (g->pos + i) % DS41_DRAFT_WINDOW;
+        for (uint32_t il = 0; ok && i < count && il < 40; il++)
+            ok = ds4_gpu_tensor_copy(d->old_raw, (il * DS41_VERIFY_ROWS + i) * kv,
+                g->window[il], slot * kv, kv);
+        for (uint32_t stage = 0; ok && i < count && stage < 3; stage++) {
+            d->old_positions[stage][i] = d->positions[stage][slot];
+            ok = ds4_gpu_tensor_copy(d->old_features, (stage * DS41_VERIFY_ROWS + i) * feature,
+                d->target[stage], slot * feature, feature);
+        }
+        ds41_gpu_graph *row = &d->verified[i];
+        ds4_gpu_tensor *res = row->residual, *pre = row->pre, *logits = row->logits;
+        ds4_gpu_tensor *pool_k[4], *pool_s[4];
+        memcpy(pool_k, row->verify_previous_kv, sizeof(pool_k));
+        memcpy(pool_s, row->verify_previous_score, sizeof(pool_s));
+        *row = *g;
+        row->residual = res ? res : ds4_gpu_tensor_view(d->verify_residual, i * DS4_N_HC * feature, DS4_N_HC * feature);
+        row->pre = pre ? pre : ds4_gpu_tensor_view(d->verify_pre, i * DS4_N_HC * 4u, DS4_N_HC * 4u);
+        row->logits = logits ? logits : ds4_gpu_tensor_view(d->verify_logits,
+            (uint64_t)i * DS4_N_VOCAB * 4u, (uint64_t)DS4_N_VOCAB * 4u);
+        row->verify_prefix = true;
+        for (uint32_t owner = 0; owner < 4; owner++) {
+            const uint64_t off = (i * 8u + owner * 2u) * kv;
+            row->verify_previous_kv[owner] = pool_k[owner] ? pool_k[owner] :
+                ds4_gpu_tensor_view(d->verify_pool, off, kv);
+            row->verify_previous_score[owner] = pool_s[owner] ? pool_s[owner] :
+                ds4_gpu_tensor_view(d->verify_pool, off + kv, kv);
+            ok = ok && row->verify_previous_kv[owner] && row->verify_previous_score[owner];
+        }
+        ok = ok && row->residual && row->pre && row->logits;
+        if (i < count) graphs[i] = row;
+        else {
+            /* Keep the block start as well: exact sampling can change mode
+             * at the first token, before any verified token is consumed. */
+            ok = ok && ds4_gpu_tensor_copy(row->residual, 0, g->residual, 0, DS4_N_HC * feature) &&
+                ds4_gpu_tensor_copy(row->pre, 0, g->pre, 0, DS4_N_HC * 4u) &&
+                ds4_gpu_tensor_copy(row->logits, 0, g->logits, 0, (uint64_t)DS4_N_VOCAB * 4u);
+            for (uint32_t owner = 0; ok && owner < 4; owner++)
+                ok = ds4_gpu_tensor_copy(row->verify_previous_kv[owner], 0, g->previous_kv[owner], 0, kv) &&
+                    ds4_gpu_tensor_copy(row->verify_previous_score[owner], 0, g->previous_score[owner], 0, kv);
+        }
+    }
+    if (ok) ok = ds41_graph_step_batch(graphs, tokens, (int)count, count, m, w);
+    if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+    if (ok) ok = ds4_gpu_tensor_read(d->verify_logits, 0, d->host_verified,
+        (uint64_t)count * DS4_N_VOCAB * 4u) &&
+        ds4_gpu_tensor_read(d->verify_logits, (uint64_t)DS41_VERIFY_ROWS * DS4_N_VOCAB * 4u,
+            d->host_verified + (uint64_t)DS41_VERIFY_ROWS * DS4_N_VOCAB, DS4_N_VOCAB * 4u);
+    if (ok) d->verify_count = count;
+    else g->valid = false;
+    return ok;
+}
+
+static DS4_MAYBE_UNUSED bool ds41_dspark_commit(ds41_dspark *d, ds41_gpu_graph *g,
+                                               uint32_t keep, float *logits) {
+    if (!d || !d->verify_count || keep > d->verify_count ||
+        (g->pos != d->verify_start && g->pos != d->rewind_end) ||
+        (d->rewind_end && d->verify_start + keep > d->rewind_end)) return false;
+    const uint64_t kv = DS4_N_HEAD_DIM * 4u, feature = DS4_N_EMBD * 4u;
+    const uint32_t row = keep ? keep - 1u : DS41_VERIFY_ROWS;
+    ds41_gpu_graph *last = &d->verified[row];
+    bool ok = ds4_gpu_begin_commands();
+    for (uint32_t i = keep; ok && i < d->verify_count; i++) {
+        const uint32_t slot = (d->verify_start + i) % DS41_DRAFT_WINDOW;
+        for (uint32_t il = 0; ok && il < 40; il++)
+            ok = ds4_gpu_tensor_copy(g->window[il], slot * kv,
+                d->old_raw, (il * DS41_VERIFY_ROWS + i) * kv, kv);
+        for (uint32_t stage = 0; ok && stage < 3; stage++) {
+            ok = ds4_gpu_tensor_copy(d->target[stage], slot * feature,
+                d->old_features, (stage * DS41_VERIFY_ROWS + i) * feature, feature);
+            d->positions[stage][slot] = d->old_positions[stage][i];
+        }
+    }
+    for (uint32_t owner = 0; ok && owner < 4; owner++)
+        ok = ds4_gpu_tensor_copy(g->previous_kv[owner], 0, last->verify_previous_kv[owner], 0, kv) &&
+            ds4_gpu_tensor_copy(g->previous_score[owner], 0, last->verify_previous_score[owner], 0, kv);
+    if (ok) ok = ds4_gpu_tensor_copy(g->residual, 0, last->residual, 0, DS4_N_HC * feature) &&
+        ds4_gpu_tensor_copy(g->pre, 0, last->pre, 0, DS4_N_HC * 4u) &&
+        ds4_gpu_tensor_copy(g->logits, 0, last->logits, 0, (uint64_t)DS4_N_VOCAB * 4u);
+    if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+    if (ok) {
+        g->pos = last->pos;
+        g->history = last->history;
+        memcpy(logits, d->host_verified + (uint64_t)row * DS4_N_VOCAB, DS4_N_VOCAB * 4u);
+    } else g->valid = false;
+    d->rewind_end = ok ? g->pos : 0;
     return ok;
 }
 

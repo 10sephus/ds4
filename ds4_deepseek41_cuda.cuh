@@ -1,6 +1,18 @@
 /* V4.1-specific operations. Included after the shared CUDA kernels. */
 #include "ds4_deepseek41_gpu.h"
 
+#ifdef __HIP_PLATFORM_AMD__
+static cudaStream_t cuda_decode_stream(void) { return nullptr; }
+#endif
+
+__device__ static float dsv41_broadcast(float value) {
+#ifdef __HIP_PLATFORM_AMD__
+    return __shfl(value, 0, 32);
+#else
+    return __shfl_sync(0xffffffffu, value, 0);
+#endif
+}
+
 static bool dsv41_has_floats(const ds4_gpu_tensor *t, uint64_t count) {
     return t && t->ptr && count <= t->bytes / sizeof(float);
 }
@@ -12,6 +24,7 @@ __device__ static float dsv41_bf16(float x) {
     return __uint_as_float(bits & 0xffff0000u);
 }
 
+#ifndef __HIP_PLATFORM_AMD__
 extern "C" int ds4_gpu_dsv41_norm(ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         const void *map, uint64_t size, uint64_t offset,
         uint32_t width, uint32_t rows, float eps) {
@@ -55,6 +68,7 @@ extern "C" int ds4_gpu_dsv41_hc_expand(ds4_gpu_tensor *out, const ds4_gpu_tensor
         width, 4u, rows, 24u, 24u, 0, 0);
     return cuda_ok(cudaGetLastError(), "V4.1 BF16 HC expansion");
 }
+#endif
 
 __device__ static float dsv41_pow2_ceil(float x) {
     const uint32_t bits = __float_as_uint(x);
@@ -75,7 +89,7 @@ __global__ static void dsv41_quantize_kernel(float *x, uint32_t width,
     if (group >= (uint64_t)(width / block) * rows) return;
     const uint64_t i = group * block + lane;
     const float value = lane < block ? dsv41_bf16(x[i]) : 0.0f;
-    const float peak = __shfl_sync(0xffffffffu, warp_max_f32(fabsf(value)), 0);
+    const float peak = dsv41_broadcast(warp_max_f32(fabsf(value)));
     float scale, quantized;
     if (mode == DS4_V41_FP8_E8M0) {
         scale = dsv41_pow2_ceil(__fmul_rn(fmaxf(peak, 1.0e-4f), 1.0f / 448.0f));
@@ -105,6 +119,7 @@ extern "C" int ds4_gpu_dsv41_quantize(ds4_gpu_tensor *x, uint32_t width,
     return cuda_ok(cudaGetLastError(), "V4.1 activation rounding");
 }
 
+#ifndef __HIP_PLATFORM_AMD__
 extern "C" int ds4_gpu_dsv41_shared_join(void) {
     if (!g_dsv41_shared.pending) return 1;
     g_dsv41_shared.pending = false;
@@ -297,6 +312,8 @@ extern "C" int ds4_gpu_dsv41_shared_start(
     return 1;
 }
 
+#endif
+
 struct dsv41_rope_args {
     uint32_t width, heads, rows, start, stride, inverse;
     float frequencies[32];
@@ -373,9 +390,9 @@ __global__ static void dsv41_engram_kernel(float *residual, const float *kv,
         k2 += k * k;
         dot += h * (qw[wi] * kw[wi]) * k;
     }
-    h2 = __shfl_sync(0xffffffffu, warp_sum_f32(h2), 0);
-    k2 = __shfl_sync(0xffffffffu, warp_sum_f32(k2), 0);
-    dot = __shfl_sync(0xffffffffu, warp_sum_f32(dot), 0) *
+    h2 = dsv41_broadcast(warp_sum_f32(h2));
+    k2 = dsv41_broadcast(warp_sum_f32(k2));
+    dot = dsv41_broadcast(warp_sum_f32(dot)) *
         rsqrtf(h2 / width + eps) * rsqrtf(k2 / width + eps) * rsqrtf(float(width));
     const float gate = 1.0f / (1.0f + expf(-copysignf(sqrtf(fmaxf(fabsf(dot), 1.0e-6f)), dot)));
     for (uint32_t i = lane; i < width; i += 32u)
@@ -494,7 +511,11 @@ __global__ static void dsv41_carry_kernel(uint32_t *packed, float *plain,
         else plain[(uint64_t)row * width + col] = __uint_as_float((uint32_t)p[col] << 16u);
     } else if (pack) {
         const bool allowed = col < width && plain[(uint64_t)row * width + col] == 0.0f;
+#ifdef __HIP_PLATFORM_AMD__
+        const uint32_t bits = (uint32_t)(__ballot(allowed) >> ((threadIdx.x % warpSize) / 32u * 32u));
+#else
         const uint32_t bits = __ballot_sync(0xffffffffu, allowed);
+#endif
         if (!(col & 31u)) packed[(uint64_t)row * words + col / 32u] = bits;
     } else if (col < width) {
         plain[(uint64_t)row * width + col] = packed[(uint64_t)row * words + col / 32u] &
@@ -555,8 +576,7 @@ __global__ static void dsv41_index_scores_kernel(float *scores, const float *q,
         const float a = __fadd_rn(__fmul_rn(x[0], k0), __fmul_rn(x[64], k2));
         const float b = __fadd_rn(__fmul_rn(x[32], k1), __fmul_rn(x[96], k3));
         float dot = __fadd_rn(a, b);
-        for (uint32_t stride = 16u; stride; stride >>= 1u)
-            dot += __shfl_down_sync(0xffffffffu, dot, stride);
+        dot = warp_sum_f32(dot);
         total += fmaxf(dot, 0.0f) * weights[(uint64_t)row * 32u + h];
     }
     if (!lane) scores[(uint64_t)row * width + key] = total * (1.0f / 64.0f);
@@ -589,6 +609,15 @@ extern "C" int ds4_gpu_dsv41_indexer_scores_packed(ds4_gpu_tensor *, const ds4_g
                                                    const ds4_gpu_tensor *, uint32_t, uint32_t,
                                                    uint32_t, uint32_t, uint32_t, uint32_t) { return 0; }
 
+#ifdef __HIP_PLATFORM_AMD__
+__global__ static void dsv41_causal_scores_kernel(float *out, const float *scores,
+        uint32_t width, uint32_t stride, uint32_t start, uint32_t ratio) {
+    const uint32_t row = blockIdx.y, col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col < width) out[(uint64_t)row * width + col] =
+        col < (start + row + 1u) / ratio ? scores[(uint64_t)row * stride + col] : -INFINITY;
+}
+#endif
+
 extern "C" int ds4_gpu_dsv41_indexer_topk_batch(ds4_gpu_tensor *selected, const ds4_gpu_tensor *scores,
                                                 uint32_t width, uint32_t rows,
                                                 uint32_t start, uint32_t ratio) {
@@ -597,7 +626,24 @@ extern "C" int ds4_gpu_dsv41_indexer_topk_batch(ds4_gpu_tensor *selected, const 
         (start + 1u) / ratio < 1024u ||
         !dsv41_has_floats(selected, (uint64_t)rows * 512u) ||
         !dsv41_has_floats(scores, (uint64_t)rows * width)) return 0;
+#ifdef __HIP_PLATFORM_AMD__
+    if (rows > 1u) {
+        if (rows > 65535u) return 0;
+        /* The generic sorter already batches rows. Pack their causal prefixes
+         * without changing the caller's scores or using its sort scratch. */
+        const uint32_t packed_width = (start + rows) / ratio;
+        ds4_gpu_tensor *causal = ds4_gpu_tensor_alloc((uint64_t)rows * packed_width * sizeof(float));
+        if (!causal) return 0;
+        dsv41_causal_scores_kernel<<<dim3((packed_width + 255u) / 256u, rows), 256>>>(
+            (float *)causal->ptr, (const float *)scores->ptr, packed_width, width, start, ratio);
+        const bool ok = cuda_ok(cudaGetLastError(), "V4.1 causal scores") &&
+            ds4_gpu_indexer_topk_tensor(selected, causal, packed_width, rows, 512u);
+        ds4_gpu_tensor_free(causal);
+        return ok;
+    }
+#endif
     uint32_t row = 0;
+#ifndef __HIP_PLATFORM_AMD__
     /* Batch independent causal rows, splitting only at a sort-width boundary. */
     while (row < rows && (start + row + 1u) / ratio <= 4096u) {
         const uint32_t visible = (start + row + 1u) / ratio;
@@ -625,6 +671,7 @@ extern "C" int ds4_gpu_dsv41_indexer_topk_batch(ds4_gpu_tensor *selected, const 
             width, rows - row, 512u, start + row, ratio);
         return cuda_ok(cudaGetLastError(), "V4.1 wide causal topk batch");
     }
+#endif
     for (; row < rows; row++) {
         const uint32_t visible = (start + row + 1u) / ratio;
         ds4_gpu_tensor src = *scores, dst = *selected;
@@ -644,6 +691,7 @@ extern "C" int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out, const void *mo
     if (!width || !outputs || !rows || rows > 8192u || !model_map ||
         !dsv41_has_floats(in, (uint64_t)width * rows) ||
         !dsv41_has_floats(out, (uint64_t)outputs * rows)) return 0;
+#ifndef __HIP_PLATFORM_AMD__
     if (rows > 1u && outputs <= 128u && g_cublas_ready && !g_quality_mode &&
         !getenv("DS4_CUDA_SERIAL_F16_MATMUL") && !getenv("DS4_CUDA_NO_F16_CUBLAS_ONE") &&
         !getenv("DS4_CUDA_SERIAL_ROUTER") && !getenv("DS4_CUDA_F16_SMALL_OUT")) {
@@ -675,6 +723,7 @@ extern "C" int ds4_gpu_dsv41_projection_rows(ds4_gpu_tensor *out, const void *mo
         }
         return 1;
     }
+#endif
     for (uint32_t row = 0; row < rows; row++) {
         ds4_gpu_tensor x = *in, y = *out;
         x.ptr = (float *)x.ptr + (uint64_t)row * width;
@@ -694,6 +743,17 @@ extern "C" int ds4_gpu_dsv41_attention_output_batch(ds4_gpu_tensor *out, ds4_gpu
     if (!rows || !dsv41_has_floats(out, (uint64_t)rows * 5120u) ||
         !dsv41_has_floats(low, (uint64_t)rows * 8192u) ||
         !dsv41_has_floats(heads, (uint64_t)rows * 32768u)) return 0;
+#ifdef __HIP_PLATFORM_AMD__
+    for (uint32_t row = 0; row < rows; row++) {
+        ds4_gpu_tensor x = *heads, y = *low;
+        x.ptr = (float *)x.ptr + (uint64_t)row * 32768u;
+        x.bytes = 32768u * sizeof(float);
+        y.ptr = (float *)y.ptr + (uint64_t)row * 8192u;
+        y.bytes = 8192u * sizeof(float);
+        if (!ds4_gpu_attention_output_low_q8_tensor(&y, model_map, model_size,
+                a, 4096u, 1024u, 8u, &x)) return 0;
+    }
+#else
     /* Quantization launches one grid-y entry per row and head group. */
     for (uint32_t first = 0; first < rows; ) {
         const uint32_t count = min(rows - first, 65535u / 8u);
@@ -706,6 +766,7 @@ extern "C" int ds4_gpu_dsv41_attention_output_batch(ds4_gpu_tensor *out, ds4_gpu
                 a, 4096u, 1024u, 8u, 0u, 8u, &x, count)) return 0;
         first += count;
     }
+#endif
     return ds4_gpu_dsv41_quantize(low, 8192u, rows, DS4_V41_BF16) &&
         ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(out, model_map, model_size,
             b, 8192u, 5120u, low, rows);
