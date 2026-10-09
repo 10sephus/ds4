@@ -81,7 +81,8 @@ def main():
     ap.add_argument("source", type=Path)
     ap.add_argument("dumps", type=Path)
     args = ap.parse_args()
-    db = SourceDB(str(args.source), index_validator=lambda _: None, scale_validator=lambda _: None)
+    db = SourceDB(str(args.source), index_validator=lambda _: None, scale_validator=lambda _: None,
+                  tensor_prefix="mtp.")
     decoder = LosslessWeights()
     failures = []
 

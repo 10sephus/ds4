@@ -287,7 +287,8 @@ def main():
         parser.error("source revision must be a full commit hash")
     with open(os.path.join(args.hf, "config.json"), "rb") as fp:
         config = json.load(fp)
-    db = SourceDB(args.hf, index_validator=lambda _: None, scale_validator=lambda _: None)
+    db = SourceDB(args.hf, index_validator=lambda _: None, scale_validator=lambda _: None,
+                  tensor_prefix="mtp.")
     try:
         weights = LosslessWeights()
         plan = build_plan(db, config, weights)

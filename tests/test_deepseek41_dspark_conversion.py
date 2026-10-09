@@ -4,6 +4,7 @@
 import contextlib
 import io
 import json
+import struct
 from pathlib import Path
 import sys
 import tempfile
@@ -17,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "gguf-tools"))
 from deepseek41_dspark import (LosslessWeights, build_plan, write_gguf,
                                verify_gguf, ALIGNMENT)
-from glm53_quantize import TensorPlan, QTYPE_F16, QTYPE_F32, QTYPE_MXFP4, kv_string, kv_u32, qtype_nbytes
+from glm53_quantize import SourceDB, TensorPlan, QTYPE_F16, QTYPE_F32, QTYPE_MXFP4, kv_string, kv_u32, qtype_nbytes
 
 
 class MemoryDB:
@@ -38,6 +39,36 @@ class MemoryDB:
 class ConversionTests(unittest.TestCase):
     def setUp(self):
         self.q, self.db = LosslessWeights(), MemoryDB()
+
+    def test_draft_only_source_shards(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            header = json.dumps({
+                "mtp.0.weight": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+                "layers.39.weight": {"dtype": "F32", "shape": [1], "data_offsets": [4, 8]},
+            }).encode()
+            root.joinpath("draft.safetensors").write_bytes(
+                struct.pack("<Q", len(header)) + header + struct.pack("<ff", 3., 4.))
+            index = {"weight_map": {"mtp.0.weight": "draft.safetensors",
+                                   "layers.39.weight": "draft.safetensors",
+                                   "layers.0.weight": "not-downloaded.safetensors"}}
+            root.joinpath("model.safetensors.index.json").write_text(json.dumps(index))
+            validator = mock.Mock()
+            db = SourceDB(tmp, index_validator=validator, scale_validator=lambda _: None,
+                          tensor_prefix="mtp.")
+            try:
+                validator.assert_called_once_with(index["weight_map"])
+                self.assertEqual(set(db.tensors), {"mtp.0.weight"})
+                self.assertEqual(db.read("mtp.0.weight"), struct.pack("<f", 3.))
+            finally:
+                db.close()
+            with self.assertRaisesRegex(ValueError, "missing source shard"):
+                SourceDB(tmp, index_validator=lambda _: None, scale_validator=lambda _: None)
+            index["weight_map"]["mtp.1.weight"] = "draft.safetensors"
+            root.joinpath("model.safetensors.index.json").write_text(json.dumps(index))
+            with self.assertRaisesRegex(ValueError, "incomplete"):
+                SourceDB(tmp, index_validator=lambda _: None, scale_validator=lambda _: None,
+                         tensor_prefix="mtp.")
 
     def test_native_fp4_all_codes_scales_and_layout(self):
         name = "mtp.0.ffn.experts.0.w1.weight"
