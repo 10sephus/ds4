@@ -245,6 +245,12 @@ tests/test_deepseek41_graph.o: tests/test_deepseek41_graph.c ds4.c ds4_gpu.h ds4
 tests/test_deepseek41_graph: tests/test_deepseek41_graph.o $(filter-out ds4.o,$(CORE_OBJS))
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(METAL_LDLIBS)
 
+tests/test_deepseek41_dspark.o: tests/test_deepseek41_dspark.c ds4.c ds4_deepseek41_dspark.h ds4_gpu.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
+
+tests/test_deepseek41_dspark: tests/test_deepseek41_dspark.o $(filter-out ds4.o,$(CORE_OBJS))
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(METAL_LDLIBS)
+
 tests/test_deepseek41_prefill.o: tests/test_deepseek41_prefill.c ds4.c ds4_gpu.h ds4_engram.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
 
@@ -727,7 +733,7 @@ test-qwen4-cuda: tests/test_qwen4_cuda
 	./tests/test_qwen4_cuda
 endif
 
-ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_gpu_copy.h ds4_gpu_tp.h ds4_deepseek41_gpu.h ds4_linux_memory.h ds4_engram.h
+ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h ds4_gpu_copy.h ds4_gpu_tp.h ds4_deepseek41_gpu.h ds4_deepseek41_dspark.h ds4_linux_memory.h ds4_engram.h
 	$(CC) $(CFLAGS) -c -o $@ ds4.c
 
 ds4_image.o: ds4_image.c ds4_image.h third_party/iris/jpeg.h third_party/iris/png.h
@@ -1370,6 +1376,7 @@ clean:
 	rm -f tests/test_cuda_ssd_repack
 	rm -f tests/test_deepseek41_gguf
 	rm -f tests/test_deepseek41_graph tests/test_deepseek41_cli
+	rm -f tests/test_deepseek41_dspark
 	rm -f tests/test_deepseek41_prefill
 	rm -f tests/test_metal_tp_bulk
 	rm -f tests/test_cuda_q8_scratch

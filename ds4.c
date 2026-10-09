@@ -3281,6 +3281,17 @@ static ds4_support_kind support_model_detect(
 static bool support_model_checkpoint_compatible(const ds4_model *m) {
     static const char vision_exp_revision[] =
         "e46e16bf6035c6f317eb2ac7458eb0362926d402";
+    ds4_str family = {0}, arch = {0};
+    const bool has_family = model_get_string(m, "dspark.target_architecture", &family);
+    const bool has_arch = model_get_string(m, "general.architecture", &arch);
+    const bool v41 = has_family && ds4_streq(family, "deepseek41") &&
+                     has_arch && ds4_streq(arch, "deepseek41-dspark");
+    if ((DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) != v41 ||
+        (has_family && !v41 && !ds4_streq(family, "deepseek4")) ||
+        (has_arch && ds4_streq(arch, "deepseek41-dspark") && !v41)) {
+        fprintf(stderr, "ds4: DSpark support model and target checkpoint families differ\n");
+        return false;
+    }
     ds4_str variant = {0};
     const bool has_variant =
         model_get_string(m, "deepseek4.checkpoint_variant", &variant);
@@ -4752,6 +4763,8 @@ typedef struct {
     uint32_t missing_tensors;
     uint32_t invalid_tensors;
     uint32_t metadata_errors;
+    uint32_t n_experts, n_experts_used;
+    bool v41;
     bool has_block_size;
     bool has_markov_rank;
     bool has_noise_token_id;
@@ -6198,6 +6211,7 @@ static void dspark_weights_validate_block_layout(
     const uint64_t hc_mix_dim = 2u * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
     const uint64_t out_low_dim = (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O;
+    const uint32_t n_experts = dw->v41 ? dw->n_experts : DS4_N_EXPERT;
 
     dspark_validate_tensor_layout(dw, l->hc_attn_fn, "hc_attn_fn",
                                   DS4_DSPARK_LAYOUT_PLAIN, 2,
@@ -6249,19 +6263,19 @@ static void dspark_weights_validate_block_layout(
                                   DS4_N_EMBD, 0, 0);
     dspark_validate_tensor_layout(dw, l->ffn_gate_inp, "ffn_gate_inp",
                                   DS4_DSPARK_LAYOUT_DENSE, 2,
-                                  DS4_N_EMBD, DS4_N_EXPERT, 0);
+                                  DS4_N_EMBD, n_experts, 0);
     dspark_validate_tensor_layout(dw, l->ffn_exp_probs_b, "exp_probs_b",
                                   DS4_DSPARK_LAYOUT_F32, 1,
-                                  DS4_N_EXPERT, 0, 0);
+                                  n_experts, 0, 0);
     dspark_validate_tensor_layout(dw, l->ffn_gate_exps, "ffn_gate_exps",
                                   DS4_DSPARK_LAYOUT_ROUTED, 3,
-                                  DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+                                  DS4_N_EMBD, DS4_N_FF_EXP, n_experts);
     dspark_validate_tensor_layout(dw, l->ffn_up_exps, "ffn_up_exps",
                                   DS4_DSPARK_LAYOUT_ROUTED, 3,
-                                  DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
+                                  DS4_N_EMBD, DS4_N_FF_EXP, n_experts);
     dspark_validate_tensor_layout(dw, l->ffn_down_exps, "ffn_down_exps",
                                   DS4_DSPARK_LAYOUT_ROUTED, 3,
-                                  DS4_N_FF_EXP, DS4_N_EMBD, DS4_N_EXPERT);
+                                  DS4_N_FF_EXP, DS4_N_EMBD, n_experts);
     if (l->ffn_gate_exps &&
         l->ffn_up_exps &&
         l->ffn_gate_exps->type != l->ffn_up_exps->type) {
@@ -8796,9 +8810,26 @@ static void dspark_weights_bind_optional(
     dw->has_markov_rank = summary->has_markov_rank;
     dw->has_noise_token_id = summary->has_noise_token_id;
     dw->has_target_layers = summary->has_target_layers;
+    ds4_str arch = {0};
+    dw->v41 = model_get_string(m, "general.architecture", &arch) &&
+              ds4_streq(arch, "deepseek41-dspark");
+    dw->n_experts = DS4_N_EXPERT;
+    dw->n_experts_used = DS4_N_EXPERT_USED;
+    if (dw->v41) {
+        if (!model_get_u32(m, "dspark.n_routed_experts", &dw->n_experts) ||
+            !model_get_u32(m, "dspark.num_experts_per_tok", &dw->n_experts_used) ||
+            dw->n_experts != 128 || dw->n_experts_used != 3 ||
+            dw->n_stages != 3 || dw->block_size != 5 || dw->markov_rank != 256 ||
+            dw->target_layer_count != 3) {
+            dspark_weights_note_metadata_error(dw, "unsupported V4.1 drafter dimensions");
+        }
+    }
     memcpy(dw->target_layers,
            summary->target_layers,
            (size_t)dw->target_layer_count * sizeof(dw->target_layers[0]));
+    if (dw->v41 && (dw->target_layers[0] != 37 || dw->target_layers[1] != 38 ||
+                     dw->target_layers[2] != 39))
+        dspark_weights_note_metadata_error(dw, "unsupported V4.1 target layers");
     if (summary->stages > DS4_DSPARK_MAX_STAGES) dw->missing_tensors++;
 
     for (uint32_t stage = 0; stage < dw->n_stages; stage++) {
@@ -8815,11 +8846,11 @@ static void dspark_weights_bind_optional(
         ds4_dspark_stage_weights *sw = &dw->stage[final_stage];
         sw->norm = dspark_bind_tensor(dw, m, final_stage, "norm.weight", true);
         sw->hc_head_base =
-            dspark_bind_tensor(dw, m, final_stage, "hc_head_base.weight", true);
+            dspark_bind_tensor(dw, m, final_stage, "hc_head_base.weight", !dw->v41);
         sw->hc_head_fn =
-            dspark_bind_tensor(dw, m, final_stage, "hc_head_fn.weight", true);
+            dspark_bind_tensor(dw, m, final_stage, "hc_head_fn.weight", !dw->v41);
         sw->hc_head_scale =
-            dspark_bind_tensor(dw, m, final_stage, "hc_head_scale.weight", true);
+            dspark_bind_tensor(dw, m, final_stage, "hc_head_scale.weight", !dw->v41);
         sw->markov_w1 =
             dspark_bind_tensor(dw, m, final_stage, "markov_head.markov_w1.weight", true);
         sw->markov_w2 =
@@ -40871,6 +40902,12 @@ typedef struct {
 #undef DS41_ROW_FIELD
 } ds41_prefill_row;
 
+typedef struct ds41_dspark ds41_dspark;
+static void ds41_dspark_free(ds41_dspark *d);
+static void ds41_dspark_reset(ds41_dspark *d);
+static bool ds41_dspark_capture(ds41_dspark *d, uint32_t layer, uint32_t pos,
+                                const ds4_gpu_tensor *residual, uint32_t rows);
+
 static uint32_t ds41_prefill_limit(uint32_t ctx) {
     const uint32_t limit = ctx < 8192u || getenv("DS4_METAL_DISABLE_V41_WIDE_CHUNK") ? 2048u :
         (ctx < 16384u || getenv("DS4_METAL_DISABLE_V41_8K_CHUNK")) ? 4096u : DS41_PREFILL_CAP;
@@ -40951,6 +40988,7 @@ typedef struct {
     ds41_prefill_row batch, *rows_view;
     ds41_prefill_row carry;
     ds4_gpu_tensor *prefill_tokens;
+    ds41_dspark *dspark;
 #define DS41_FIELD(name, count) ds4_gpu_tensor *name;
     DS41_SCRATCH(DS41_FIELD)
 #undef DS41_FIELD
@@ -40966,6 +41004,7 @@ static bool ds41_read_array(const ds4_model *m, const char *key, uint32_t type,
 
 static void ds41_graph_free(ds41_gpu_graph *g) {
     if (!g) return;
+    ds41_dspark_free(g->dspark);
     ds4_engram_reader_free(g->engram_reader);
 #if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     ds4_gpu_decode_graphs_invalidate();
@@ -41054,6 +41093,7 @@ static void ds41_graph_reset(ds41_gpu_graph *g) {
     g->pos = 0;
     g->valid = true;
     ds4_engram_history_reset(&g->history);
+    ds41_dspark_reset(g->dspark);
     /* Valid lengths, not zeroed storage, determine cache visibility. Each
      * partial pair is overwritten by its even-position token before use. */
 }
@@ -41644,7 +41684,8 @@ static bool ds41_graph_before_attention(ds41_gpu_graph *g, const ds4_model *m,
                 g->engram_q_norm[i], g->engram_k_norm[i], NULL, DS4_N_EMBD, 1, DS4_RMS_EPS))
             return false;
     }
-    return ds41_hc_mix(g, m, l, false) &&
+    return ds41_dspark_capture(g->dspark, il, g->pos, g->residual, 1) &&
+        ds41_hc_mix(g, m, l, false) &&
         ds41_hc_sum(g->x, g->residual, g->pre, false) && ds41_norm(g->norm, g->x, m, l->attn_norm);
 }
 
@@ -41974,7 +42015,7 @@ static bool ds41_decode_island(ds41_gpu_graph *g, const ds4_model *m,
 
 static bool ds41_graph_decode_layer(ds41_gpu_graph *g, const ds4_model *m,
                                     const ds4_layer_weights *l, uint32_t il, int token) {
-    if (g->tp_world != 2 || g->streaming || g->quality || g->imatrix ||
+    if (g->tp_world != 2 || g->streaming || g->quality || g->imatrix || g->dspark ||
         g->image_count || getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER") ||
         g_expert_profile.active || getenv("DS4_CUDA_MOE_PROFILE") ||
         metal_graph_debug_get_config()->prefix ||
@@ -42564,7 +42605,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
             if (il == 20u)
                 ok = ds41_decoder_prepare(g, m, &w->layer[il], il, initial_start,
                     0, total_count, true, batch_hc, batch_attention, cancel, cancel_ud);
-            const uint32_t needed = 1u + (DS4_N_LAYER - 1u - il) * 127u;
+            const uint32_t needed = (g->dspark ? 128u : 1u) + (DS4_N_LAYER - 1u - il) * 127u;
             first = total_count - needed;
             if (ok) ok = ds41_decoder_prepare(g, m, &w->layer[il], il, initial_start,
                 first - 127u, 127u, false, batch_hc, batch_attention, cancel, cancel_ud);
@@ -42662,7 +42703,8 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                                          off * bytes, count * bytes) != 0;
             }
             if (ok && batch_hc)
-                ok = ds41_before_attention_batch(g, &active, m, &w->layer[il], il, count);
+                ok = ds41_dspark_capture(g->dspark, il, start, active.residual, count) &&
+                    ds41_before_attention_batch(g, &active, m, &w->layer[il], il, count);
             DS41_STAGE("hc/engram");
             for (uint32_t t = 0; ok && !batch_hc && t < count; t++) {
                 row.pos = start + t;
@@ -42902,6 +42944,9 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                     sizeof(s->rows[table]));
             }
         }
+        for (int i = 0; ok && i < count; i++)
+            ok = ds41_dspark_capture(graphs[i]->dspark, il, positions[i],
+                g->rows_view[i].residual, 1);
         if (ok) ok = ds41_before_attention_batch(g, &active, model, l, il, rows) &&
             ds41_attention_project_batch(g, model, l, rows);
         bool batch_output = false;
@@ -43001,6 +43046,7 @@ static bool ds41_graph_short_prefill(ds41_gpu_graph *g, const ds4_model *m,
     if (!ok) g->valid = false;
     return ok;
 }
+#include "ds4_deepseek41_dspark.h"
 #undef DS41_PREFILL_ROWS
 #undef DS41_PREFILL_ALIASES
 #undef DS41_PREFILL_STORAGE

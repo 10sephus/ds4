@@ -1,0 +1,285 @@
+/* Internal V4.1 drafter graph. Included after the target graph in ds4.c. */
+#ifndef DS4_DEEPSEEK41_DSPARK_H
+#define DS4_DEEPSEEK41_DSPARK_H
+
+#define DS41_DRAFT_WINDOW 128u
+#define DS41_DRAFT_ROWS 5u
+
+struct ds41_dspark {
+    const ds4_dspark_weights *weights;
+    ds41_prefill_row batch;
+    ds4_gpu_tensor *target[3], *window[3];
+    uint32_t positions[3][DS41_DRAFT_WINDOW];
+    uint32_t kv_end;
+    bool kv_valid;
+    ds4_gpu_tensor *mean_weights, *mean, *input, *projected, *main_x, *main_kv;
+    ds4_gpu_tensor *logits, *tokens, *markov_embed, *markov_logits, *confidence_input, *confidence;
+    float *host_logits;
+};
+
+static void ds41_dspark_reset(ds41_dspark *d) {
+    if (!d) return;
+    memset(d->positions, 0xff, sizeof(d->positions));
+    d->kv_valid = false;
+    d->kv_end = 0;
+}
+
+static void ds41_dspark_free(ds41_dspark *d) {
+    if (!d) return;
+#define DS41_DRAFT_FREE(name, count) ds4_gpu_tensor_free(d->batch.name);
+    DS41_PREFILL_ROWS(DS41_DRAFT_FREE)
+#undef DS41_DRAFT_FREE
+    for (unsigned i = 0; i < 3; i++) {
+        ds4_gpu_tensor_free(d->target[i]);
+        ds4_gpu_tensor_free(d->window[i]);
+    }
+    ds4_gpu_tensor_free(d->mean_weights); ds4_gpu_tensor_free(d->mean);
+    ds4_gpu_tensor_free(d->input); ds4_gpu_tensor_free(d->projected);
+    ds4_gpu_tensor_free(d->main_x); ds4_gpu_tensor_free(d->main_kv);
+    ds4_gpu_tensor_free(d->logits); ds4_gpu_tensor_free(d->markov_embed);
+    ds4_gpu_tensor_free(d->tokens);
+    ds4_gpu_tensor_free(d->markov_logits); ds4_gpu_tensor_free(d->confidence_input);
+    ds4_gpu_tensor_free(d->confidence);
+    free(d->host_logits);
+    free(d);
+}
+
+static DS4_MAYBE_UNUSED ds41_dspark *ds41_dspark_alloc(const ds4_dspark_weights *dw) {
+    if (!dw || !dw->v41 || dw->n_stages != 3 || dw->block_size != DS41_DRAFT_ROWS ||
+        dw->missing_tensors || dw->invalid_tensors || dw->metadata_errors) return NULL;
+    ds41_dspark *d = calloc(1, sizeof(*d));
+    if (!d) return NULL;
+    d->weights = dw;
+    const ds41_gpu_graph shape = {.ctx = DS41_DRAFT_WINDOW}, *g = &shape;
+#define DS41_DRAFT_ALLOC(name, width) \
+    if (!(d->batch.name = ds4_gpu_tensor_alloc((uint64_t)(width) * DS41_DRAFT_ROWS * sizeof(float)))) goto fail;
+    DS41_PREFILL_ROWS(DS41_DRAFT_ALLOC)
+#undef DS41_DRAFT_ALLOC
+    for (unsigned i = 0; i < 3; i++) {
+        d->target[i] = ds4_gpu_tensor_alloc((uint64_t)DS41_DRAFT_WINDOW * DS4_N_EMBD * 4u);
+        d->window[i] = ds4_gpu_tensor_alloc((uint64_t)(DS41_DRAFT_WINDOW + DS41_DRAFT_ROWS) * DS4_N_HEAD_DIM * 4u);
+        if (!d->target[i] || !d->window[i]) goto fail;
+    }
+#define DS41_DRAFT_A(name, count) \
+    if (!(d->name = ds4_gpu_tensor_alloc((uint64_t)(count) * sizeof(float)))) goto fail;
+    DS41_DRAFT_A(mean_weights, DS41_DRAFT_WINDOW * DS4_N_HC)
+    DS41_DRAFT_A(mean, DS41_DRAFT_WINDOW * DS4_N_EMBD)
+    DS41_DRAFT_A(input, DS41_DRAFT_WINDOW * 3u * DS4_N_EMBD)
+    DS41_DRAFT_A(projected, DS41_DRAFT_WINDOW * DS4_N_EMBD)
+    DS41_DRAFT_A(main_x, DS41_DRAFT_WINDOW * DS4_N_EMBD)
+    DS41_DRAFT_A(main_kv, DS41_DRAFT_WINDOW * DS4_N_HEAD_DIM)
+    DS41_DRAFT_A(logits, DS41_DRAFT_ROWS * DS4_N_VOCAB)
+    DS41_DRAFT_A(tokens, DS41_DRAFT_ROWS)
+    DS41_DRAFT_A(markov_embed, dw->markov_rank)
+    DS41_DRAFT_A(markov_logits, DS4_N_VOCAB)
+    DS41_DRAFT_A(confidence_input, DS4_N_EMBD + dw->markov_rank)
+    DS41_DRAFT_A(confidence, 1)
+#undef DS41_DRAFT_A
+    d->host_logits = malloc((uint64_t)DS41_DRAFT_ROWS * DS4_N_VOCAB * sizeof(float));
+    if (!d->host_logits || !ds4_gpu_tensor_fill_f32(d->mean_weights,
+        1.0f / DS4_N_HC, DS41_DRAFT_WINDOW * DS4_N_HC) ||
+        !ds4_gpu_tensor_fill_f32(d->tokens, 0, DS41_DRAFT_ROWS)) goto fail;
+    ds41_dspark_reset(d);
+    return d;
+fail:
+    ds41_dspark_free(d);
+    return NULL;
+}
+
+static bool ds41_dspark_capture(ds41_dspark *d, uint32_t layer, uint32_t pos,
+                                const ds4_gpu_tensor *residual, uint32_t rows) {
+    if (!d) return true;
+    unsigned stage = 0;
+    while (stage < 3 && d->weights->target_layers[stage] != layer) stage++;
+    if (stage == 3) return true;
+    if (!rows || rows > UINT32_MAX - pos) return false;
+    const uint32_t count = rows < DS41_DRAFT_WINDOW ? rows : DS41_DRAFT_WINDOW;
+    const uint32_t first = rows - count, start = pos + first;
+    const uint64_t bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    ds4_gpu_tensor *src = ds4_gpu_tensor_view((ds4_gpu_tensor *)residual,
+        first * DS4_N_HC * bytes, count * DS4_N_HC * bytes);
+    ds4_gpu_tensor *out = ds4_gpu_tensor_view(d->mean, 0, count * bytes);
+    ds4_gpu_tensor *mix = ds4_gpu_tensor_view(d->mean_weights, 0, count * DS4_N_HC * sizeof(float));
+    bool ok = src && out && mix && ds4_gpu_hc_weighted_sum_tensor(out, src, mix, DS4_N_EMBD, DS4_N_HC) &&
+        ds4_gpu_dsv41_quantize(out, DS4_N_EMBD, count, DS4_V41_BF16);
+    const uint32_t slot = start % DS41_DRAFT_WINDOW;
+    const uint32_t part = count < DS41_DRAFT_WINDOW - slot ? count : DS41_DRAFT_WINDOW - slot;
+    if (ok) ok = ds4_gpu_tensor_copy(d->target[stage], slot * bytes, out, 0, part * bytes) &&
+        (part == count || ds4_gpu_tensor_copy(d->target[stage], 0, out, part * bytes, (count - part) * bytes));
+    ds4_gpu_tensor_free(mix); ds4_gpu_tensor_free(out); ds4_gpu_tensor_free(src);
+    if (ok) for (uint32_t i = 0; i < count; i++)
+        d->positions[stage][(start + i) % DS41_DRAFT_WINDOW] = start + i;
+    return ok;
+}
+
+/* Only accepted target features enter these rings. A fresh prefill seeds the
+ * last window once; subsequent calls project only the newly accepted rows. */
+static bool ds41_dspark_seed(ds41_dspark *d, const ds4_model *m, uint32_t pos) {
+    if (!pos) return false;
+    const uint32_t oldest = pos > DS41_DRAFT_WINDOW ? pos - DS41_DRAFT_WINDOW : 0;
+    const uint32_t start = d->kv_valid && d->kv_end >= oldest && d->kv_end <= pos ? d->kv_end : oldest;
+    const uint32_t count = pos - start;
+    if (!count) return true;
+    const uint64_t row_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    for (uint32_t i = 0; i < count; i++) {
+        const uint32_t slot = (start + i) % DS41_DRAFT_WINDOW;
+        for (unsigned stage = 0; stage < 3; stage++) {
+            if (d->positions[stage][slot] != start + i ||
+                !ds4_gpu_tensor_copy(d->input, (i * 3u + stage) * row_bytes,
+                    d->target[stage], slot * row_bytes, row_bytes)) return false;
+        }
+    }
+    const ds4_dspark_stage_weights *first = &d->weights->stage[0];
+    if (!ds41_matmul_batch(d->projected, m, first->main_proj, d->input, count, true) ||
+        !ds41_norm_batch(d->main_x, d->projected, m, first->main_norm, count)) return false;
+    const uint64_t kv_bytes = DS4_N_HEAD_DIM * sizeof(float);
+    for (unsigned stage = 0; stage < 3; stage++) {
+        const ds4_layer_weights *l = &d->weights->stage[stage].block;
+        if (!ds41_matmul_batch(d->main_kv, m, l->attn_kv, d->main_x, count, true) ||
+            !ds41_norm_batch(d->main_kv, d->main_kv, m, l->attn_kv_a_norm, count) ||
+            !ds4_gpu_dsv41_rope(d->main_kv, DS4_N_HEAD_DIM, 1, count, start, false, false) ||
+            !ds4_gpu_dsv41_quantize(d->main_kv, DS4_N_HEAD_DIM, count, DS4_V41_FP8_E8M0)) return false;
+        const uint32_t slot = start % DS41_DRAFT_WINDOW;
+        const uint32_t part = count < DS41_DRAFT_WINDOW - slot ? count : DS41_DRAFT_WINDOW - slot;
+        if (!ds4_gpu_tensor_copy(d->window[stage], slot * kv_bytes, d->main_kv, 0, part * kv_bytes) ||
+            (part < count && !ds4_gpu_tensor_copy(d->window[stage], 0, d->main_kv,
+                part * kv_bytes, (count - part) * kv_bytes))) return false;
+    }
+    d->kv_end = pos;
+    d->kv_valid = true;
+    return true;
+}
+
+static bool ds41_dspark_attention_output(ds41_prefill_row *b, const ds4_model *m,
+                                          const ds4_layer_weights *l) {
+    const uint32_t groups = DS4_N_OUT_GROUP, width = DS4_N_HEAD * DS4_N_HEAD_DIM / groups;
+    uint64_t weight_row;
+    if (!tensor_nbytes(l->attn_output_a->type, width, &weight_row)) return false;
+    for (uint32_t row = 0; row < DS41_DRAFT_ROWS; row++) {
+        for (uint32_t group = 0; group < groups; group++) {
+            ds4_tensor slice = *l->attn_output_a;
+            slice.abs_offset += group * DS4_N_LORA_O * weight_row;
+            slice.dim[1] = DS4_N_LORA_O;
+            ds4_gpu_tensor *x = ds4_gpu_tensor_view(b->heads,
+                ((uint64_t)row * groups + group) * width * 4u, width * 4u);
+            ds4_gpu_tensor *y = ds4_gpu_tensor_view(b->low,
+                ((uint64_t)row * groups + group) * DS4_N_LORA_O * 4u, DS4_N_LORA_O * 4u);
+            const bool ok = x && y && ds41_matmul(y, m, &slice, x, true);
+            ds4_gpu_tensor_free(y); ds4_gpu_tensor_free(x);
+            if (!ok) return false;
+        }
+    }
+    return ds41_matmul_batch(b->block, m, l->attn_output_b, b->low, DS41_DRAFT_ROWS, true);
+}
+
+static bool ds41_dspark_stage(ds41_dspark *d, const ds4_model *m, uint32_t stage, uint32_t pos) {
+    ds41_prefill_row *b = &d->batch;
+    const ds4_layer_weights *l = &d->weights->stage[stage].block;
+    const uint32_t n = DS41_DRAFT_ROWS, past = pos < DS41_DRAFT_WINDOW ? pos : DS41_DRAFT_WINDOW;
+    if (!ds41_hc_mix_batch(b, m, l, false, n) ||
+        !(stage ? ds4_gpu_hc_weighted_sum_split_tensor(b->x, b->residual, b->ffn_split, DS4_N_EMBD, DS4_N_HC) :
+                  ds4_gpu_hc_weighted_sum_tensor(b->x, b->residual, b->pre, DS4_N_EMBD, DS4_N_HC)) ||
+        !ds4_gpu_dsv41_quantize(b->x, DS4_N_EMBD, n, DS4_V41_BF16) ||
+        !ds41_norm_batch(b->norm, b->x, m, l->attn_norm, n) ||
+        !ds41_matmul_batch(b->qr, m, l->attn_q_a, b->norm, n, true) ||
+        !ds41_norm_batch(b->qr, b->qr, m, l->attn_q_a_norm, n) ||
+        !ds41_matmul_batch(b->q, m, l->attn_q_b, b->qr, n, true) ||
+        !ds4_gpu_dsv41_rope(b->q, DS4_N_HEAD_DIM, DS4_N_HEAD, n, pos, false, false) ||
+        !ds41_matmul_batch(b->kv, m, l->attn_kv, b->norm, n, true) ||
+        !ds41_norm_batch(b->kv, b->kv, m, l->attn_kv_a_norm, n) ||
+        !ds4_gpu_dsv41_rope(b->kv, DS4_N_HEAD_DIM, 1, n, pos, false, false) ||
+        !ds4_gpu_dsv41_quantize(b->kv, DS4_N_HEAD_DIM, n, DS4_V41_FP8_E8M0) ||
+        !ds4_gpu_tensor_copy(d->window[stage], (uint64_t)past * DS4_N_HEAD_DIM * 4u,
+            b->kv, 0, (uint64_t)n * DS4_N_HEAD_DIM * 4u) ||
+        !ds4_gpu_attention_noncausal_raw_batch_heads_tensor(b->heads, m->map, m->size,
+            l->attn_sinks->abs_offset, b->q, d->window[stage], n, past + n,
+            DS41_DRAFT_WINDOW + n, 0, DS4_N_HEAD, DS4_N_HEAD_DIM) ||
+        !ds4_gpu_dsv41_quantize(b->heads, DS4_N_HEAD * DS4_N_HEAD_DIM, n, DS4_V41_BF16) ||
+        !ds4_gpu_dsv41_rope(b->heads, DS4_N_HEAD_DIM, DS4_N_HEAD, n, pos, false, true) ||
+        !ds41_dspark_attention_output(b, m, l) ||
+        !ds41_after_attention_batch(b, m, l, n)) return false;
+    const uint32_t experts = d->weights->n_experts, active = d->weights->n_experts_used;
+    const uint64_t gate_row = routed_expert_row_bytes(l->ffn_gate_exps);
+    const uint64_t down_row = routed_expert_row_bytes(l->ffn_down_exps);
+    bool mid_f16 = false;
+    return ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, n, false) &&
+        ds4_gpu_router_select_batch_tensor(b->selected, b->route_weights, b->route_probs,
+            m->map, m->size, l->ffn_exp_probs_b->abs_offset, 0, 0, 0, 0, true, false,
+            b->route_logits, d->tokens, experts, active, DS4_EXPERT_WEIGHT_SCALE, n) &&
+        ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, n, true) &&
+        ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, n, true) &&
+        ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up,
+            n * DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
+        ds4_gpu_dsv41_quantize(b->shared_mid, DS4_N_FF_EXP, n, DS4_V41_BF16) &&
+        ds41_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, n, true) &&
+        ds4_gpu_routed_moe_batch_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
+            m->map, m->size, l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset,
+            l->ffn_down_exps->abs_offset, l->ffn_gate_exps->type, l->ffn_down_exps->type,
+            gate_row * DS4_N_FF_EXP, gate_row, down_row * DS4_N_EMBD, down_row,
+            DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD, b->selected, b->route_weights,
+            experts, active, DS4_SWIGLU_CLAMP_EXP, b->norm, stage, n, &mid_f16, true) &&
+        ds4_gpu_add_tensor(b->block, b->routed, b->shared, n * DS4_N_EMBD) &&
+        ds4_gpu_dsv41_quantize(b->block, DS4_N_EMBD, n, DS4_V41_BF16) &&
+        ds4_gpu_hc_expand_split_tensor(b->residual, b->block, b->after_attn,
+            b->ffn_split, DS4_N_EMBD, DS4_N_HC) &&
+        ds4_gpu_dsv41_quantize(b->residual, DS4_N_HC * DS4_N_EMBD, n, DS4_V41_BF16);
+}
+
+/* Leaves the five base-logit rows and unnormalized collapsed features on the
+ * GPU. Markov sampling is sequential and performed after this stage chain. */
+static DS4_MAYBE_UNUSED bool ds41_dspark_forward(ds41_dspark *d, const ds4_model *target,
+                                 const ds4_weights *tw, const ds4_model *draft,
+                                 uint32_t pos, int token) {
+    if (!d || !pos || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
+    ds41_prefill_row *b = &d->batch;
+    bool ok = ds4_gpu_begin_commands() && ds41_dspark_seed(d, draft, pos);
+    const float pre[DS41_DRAFT_ROWS][4] = {{1, 0, 0, 0}, {1, 0, 0, 0}, {1, 0, 0, 0}, {1, 0, 0, 0}, {1, 0, 0, 0}};
+    if (ok) ok = ds4_gpu_tensor_write(b->pre, 0, pre, sizeof(pre));
+    for (uint32_t row = 0; ok && row < DS41_DRAFT_ROWS; row++) {
+        const uint64_t bytes = (uint64_t)DS4_N_EMBD * DS4_N_HC * sizeof(float);
+        ds4_gpu_tensor *out = ds4_gpu_tensor_view(b->residual, row * bytes, bytes);
+        ok = out && ds4_gpu_embed_token_hc_tensor(out, target->map, target->size,
+            tw->token_embd->abs_offset, DS4_N_VOCAB, row ? d->weights->noise_token_id : (uint32_t)token,
+            DS4_N_EMBD, DS4_N_HC);
+        ds4_gpu_tensor_free(out);
+    }
+    for (uint32_t stage = 0; ok && stage < 3; stage++)
+        ok = ds41_dspark_stage(d, draft, stage, pos);
+    if (ok) ok = ds4_gpu_hc_weighted_sum_split_tensor(b->x, b->residual,
+        b->ffn_split, DS4_N_EMBD, DS4_N_HC) &&
+        ds4_gpu_dsv41_quantize(b->x, DS4_N_EMBD, DS41_DRAFT_ROWS, DS4_V41_BF16) &&
+        ds41_norm_batch(b->norm, b->x, draft, d->weights->stage[2].norm, DS41_DRAFT_ROWS) &&
+        ds41_matmul_batch(d->logits, target, tw->output, b->norm, DS41_DRAFT_ROWS, false);
+    if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+    if (!ok) d->kv_valid = false;
+    return ok;
+}
+
+static DS4_MAYBE_UNUSED bool ds41_dspark_markov(ds41_dspark *d, const ds4_model *m,
+                               uint32_t row, int previous, float *confidence) {
+    if (!d || row >= DS41_DRAFT_ROWS || previous < 0 ||
+        (uint32_t)previous >= DS4_N_VOCAB || !confidence) return false;
+    const ds4_dspark_stage_weights *last = &d->weights->stage[2];
+    float embedding[256];
+    const uint32_t rank = d->weights->markov_rank;
+    if (rank != 256 || !dspark_dense_row_to_f32(embedding, m, last->markov_w1, (uint32_t)previous))
+        return false;
+    const uint64_t bytes = (uint64_t)DS4_N_VOCAB * sizeof(float);
+    ds4_gpu_tensor *logits = ds4_gpu_tensor_view(d->logits, row * bytes, bytes);
+    bool ok = logits && ds4_gpu_begin_commands() &&
+        ds4_gpu_tensor_write(d->markov_embed, 0, embedding, sizeof(embedding)) &&
+        ds41_matmul(d->markov_logits, m, last->markov_w2, d->markov_embed, false) &&
+        ds4_gpu_add_tensor(logits, logits, d->markov_logits, DS4_N_VOCAB) &&
+        ds4_gpu_tensor_copy(d->confidence_input, 0, d->batch.x,
+            (uint64_t)row * DS4_N_EMBD * 4u, (uint64_t)DS4_N_EMBD * 4u) &&
+        ds4_gpu_tensor_copy(d->confidence_input, (uint64_t)DS4_N_EMBD * 4u,
+            d->markov_embed, 0, rank * 4u) &&
+        ds41_matmul(d->confidence, m, last->confidence_proj, d->confidence_input, false);
+    if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+    if (ok) ok = ds4_gpu_tensor_read(logits, 0, d->host_logits + (uint64_t)row * DS4_N_VOCAB, bytes) &&
+        ds4_gpu_tensor_read(d->confidence, 0, confidence, sizeof(*confidence));
+    ds4_gpu_tensor_free(logits);
+    return ok;
+}
+
+#endif
