@@ -782,18 +782,17 @@ int main(int argc, char **argv) {
         }
     }
     if (ctx_size < 1024) ctx_size = 1024;
-#ifdef DS4_TEST_HOOKS
-    if (verify_batch && (!mtp_path || session_count != 1 || tp.role != DS4_TP_NONE ||
-                         dist.role != DS4_DISTRIBUTED_NONE))
-        die("--verify-batch requires --mtp-model and one local session");
-#endif
-
     char tp_err[256] = {0};
     if (!ds4_tp_adopt_distributed_options(&tp, &dist,
                                           tp_err, sizeof(tp_err))) {
         fprintf(stderr, "score_official: %s\n", tp_err);
         return 2;
     }
+#ifdef DS4_TEST_HOOKS
+    if (verify_batch && (!mtp_path || session_count != 1 ||
+                         dist.role != DS4_DISTRIBUTED_NONE))
+        die("--verify-batch requires --mtp-model and one session without pipeline execution");
+#endif
     if (tp.role == DS4_TP_WORKER || dist.role == DS4_DISTRIBUTED_WORKER) {
         die("score_official: start workers with ./ds4");
     }

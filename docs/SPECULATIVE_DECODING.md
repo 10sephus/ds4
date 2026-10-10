@@ -65,14 +65,17 @@ See [conversion](../gguf-tools/README.md#convert-v41-dspark) to build it.
 
 The same options work with `ds4-agent` and `ds4-server`. Metal, CUDA and ROCm
 support single-host execution, with either resident target weights or SSD
-streaming. The drafter stays resident, so leave another 8 GiB for it. Network
-TP with V4.1 DSpark is not implemented; ordinary V4.1 TP is unchanged.
+streaming. The drafter stays resident, so leave another 8 GiB for it.
+Two-host tensor parallelism works on Metal and CUDA: add the same `--dspark
+--mtp-model FILE` options to both the coordinator and worker. Each peer keeps
+the drafter resident; the target and its verification run across both GPUs.
 
 Up to five drafts are checked together. The sampling choices below apply;
 `--mtp-exact-sampling` uses sampled proposals and the full acceptance/correction
 rule for V4.1. Restored sessions warm the draft window with 128 ordinary tokens
 before speculation resumes. Measure speed on your prompts: acceptance and SSD
-cache size both matter.
+cache size both matter. V4.1 DSpark can still be slower than ordinary decoding,
+including in TP mode.
 
 ## GLM: built-in MTP
 

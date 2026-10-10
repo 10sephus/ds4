@@ -112,6 +112,7 @@ enum {
     DS4_TP_MODE_EXPERT_INTERMEDIATE_SPLIT = 1u,
     DS4_TP_MODE_V41_SHARED_OWNER = 2u,
     DS4_TP_MODE_V41_SHARED_BALANCE = 4u,
+    DS4_TP_MODE_V41_DSPARK = 8u,
 };
 /* Call on both engines before binding the GPU slab. Resident layouts and
  * shared-expert ownership must match before either rank can reduce results. */

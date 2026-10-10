@@ -71877,13 +71877,12 @@ static int ds4_engine_open_internal(ds4_engine **out,
 #endif
             opt->distributed.role == DS4_DISTRIBUTED_NONE &&
             !load_slice && !opt->glm_mtp &&
-            (!(opt->dspark || (opt->mtp_path && opt->mtp_path[0])) || opt->tp.role == DS4_TP_NONE) &&
             !opt->first_token_test && !opt->metal_graph_test &&
             (!opt->directional_steering_file || !opt->directional_steering_file[0]) &&
             e->power_percent == 100 && opt->context_size <= 1048576;
         if (!supported) {
             fprintf(stderr, "ds4: V4.1 requires Metal, single-GPU CUDA or ROCm (network TP on Metal/CUDA); "
-                            "DSpark currently requires one rank; steering and legacy diagnostics "
+                            "steering and legacy diagnostics "
                             "are not supported (maximum context 1048576)\n");
             ds4_engine_close(e);
             *out = NULL;
@@ -73858,6 +73857,8 @@ int ds4_engine_tp_bind(ds4_engine *e, struct ds4_tp *tp, char *err, size_t errle
     }
     uint32_t execution_mode = e->cuda_tp_expert_split ?
         DS4_TP_MODE_EXPERT_INTERMEDIATE_SPLIT : 0u;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && e->dspark)
+        execution_mode |= DS4_TP_MODE_V41_DSPARK;
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 &&
         !getenv("DS4_METAL_DISABLE_V41_TP_SHARED_OWNER")) {
         execution_mode |= DS4_TP_MODE_V41_SHARED_OWNER;
@@ -78925,6 +78926,9 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     ds4_engine *e = s->engine;
 #ifdef DS4_HAS_DEEPSEEK41_GPU
     if (ds4_session_is_ds41(s)) {
+        ds41_dspark *d = s->ds41_graph.dspark;
+        const bool rewindable = d && d->rewind_end == s->ds41_graph.pos &&
+            d->rewind_end && d->rewind_end < d->verify_start + d->verify_count;
         if (!s->ds41_graph_ready ||
             (!s->checkpoint_valid && s->checkpoint.len != 0) ||
             s->ds41_graph.pos != (uint32_t)s->checkpoint.len ||
@@ -78935,6 +78939,7 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         }
         token_vec_push(&s->checkpoint, token);
         s->checkpoint_valid = true;
+        if (rewindable) d->rewind_end = s->ds41_graph.pos;
         return 0;
     }
 #endif
@@ -82869,6 +82874,100 @@ static int ds4_session_eval_dspark_speculative_stochastic(
 }
 #endif
 
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+/* The target vocabulary is sharded on CUDA. Both ranks keep the small native
+ * drafter resident, then exchange its head rows before the leader applies the
+ * sequential Markov bias. Metal currently keeps the complete target head. */
+static bool ds41_session_draft(ds4_session *s, int token) {
+    ds4_engine *e = s->engine;
+    ds41_gpu_graph *g = &s->ds41_graph;
+    ds41_dspark *d = g->dspark;
+    const bool split = e->tp.active && e->tp.vocab_split;
+    if (!d || (split && e->tp.rank == 0 &&
+        !ds4_tp_send_dspark_draft(e->tp.ctx, s->tp_session_id, token,
+                                  (int)g->pos, DS4_TP_DSPARK_DRAFT))) return false;
+    if (!ds41_dspark_forward(d, &e->model, &e->weights, &e->mtp_model, g->pos, token, g))
+        return false;
+    if (!split) return true;
+    const uint32_t half = DS4_N_VOCAB / 2u;
+    /* draft_probs is not live until Markov sampling; borrow it for the packed
+     * local half rows so expansion cannot overwrite the next row. */
+    if (!ds4_gpu_tensor_read(d->logits, 0, d->draft_probs,
+        (uint64_t)DS41_DRAFT_ROWS * half * sizeof(float))) return false;
+    for (uint32_t i = 0; i < DS41_DRAFT_ROWS; i++) {
+        float *local = d->draft_probs + (uint64_t)i * half;
+        float *row = d->host_logits + (uint64_t)i * DS4_N_VOCAB;
+        if (e->tp.rank == 1) {
+            if (!ds4_tp_send_logits_half(e->tp.ctx, local, half)) return false;
+        } else {
+            memcpy(row, local, half * sizeof(float));
+            if (!ds4_tp_recv_logits_half(e->tp.ctx, row + half, half)) return false;
+        }
+    }
+    return e->tp.rank == 1 || ds4_gpu_tensor_write(d->logits, 0, d->host_logits,
+        (uint64_t)DS41_DRAFT_ROWS * DS4_N_VOCAB * sizeof(float));
+}
+
+static bool ds41_session_verify(ds4_session *s, const int *tokens, uint32_t count) {
+    ds4_engine *e = s->engine;
+    ds41_gpu_graph *g = &s->ds41_graph;
+    ds41_dspark *d = g->dspark;
+    if (ds4_session_tp_leader(s) &&
+        !ds4_tp_send_verify(e->tp.ctx, s->tp_session_id, tokens, count)) return false;
+    /* Scalar TP merges its head on the host. Preserve that complete frontier
+     * for a zero-prefix rewind, not the stale other half on the device. */
+    if (!ds4_gpu_tensor_write(g->logits, 0, s->logits, (uint64_t)DS4_N_VOCAB * 4u) ||
+        !ds41_dspark_verify(d, g, &e->model, &e->weights, tokens, count)) return false;
+    if (!e->tp.active || !e->tp.vocab_split) return true;
+    const uint32_t half = DS4_N_VOCAB / 2u;
+    for (uint32_t i = 0; i < count; i++) {
+        float *row = d->host_verified + (uint64_t)i * DS4_N_VOCAB;
+        if (e->tp.rank == 1) {
+            if (!ds4_tp_send_logits_half(e->tp.ctx, row + half, half)) return false;
+        } else if (!ds4_tp_recv_logits_half(e->tp.ctx, row + half, half)) return false;
+    }
+    return e->tp.rank == 1 || ds4_gpu_tensor_write(d->verify_logits, 0, d->host_verified,
+        (uint64_t)count * DS4_N_VOCAB * sizeof(float));
+}
+
+static bool ds41_session_commit(ds4_session *s, const int *tokens,
+                                uint32_t count, uint32_t keep) {
+    ds4_engine *e = s->engine;
+    if (keep > count || (ds4_session_tp_leader(s) &&
+        !ds4_tp_send_verify_commit(e->tp.ctx,
+            keep == count ? DS4_TP_VERIFY_COMMIT_FULL : DS4_TP_VERIFY_COMMIT_PREFIX,
+            (int32_t)keep))) return false;
+    if (!ds41_dspark_commit(s->ds41_graph.dspark, &s->ds41_graph, keep, s->logits))
+        return false;
+    char err[128];
+    if (ds4_session_tp_leader(s) && !ds4_tp_wait_command_ack(e->tp.ctx,
+        s->tp_session_id, "V4.1 verify commit", err, sizeof(err))) return false;
+    for (uint32_t i = 0; i < keep; i++) token_vec_push(&s->checkpoint, tokens[i]);
+    return true;
+}
+
+static int ds41_session_tp_verify(ds4_session *s, const int *tokens, uint32_t count,
+                                   uint32_t flags, char *err, size_t errlen) {
+    ds4_engine *e = s->engine;
+    int32_t mode, keep;
+    bool ok = !flags && s->checkpoint_valid && s->ds41_graph.dspark &&
+        s->ds41_graph.pos == (uint32_t)s->checkpoint.len &&
+        ds41_session_verify(s, tokens, count) &&
+        ds4_tp_recv_verify_commit(e->tp.ctx, &mode, &keep);
+    if (ok) ok = keep >= 0 && (uint32_t)keep <= count &&
+        ((mode == DS4_TP_VERIFY_COMMIT_FULL && (uint32_t)keep == count) ||
+         (mode == DS4_TP_VERIFY_COMMIT_PREFIX && (uint32_t)keep < count));
+    if (ok) ok = ds41_dspark_commit(s->ds41_graph.dspark, &s->ds41_graph,
+                                     (uint32_t)keep, s->logits);
+    if (ok) for (int32_t i = 0; i < keep; i++) token_vec_push(&s->checkpoint, tokens[i]);
+    if (!ok) {
+        s->checkpoint_valid = s->ds41_graph.valid = false;
+        snprintf(err, errlen, "tp: V4.1 verification or prefix commit failed");
+    }
+    return ok ? 0 : 1;
+}
+#endif
+
 /* TP worker side of a mirrored speculative-verify block. Runs its half of the
  * same batch verify as the leader, including per-layer combine gates, purely
  * for KV, compressor, and indexer side effects; then it obeys the commit
@@ -82900,6 +82999,10 @@ int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
         snprintf(err, errlen, "tp: verify block beyond context");
         return 1;
     }
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    if (ds4_session_is_ds41(s))
+        return ds41_session_tp_verify(s, drafts, (uint32_t)draft_n, flags, err, errlen);
+#endif
     ds4_spec_frontier frontier;
     memset(&frontier, 0, sizeof(frontier));
     const int start = s->checkpoint.len;
@@ -83088,6 +83191,17 @@ int ds4_session_tp_spec_cycle(ds4_session *s, const int *drafts, int draft_n,
 
 int ds4_session_tp_dspark_draft(ds4_session *s, int token, int pos,
                                 uint32_t mode, char *err, size_t errlen) {
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    if (s && ds4_session_is_ds41(s)) {
+        ds4_engine *e = s->engine;
+        if (e->tp.active && e->tp.rank == 1 && e->tp.vocab_split &&
+            mode == DS4_TP_DSPARK_DRAFT && pos > 0 &&
+            s->checkpoint_valid && pos == s->checkpoint.len &&
+            (uint32_t)pos == s->ds41_graph.pos && ds41_session_draft(s, token)) return 0;
+        snprintf(err, errlen, "tp: V4.1 draft failed or frontier differs");
+        return 1;
+    }
+#endif
 #if !defined(DS4_NO_GPU) && !defined(__APPLE__) && !defined(DS4_ROCM_BUILD) && \
     defined(DS4_HAS_DEEPSEEK41_GPU)
     ds4_engine *e = s ? s->engine : NULL;
@@ -85912,7 +86026,7 @@ static int ds4_sessions_eval_batch_with_prefill_cuda(
 int ds4_test_ds41_verify_tokens(ds4_session *s, const int *tokens, int count,
                                 float *logits, char *err, size_t errlen) {
     if (!s || !ds4_session_is_ds41(s) || !tokens || !logits || count < 1 ||
-        count > (int)DS41_VERIFY_ROWS || !s->checkpoint_valid || s->engine->tp.active ||
+        count > (int)DS41_VERIFY_ROWS || !s->checkpoint_valid ||
         !s->ds41_graph.dspark || s->checkpoint.len + count > s->ctx_size) {
         snprintf(err, errlen, "invalid V4.1 verification test block");
         return 1;
@@ -85927,14 +86041,13 @@ int ds4_test_ds41_verify_tokens(ds4_session *s, const int *tokens, int count,
         return 0;
     }
     ds41_dspark *d = s->ds41_graph.dspark;
-    if (!ds41_dspark_verify(d, &s->ds41_graph, &s->engine->model, &s->engine->weights, tokens, count) ||
-        !ds41_dspark_commit(d, &s->ds41_graph, count, s->logits)) {
+    if (!ds41_session_verify(s, tokens, count) ||
+        !ds41_session_commit(s, tokens, count, count)) {
         ds4_session_invalidate(s);
         snprintf(err, errlen, "V4.1 verification test failed");
         return 1;
     }
     memcpy(logits, d->host_verified, (uint64_t)count * DS4_N_VOCAB * sizeof(float));
-    for (int i = 0; i < count; i++) token_vec_push(&s->checkpoint, tokens[i]);
     return 0;
 }
 #endif
@@ -85955,7 +86068,7 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
     if (stats) { s->dspark_stats.cycles++; s->dspark_stats.first_tokens++; }
     bool ready = d && !e->quality && !e->dspark_strict && cap > 1 &&
         first_token != eos && g->pos && g->pos <= 1048576u - DS41_DRAFT_ROWS &&
-        !e->tp.active;
+        ds41_tp_batch_enabled(g);
     /* Old session files contain target caches, not draft features. Warm the
      * window with ordinary decoding instead of inventing missing features. */
     if (ready) for (uint32_t pos = g->pos > 128u ? g->pos - 128u : 0; pos < g->pos; pos++)
@@ -85969,7 +86082,7 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
     }
     const bool exact = temperature > 0 && e->dspark_exact_sampling;
     const double started = now_sec();
-    if (!ds41_dspark_forward(d, &e->model, &e->weights, &e->mtp_model, g->pos, first_token))
+    if (!ds41_session_draft(s, first_token))
         goto fail;
     int tokens[DS41_VERIFY_ROWS] = {first_token};
     uint32_t count = 1;
@@ -86008,7 +86121,7 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
         s->dspark_stats.proposed_tokens += count - 1u;
         ds4_dspark_stats_note_len(s->dspark_stats.draft_len_hist, count - 1u);
     }
-    if (!ds41_dspark_verify(d, g, &e->model, &e->weights, tokens, count)) goto fail;
+    if (!ds41_session_verify(s, tokens, count)) goto fail;
     uint32_t keep = 1;
     int correction = -1;
     for (; keep < count; keep++) {
@@ -86026,9 +86139,8 @@ static int ds41_session_speculate(ds4_session *s, int first_token, int cap, int 
             }
         }
     }
-    if (!ds41_dspark_commit(d, g, keep, s->logits)) goto fail;
+    if (!ds41_session_commit(s, tokens, count, keep)) goto fail;
     for (uint32_t i = 0; i < keep; i++) {
-        token_vec_push(&s->checkpoint, tokens[i]);
         accepted[i] = tokens[i];
     }
     const uint32_t accepted_drafts = keep - 1u;
@@ -86061,6 +86173,7 @@ fail:
     g->valid = s->checkpoint_valid = false;
     if (stats) s->dspark_stats.verifier_errors++;
     snprintf(err, errlen, "V4.1 DSpark draft/verification failed at position %u", g->pos);
+    if (e->tp.active) ds4_tp_mark_failed(e->tp.ctx);
     return -1;
 }
 #endif
@@ -87117,6 +87230,21 @@ int ds4_session_restore_speculative_prefix(ds4_session *s, int pos) {
     (void)s; (void)pos;
     return 1;
 #else
+#ifdef DS4_HAS_DEEPSEEK41_GPU
+    if (s && ds4_session_is_ds41(s)) {
+        ds41_gpu_graph *g = &s->ds41_graph;
+        ds41_dspark *d = g->dspark;
+        if (!s->checkpoint_valid || !g->valid || !d || pos < 0 ||
+            d->rewind_end != (uint32_t)s->checkpoint.len ||
+            (uint32_t)pos < d->verify_start || (uint32_t)pos >= d->rewind_end) return 1;
+        if (!ds41_dspark_commit(d, g, (uint32_t)pos - d->verify_start, s->logits)) {
+            s->checkpoint_valid = false;
+            return -1;
+        }
+        s->checkpoint.len = pos;
+        return 0;
+    }
+#endif
     if (!s || !s->checkpoint_valid || !s->dspark_rewind_logits ||
         s->dspark_rewind_end <= s->dspark_rewind_start ||
         s->dspark_rewind_end != s->checkpoint.len ||
@@ -87213,11 +87341,20 @@ bool ds4_session_rewind_speculative(ds4_session *s, int pos) {
             d->rewind_end != (uint32_t)s->checkpoint.len ||
             (uint32_t)pos < d->verify_start || (uint32_t)pos >= d->rewind_end)
             return false;
-        if (!ds41_dspark_commit(d, g, (uint32_t)pos - d->verify_start, s->logits)) {
+        const bool mirror = ds4_session_tp_leader(s);
+        ds4_engine *e = s->engine;
+        if (mirror && !ds4_tp_send_spec_restore(e->tp.ctx, s->tp_session_id, pos))
+            return false;
+        const int local = ds4_session_restore_speculative_prefix(s, pos);
+        int peer = 0;
+        char err[128];
+        if (mirror && !ds4_tp_wait_command_status(e->tp.ctx, s->tp_session_id,
+            &peer, "V4.1 speculative restore", err, sizeof(err))) peer = -1;
+        if (local || peer) {
             s->checkpoint_valid = false;
+            if (mirror) ds4_session_invalidate(s);
             return false;
         }
-        s->checkpoint.len = pos;
         return true;
     }
 #endif

@@ -53,6 +53,7 @@ static void ds41_dspark_free(ds41_dspark *d) {
         ds41_gpu_graph *g = &d->verified[i];
         ds4_gpu_tensor_free(g->residual); ds4_gpu_tensor_free(g->pre);
         ds4_gpu_tensor_free(g->logits);
+        ds4_gpu_tensor_free(g->tp_logits_half);
         for (unsigned j = 0; j < 4; j++) {
             ds4_gpu_tensor_free(g->verify_previous_kv[j]);
             ds4_gpu_tensor_free(g->verify_previous_score[j]);
@@ -270,9 +271,11 @@ static bool ds41_dspark_stage(ds41_dspark *d, const ds4_model *m, uint32_t stage
  * GPU. Markov sampling is sequential and performed after this stage chain. */
 static DS4_MAYBE_UNUSED bool ds41_dspark_forward(ds41_dspark *d, const ds4_model *target,
                                  const ds4_weights *tw, const ds4_model *draft,
-                                 uint32_t pos, int token) {
+                                 uint32_t pos, int token, ds41_gpu_graph *target_graph) {
     if (!d || !pos || token < 0 || (uint32_t)token >= DS4_N_VOCAB) return false;
     ds41_prefill_row *b = &d->batch;
+    const bool local_experts = target_graph && target_graph->tp_world == 2;
+    if (local_experts) ds4_gpu_tp_suspend_expert_sharding(1);
     bool ok = ds4_gpu_begin_commands() && ds41_dspark_seed(d, draft, pos);
     if (!ok) fprintf(stderr, "ds4: V4.1 DSpark seed failed\n");
     const float pre[DS41_DRAFT_ROWS][4] = {{1, 0, 0, 0}, {1, 0, 0, 0}, {1, 0, 0, 0}, {1, 0, 0, 0}, {1, 0, 0, 0}};
@@ -292,9 +295,12 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_forward(ds41_dspark *d, const ds4_model
     if (ok) ok = ds4_gpu_hc_weighted_sum_split_tensor(b->x, b->residual,
         b->ffn_split, DS4_N_EMBD, DS4_N_HC) &&
         ds4_gpu_dsv41_quantize(b->x, DS4_N_EMBD, DS41_DRAFT_ROWS, DS4_V41_BF16) &&
-        ds41_norm_batch(b->norm, b->x, draft, d->weights->stage[2].norm, DS41_DRAFT_ROWS) &&
+        ds41_norm_batch(b->norm, b->x, draft, d->weights->stage[2].norm, DS41_DRAFT_ROWS);
+    if (ok) ok = target_graph ?
+        ds41_output_projection(target_graph, d->logits, target, tw, b->norm, DS41_DRAFT_ROWS) :
         ds41_matmul_batch(d->logits, target, tw->output, b->norm, DS41_DRAFT_ROWS, false);
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+    if (local_experts) ds4_gpu_tp_suspend_expert_sharding(0);
     if (!ok) d->kv_valid = false;
     return ok;
 }
@@ -332,7 +338,7 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_markov(ds41_dspark *d, const ds4_model 
 static DS4_MAYBE_UNUSED bool ds41_dspark_verify(ds41_dspark *d, ds41_gpu_graph *g,
         const ds4_model *m, const ds4_weights *w, const int *tokens, uint32_t count) {
     if (!d || !g->valid || count < 2 || count > DS41_VERIFY_ROWS ||
-        g->pos > g->ctx || count > g->ctx - g->pos || g->tp_logits_half) return false;
+        g->pos > g->ctx || count > g->ctx - g->pos || !ds41_tp_batch_enabled(g)) return false;
     const uint64_t kv = DS4_N_HEAD_DIM * 4u, feature = DS4_N_EMBD * 4u;
     ds41_gpu_graph *graphs[DS41_VERIFY_ROWS];
     bool ok = ds4_gpu_begin_commands();
@@ -352,6 +358,7 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_verify(ds41_dspark *d, ds41_gpu_graph *
         }
         ds41_gpu_graph *row = &d->verified[i];
         ds4_gpu_tensor *res = row->residual, *pre = row->pre, *logits = row->logits;
+        ds4_gpu_tensor *half = row->tp_logits_half;
         ds4_gpu_tensor *pool_k[4], *pool_s[4];
         memcpy(pool_k, row->verify_previous_kv, sizeof(pool_k));
         memcpy(pool_s, row->verify_previous_score, sizeof(pool_s));
@@ -360,6 +367,13 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_verify(ds41_dspark *d, ds41_gpu_graph *
         row->pre = pre ? pre : ds4_gpu_tensor_view(d->verify_pre, i * DS4_N_HC * 4u, DS4_N_HC * 4u);
         row->logits = logits ? logits : ds4_gpu_tensor_view(d->verify_logits,
             (uint64_t)i * DS4_N_VOCAB * 4u, (uint64_t)DS4_N_VOCAB * 4u);
+        row->tp_logits_half = NULL;
+        if (g->tp_logits_half) {
+            const uint64_t bytes = (uint64_t)DS4_N_VOCAB * 2u;
+            row->tp_logits_half = half ? half : ds4_gpu_tensor_view(row->logits,
+                g->tp_rank * bytes, bytes);
+            ok = ok && row->tp_logits_half;
+        }
         row->verify_prefix = true;
         for (uint32_t owner = 0; owner < 4; owner++) {
             const uint64_t off = (i * 8u + owner * 2u) * kv;

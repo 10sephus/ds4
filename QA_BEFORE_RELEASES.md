@@ -1688,7 +1688,8 @@ the long sparse-boundary tests; neither substitutes for the other.
 Use `DeepSeek-V4.1-Flash-DSpark.gguf`, not a V4.0 drafter. The native support
 model is 8.04 GiB and remains resident while the target can use SSD streaming.
 On 128 GiB hosts, leave room for both models and context buffers. This path
-supports one Metal, CUDA or ROCm host; TP plus DSpark must fail explicitly.
+supports one Metal, CUDA or ROCm host and two-rank Metal/CUDA TP. For TP,
+pass the matching `--dspark --mtp-model DSPARK` options on both peers.
 
 - Run `python3 tests/test_deepseek41_dspark_conversion.py` and audit every
   real tensor with `python3 gguf-tools/deepseek41_dspark.py --hf SOURCE
@@ -1709,6 +1710,12 @@ supports one Metal, CUDA or ROCm host; TP plus DSpark must fail explicitly.
   after verification. Exercise opportunistic and exact sampling. Loading an
   older target snapshot must warm missing draft features rather than reuse
   stale ones. Repeat the backend primitives, including 128-expert/top-3 routing.
+- Repeat the runtime test on physical Metal RDMA and CUDA RoCE pairs:
+  `tests/test_deepseek41_dspark TARGET DSPARK --runtime-tp HOST PORT DEVICE GID`.
+  Start the normal `ds4` TP worker with context 2048 and the matching drafter.
+  Require all prefix commits, correction rewinds, both sampling modes and
+  cancellation to finish without a lost peer. Also reject mismatched DSpark
+  settings at startup (`DS4_TEST_TP_MODE_MISMATCH=3` in `test_tp_link`).
 - Build `gguf-tools/quality-testing/score_official_verify`. Compare the matching
   official manifest with `--mtp-model DSPARK` against the same command plus
   `--verify-batch 6`. Keep `--ssd-streaming --ssd-streaming-cache-experts 40gb`
@@ -1717,6 +1724,9 @@ supports one Metal, CUDA or ROCm host; TP plus DSpark must fail explicitly.
   34816; also repeat its `manifest-long.tsv` with `--continued-prefill 32`.
   Report paired teacher-forced NLL and API top-token agreement. Greedy sampled
   prefix length and scalar-versus-verifier text equality are not quality gates.
+  Repeat the scalar/verifier comparison on both physical TP pairs using the
+  normal coordinator flags instead of SSD streaming; start a matching worker
+  for each run. Verify the complete vocabulary, not just the local half.
 - Run real CLI and agent code/prose requests at temperature zero and above
   zero, including `--mtp-exact-sampling`. Against an otherwise idle speculative
   server, run `tests/test_server_speculative_stop.py --model deepseek-v4.1-flash
@@ -1725,6 +1735,12 @@ supports one Metal, CUDA or ROCm host; TP plus DSpark must fail explicitly.
   coding client's edit/build/test loop and cancellation near context capacity.
   Record acceptance and end-to-end timing; working speculation does not by
   itself establish a speedup.
+- On ROCm, repeat at least ten actual server cold starts outside a debugger,
+  alternating default and exact sampling. Send a request, check the answer,
+  and shut down cleanly each time. Watch usable host memory, excluding CMA.
+  If startup crashes, retain the binary and core or backtrace plus kernel
+  logs; distinguish a userspace HIP failure from OOM or a GPU reset. A clean
+  rerun is evidence against recurrence, not an explanation of a prior crash.
 
 ### Metal Reference Checks
 
