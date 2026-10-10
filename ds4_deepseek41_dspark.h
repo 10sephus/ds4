@@ -145,6 +145,20 @@ static bool ds41_dspark_capture(ds41_dspark *d, uint32_t layer, uint32_t pos,
     return ok;
 }
 
+static bool ds41_dspark_matmul_batch(ds4_gpu_tensor *out, const ds4_model *m,
+        const ds4_tensor *weight, const ds4_gpu_tensor *in, uint32_t count, bool round) {
+#if !defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    /* Draft rows share a GEMM. Target verification retains its scalar-reduction
+     * kernels; proposal arithmetic need not reproduce their reduction order. */
+    if (count > 1 && weight->type == DS4_TENSOR_F16 &&
+        !getenv("DS4_DISABLE_V41_DRAFT_GEMM"))
+        return metal_graph_matmul_plain_tensor(out, m, weight, weight->dim[0],
+            weight->dim[1], in, count) && (!round ||
+            ds4_gpu_dsv41_quantize(out, (uint32_t)weight->dim[1], count, DS4_V41_BF16));
+#endif
+    return ds41_matmul_batch(out, m, weight, in, count, round);
+}
+
 /* Only accepted target features enter these rings. A fresh prefill seeds the
  * last window once; subsequent calls project only the newly accepted rows. */
 static bool ds41_dspark_seed(ds41_dspark *d, const ds4_model *m, uint32_t pos) {
@@ -163,12 +177,12 @@ static bool ds41_dspark_seed(ds41_dspark *d, const ds4_model *m, uint32_t pos) {
         }
     }
     const ds4_dspark_stage_weights *first = &d->weights->stage[0];
-    if (!ds41_matmul_batch(d->projected, m, first->main_proj, d->input, count, true) ||
+    if (!ds41_dspark_matmul_batch(d->projected, m, first->main_proj, d->input, count, true) ||
         !ds41_norm_batch(d->main_x, d->projected, m, first->main_norm, count)) return false;
     const uint64_t kv_bytes = DS4_N_HEAD_DIM * sizeof(float);
     for (unsigned stage = 0; stage < 3; stage++) {
         const ds4_layer_weights *l = &d->weights->stage[stage].block;
-        if (!ds41_matmul_batch(d->main_kv, m, l->attn_kv, d->main_x, count, true) ||
+        if (!ds41_dspark_matmul_batch(d->main_kv, m, l->attn_kv, d->main_x, count, true) ||
             !ds41_norm_batch(d->main_kv, d->main_kv, m, l->attn_kv_a_norm, count) ||
             !ds4_gpu_dsv41_rope(d->main_kv, DS4_N_HEAD_DIM, 1, count, start, false, false) ||
             !ds4_gpu_dsv41_quantize(d->main_kv, DS4_N_HEAD_DIM, count, DS4_V41_FP8_E8M0)) return false;
@@ -202,7 +216,7 @@ static bool ds41_dspark_attention_output(ds41_prefill_row *b, const ds4_model *m
             if (!ok) return false;
         }
     }
-    return ds41_matmul_batch(b->block, m, l->attn_output_b, b->low, DS41_DRAFT_ROWS, true);
+    return ds41_dspark_matmul_batch(b->block, m, l->attn_output_b, b->low, DS41_DRAFT_ROWS, true);
 }
 
 static bool ds41_dspark_stage(ds41_dspark *d, const ds4_model *m, uint32_t stage, uint32_t pos) {
@@ -214,11 +228,11 @@ static bool ds41_dspark_stage(ds41_dspark *d, const ds4_model *m, uint32_t stage
                   ds4_gpu_hc_weighted_sum_tensor(b->x, b->residual, b->pre, DS4_N_EMBD, DS4_N_HC)) ||
         !ds4_gpu_dsv41_quantize(b->x, DS4_N_EMBD, n, DS4_V41_BF16) ||
         !ds41_norm_batch(b->norm, b->x, m, l->attn_norm, n) ||
-        !ds41_matmul_batch(b->qr, m, l->attn_q_a, b->norm, n, true) ||
+        !ds41_dspark_matmul_batch(b->qr, m, l->attn_q_a, b->norm, n, true) ||
         !ds41_norm_batch(b->qr, b->qr, m, l->attn_q_a_norm, n) ||
-        !ds41_matmul_batch(b->q, m, l->attn_q_b, b->qr, n, true) ||
+        !ds41_dspark_matmul_batch(b->q, m, l->attn_q_b, b->qr, n, true) ||
         !ds4_gpu_dsv41_rope(b->q, DS4_N_HEAD_DIM, DS4_N_HEAD, n, pos, false, false) ||
-        !ds41_matmul_batch(b->kv, m, l->attn_kv, b->norm, n, true) ||
+        !ds41_dspark_matmul_batch(b->kv, m, l->attn_kv, b->norm, n, true) ||
         !ds41_norm_batch(b->kv, b->kv, m, l->attn_kv_a_norm, n) ||
         !ds4_gpu_dsv41_rope(b->kv, DS4_N_HEAD_DIM, 1, n, pos, false, false) ||
         !ds4_gpu_dsv41_quantize(b->kv, DS4_N_HEAD_DIM, n, DS4_V41_FP8_E8M0) ||
@@ -238,18 +252,18 @@ static bool ds41_dspark_stage(ds41_dspark *d, const ds4_model *m, uint32_t stage
     const uint64_t gate_row = routed_expert_row_bytes(l->ffn_gate_exps);
     const uint64_t down_row = routed_expert_row_bytes(l->ffn_down_exps);
     bool mid_f16 = false;
-    if (!(ds41_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, n, false) &&
+    if (!(ds41_dspark_matmul_batch(b->route_logits, m, l->ffn_gate_inp, b->norm, n, false) &&
         ds4_gpu_router_select_batch_tensor(b->selected, b->route_weights, b->route_probs,
             m->map, m->size, l->ffn_exp_probs_b->abs_offset, 0, 0, 0, 0, true, false,
             b->route_logits, d->tokens, experts, active, DS4_EXPERT_WEIGHT_SCALE, n))) {
         fprintf(stderr, "ds4: V4.1 draft routing failed\n"); return false;
     }
-    if (!(ds41_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, n, true) &&
-        ds41_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, n, true) &&
+    if (!(ds41_dspark_matmul_batch(b->shared_gate, m, l->ffn_gate_shexp, b->norm, n, true) &&
+        ds41_dspark_matmul_batch(b->shared_up, m, l->ffn_up_shexp, b->norm, n, true) &&
         ds4_gpu_swiglu_tensor(b->shared_mid, b->shared_gate, b->shared_up,
             n * DS4_N_FF_EXP, DS4_SWIGLU_CLAMP_EXP, 1.0f) &&
         ds4_gpu_dsv41_quantize(b->shared_mid, DS4_N_FF_EXP, n, DS4_V41_BF16) &&
-        ds41_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, n, true))) {
+        ds41_dspark_matmul_batch(b->shared, m, l->ffn_down_shexp, b->shared_mid, n, true))) {
         fprintf(stderr, "ds4: V4.1 draft shared expert failed\n"); return false;
     }
     if (!ds4_gpu_routed_moe_batch_tensor(b->routed, b->gate, b->up, b->mid, b->experts,
