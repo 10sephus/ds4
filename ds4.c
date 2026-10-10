@@ -40971,6 +40971,7 @@ typedef struct {
     uint32_t tp_world, tp_rank;
     ds4_gpu_tensor *tp_logits_half;
     ds4_gpu_tensor **tp_out, **tp_in;
+    ds4_gpu_tensor **tp_batch_out, **tp_batch_in;
     ds4_imatrix_collector *imatrix;
     const ds4_vision_span *images;
     size_t image_count;
@@ -41385,12 +41386,22 @@ static bool ds41_hc_expand(ds4_gpu_tensor *out, const ds4_gpu_tensor *block,
 }
 
 static bool ds41_sum_partial_batch(ds41_gpu_graph *g, ds4_gpu_tensor *x,
-                                   uint32_t il, uint32_t count) {
+                                   uint32_t il, uint32_t gate, uint32_t count) {
     if (g->tp_world != 2) return true;
+    const uint64_t bytes = (uint64_t)count * DS4_N_EMBD * sizeof(float);
+    if (g->verify_prefix) {
+        const uint32_t slot = il * DS4_TP_BATCH_GATES_PER_LAYER + gate;
+        if (!g->tp_batch_out || !g->tp_batch_in || count > DS4_TP_BATCH_MAX_ROWS ||
+            !ds4_gpu_tensor_copy(g->tp_batch_out[slot], 0, x, 0, bytes) ||
+            !ds4_gpu_tp_batch_gate_encode(slot, count)) return false;
+        return ds4_gpu_add_tensor(x,
+            g->tp_rank ? g->tp_batch_in[slot] : g->tp_batch_out[slot],
+            g->tp_rank ? g->tp_batch_out[slot] : g->tp_batch_in[slot],
+            count * DS4_N_EMBD) != 0;
+    }
     /* Q is dead after attention; its expert-output alias is dead after the
      * routed reduction. Reuse it for the peer, without another large buffer. */
     ds4_gpu_tensor *peer = g->batch.q;
-    const uint64_t bytes = (uint64_t)count * DS4_N_EMBD * sizeof(float);
     if (!ds4_gpu_tp_big_gate_encode(il, count, x, peer, bytes)) return false;
     return ds4_gpu_add_tensor(x, g->tp_rank ? peer : x,
         g->tp_rank ? x : peer, count * DS4_N_EMBD) != 0;
@@ -42130,7 +42141,7 @@ static bool ds41_moe_batch(ds41_gpu_graph *g, const ds4_model *m,
             il, count, &mid_f16, !g->verify_prefix)) &&
         (!shared_owner || (!balance_shared && g->tp_rank != (il & 1u)) ||
             ds4_gpu_add_tensor(b->routed, b->routed, b->shared, count * DS4_N_EMBD)) &&
-        ds41_sum_partial_batch(g, b->routed, il, count);
+        ds41_sum_partial_batch(g, b->routed, il, DS4_TP_GATE_FFN, count);
 }
 
 static DS4_MAYBE_UNUSED bool ds41_graph_step(ds41_gpu_graph *g, const ds4_model *m,
@@ -42769,7 +42780,7 @@ static bool ds41_graph_prefill_sweep(ds41_gpu_graph *g, const ds4_model *m,
                     ok = ds4_gpu_dsv41_attention_output_tp_batch(g->batch.block, g->batch.low,
                         m->map, m->size, l->attn_output_a->abs_offset, l->attn_output_b->abs_offset,
                         g->batch.heads, count, g->tp_rank) &&
-                        ds41_sum_partial_batch(g, g->batch.block, il, count) &&
+                        ds41_sum_partial_batch(g, g->batch.block, il, DS4_TP_GATE_ATTN, count) &&
                         ds4_gpu_dsv41_quantize(g->batch.block, DS4_N_EMBD, count, DS4_V41_BF16);
                 } else if (ok && l->attn_output_b->type == DS4_TENSOR_Q8_0) {
                     ok = ds4_gpu_dsv41_attention_output_batch(g->batch.block, g->batch.low,
@@ -43015,7 +43026,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_step_batch(ds41_gpu_graph *const *graphs
                 ds4_gpu_dsv41_attention_output_batch(active.block, active.low,
                     model->map, model->size, l->attn_output_a->abs_offset,
                     l->attn_output_b->abs_offset, g->batch.heads, rows);
-        if (ok) ok = ds41_sum_partial_batch(g, active.block, il, rows);
+        if (ok) ok = ds41_sum_partial_batch(g, active.block, il, DS4_TP_GATE_ATTN, rows);
         if (ok) ok = ds4_gpu_dsv41_quantize(active.block, DS4_N_EMBD, rows, DS4_V41_BF16) &&
             ds41_after_attention_batch(&active, model, l, rows) &&
             ds41_moe_batch(g, model, l, il, rows, shared_owner) &&
@@ -74281,6 +74292,8 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             s->ds41_graph.tp_rank = (uint32_t)e->tp.rank;
             s->ds41_graph.tp_out = e->tp.out_views;
             s->ds41_graph.tp_in = e->tp.in_views;
+            s->ds41_graph.tp_batch_out = e->tp.batch_out_views;
+            s->ds41_graph.tp_batch_in = e->tp.batch_in_views;
             if (e->tp.vocab_split) {
                 const uint64_t half_bytes = (uint64_t)DS4_N_VOCAB / 2u * sizeof(float);
                 s->ds41_graph.tp_logits_half = ds4_gpu_tensor_view(s->ds41_graph.logits,

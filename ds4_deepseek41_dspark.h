@@ -353,6 +353,13 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_verify(ds41_dspark *d, ds41_gpu_graph *
         const ds4_model *m, const ds4_weights *w, const int *tokens, uint32_t count) {
     if (!d || !g->valid || count < 2 || count > DS41_VERIFY_ROWS ||
         g->pos > g->ctx || count > g->ctx - g->pos || !ds41_tp_batch_enabled(g)) return false;
+    /* Prepost the complete small-row exchange window, as in V4.0 verification.
+     * Bulk-prefill handshakes at every attention/FFN gate are too expensive. */
+    const bool tp_block = g->tp_world == 2;
+    uint32_t gates = 2;
+    if (tp_block && (!g->tp_batch_out || !g->tp_batch_in || !g_tp_block_ctx ||
+        !ds4_tp_batch_block_begin_gates(g_tp_block_ctx, count, DS4_N_LAYER, &gates) ||
+        gates != 2)) return false;
     const uint64_t kv = DS4_N_HEAD_DIM * 4u, feature = DS4_N_EMBD * 4u;
     ds41_gpu_graph *graphs[DS41_VERIFY_ROWS];
     bool ok = ds4_gpu_begin_commands();
@@ -412,6 +419,10 @@ static DS4_MAYBE_UNUSED bool ds41_dspark_verify(ds41_dspark *d, ds41_gpu_graph *
     }
     if (ok) ok = ds41_graph_step_batch(graphs, tokens, (int)count, count, m, w);
     if (ds4_gpu_commands_active() && !ds4_gpu_end_commands()) ok = false;
+    if (tp_block && (!ok || !ds4_tp_batch_block_end(g_tp_block_ctx))) {
+        ds4_tp_mark_failed(g_tp_block_ctx);
+        ok = false;
+    }
     if (ok) ok = ds4_gpu_tensor_read(d->verify_logits, 0, d->host_verified,
         (uint64_t)count * DS4_N_VOCAB * 4u) &&
         ds4_gpu_tensor_read(d->verify_logits, (uint64_t)DS41_VERIFY_ROWS * DS4_N_VOCAB * 4u,
