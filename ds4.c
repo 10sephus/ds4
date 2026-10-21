@@ -399,6 +399,9 @@ int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
+#if defined(DS4_NO_GPU) && defined(__AVX2__)
+#include <immintrin.h>
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -1283,6 +1286,20 @@ static inline DS4_MAYBE_UNUSED int32_t dot_iq2_pair_16(const int8_t *grid0, cons
     const int16x8_t p0 = vmull_s8(vget_low_s8(gv), vget_low_s8(qv));
     const int16x8_t p1 = vmull_s8(vget_high_s8(gv), vget_high_s8(qv));
     return vaddvq_s32(vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)));
+#elif defined(DS4_NO_GPU) && defined(__AVX2__)
+    /* Each lookup contains only eight bytes. Widen signed bytes before the
+     * multiply so even -128 * -128 and its pair sum remain exact. */
+    const __m128i grids = _mm_unpacklo_epi64(
+        _mm_loadl_epi64((const __m128i *)grid0),
+        _mm_loadl_epi64((const __m128i *)grid1));
+    const __m256i products = _mm256_madd_epi16(
+        _mm256_cvtepi8_epi16(grids),
+        _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)q8)));
+    __m128i sum = _mm_add_epi32(_mm256_castsi256_si128(products),
+                               _mm256_extracti128_si256(products, 1));
+    sum = _mm_add_epi32(sum, _mm_srli_si128(sum, 8));
+    sum = _mm_add_epi32(sum, _mm_srli_si128(sum, 4));
+    return _mm_cvtsi128_si32(sum);
 #else
     int32_t sum = 0;
     for (uint32_t i = 0; i < 8; i++) sum += (int32_t)grid0[i] * (int32_t)q8[i];
@@ -1316,6 +1333,17 @@ static inline DS4_MAYBE_UNUSED int32_t dot_q2_16(const uint8_t *q2, const int8_t
     const int32x4_t s0 = vpaddlq_s16(p0);
     const int32x4_t s1 = vpaddlq_s16(p1);
     return vaddvq_s32(vaddq_s32(s0, s1));
+#elif defined(DS4_NO_GPU) && defined(__AVX2__)
+    /* Valid shifts are 0, 2, 4 and 6. Masking after a 16-bit shift leaves
+     * each byte's two-bit value intact. Pair sums fit int16: at most 768. */
+    const __m128i values = _mm_and_si128(
+        _mm_srl_epi16(_mm_loadu_si128((const __m128i *)q2), _mm_cvtsi32_si128(shift)),
+        _mm_set1_epi8(3));
+    const __m128i pairs = _mm_maddubs_epi16(values, _mm_loadu_si128((const __m128i *)q8));
+    __m128i sum = _mm_madd_epi16(pairs, _mm_set1_epi16(1));
+    sum = _mm_add_epi32(sum, _mm_srli_si128(sum, 8));
+    sum = _mm_add_epi32(sum, _mm_srli_si128(sum, 4));
+    return _mm_cvtsi128_si32(sum);
 #else
     int32_t sum = 0;
     for (uint32_t i = 0; i < 16; i++) sum += (int32_t)q8[i] * (int32_t)((q2[i] >> shift) & 3);
@@ -2159,7 +2187,11 @@ static void ds4_threads_init(void) {
         if (v > 0) n_threads = (uint32_t)v;
     }
     if (g_requested_threads > 0) n_threads = g_requested_threads;
-    if (n_threads > DS4_MAX_THREADS) n_threads = DS4_MAX_THREADS;
+    if (n_threads > DS4_MAX_THREADS) {
+        fprintf(stderr, "ds4: requested %u CPU threads; limiting to %u (CPU worker limit)\n",
+                n_threads, (unsigned)DS4_MAX_THREADS);
+        n_threads = DS4_MAX_THREADS;
+    }
     if (n_threads == 0) n_threads = 1;
 
     pthread_mutex_init(&g_pool.mutex, NULL);
@@ -14315,6 +14347,8 @@ typedef struct {
     ds4_layer_cache layer[DS4_MAX_LAYER];
     uint32_t head_dim;
 } ds4_kv_cache;
+
+static ds4_context_memory ds41_cpu_memory(uint32_t ctx);
 
 static uint32_t ds4_default_raw_cap(uint32_t ctx_size) {
     uint32_t raw_cap = DS4_N_SWA;
@@ -40425,6 +40459,8 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         bool        ssd_streaming) {
     ds4_context_memory m = {0};
     uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
+    if (backend == DS4_BACKEND_CPU && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41)
+        return ds41_cpu_memory(ctx);
     if (ds4_backend_uses_graph(backend) && ds4_model_is_qwen4()) {
         /* per-token f16 K/V and raw indexer keys per attention layer, pooled
          * block keys, rope positions; transients scale with the prefill chunk */
@@ -43362,7 +43398,14 @@ static void ds4_engine_print_startup_memory(
         ds4_engine_dynamic_expert_cache_bytes(e);
     const uint64_t expert_reserved_bytes =
         e->ssd_streaming_prefill_headroom_bytes;
+    const bool cpu_model_map = e->backend == DS4_BACKEND_CPU;
     uint64_t resident_model_bytes = e->startup_model_span_bytes;
+    if (cpu_model_map) {
+        /* CPU tensors remain file-backed. This is their mapped extent, not
+         * measured RSS; disk-only Engram/n-gram tails have been unmapped. */
+        resident_model_bytes = e->model.size > e->model.tensor_data_pos ?
+            e->model.size - e->model.tensor_data_pos : 0;
+    }
 #ifndef DS4_NO_GPU
     if (e->ssd_streaming_static_decode_map &&
         e->ssd_streaming_decode_map_bytes != 0) {
@@ -43399,12 +43442,13 @@ static void ds4_engine_print_startup_memory(
 
     fprintf(stderr,
             "%sds4: memory: KV %.2f GiB (raw %.2f + compressed %.2f) "
-            "+ buffers %.2f GiB + resident model %.2f GiB",
+            "+ buffers %.2f GiB + %s %.2f GiB",
             green,
             ds4_bytes_to_gib(kv_bytes),
             ds4_bytes_to_gib(mem.raw_bytes),
             ds4_bytes_to_gib(mem.compressed_bytes),
             ds4_bytes_to_gib(mem.scratch_bytes),
+            cpu_model_map ? "mapped main weights" : "resident model",
             ds4_bytes_to_gib(resident_model_bytes));
     if (dynamic_expert_cache_bytes != 0) {
         fprintf(stderr,
@@ -43424,9 +43468,10 @@ static void ds4_engine_print_startup_memory(
     if (ds41_drafter_bytes) fprintf(stderr, " + drafter weights/buffers %.2f GiB",
                                     ds4_bytes_to_gib(ds41_drafter_bytes));
     fprintf(stderr,
-            " = %s%.2f GiB planned%s\n",
+            " = %s%.2f GiB %s%s\n",
             bright_green,
             ds4_bytes_to_gib(total),
+            cpu_model_map ? "mapped + estimated runtime (RSS not measured)" : "planned",
             reset);
 
     fprintf(stderr,
@@ -60448,6 +60493,7 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
     (void)ssd_streaming;
     ds4_context_memory m = {0};
     uint32_t ctx = ctx_size > 0 ? (uint32_t)ctx_size : 1u;
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) return ds41_cpu_memory(ctx);
 
     m.raw_cap = ds4_default_raw_cap(ctx);
     m.raw_bytes = (uint64_t)DS4_N_LAYER *
@@ -61168,6 +61214,8 @@ typedef struct {
     uint8_t fingerprint[32];
 } ds4_vision_identity;
 
+#include "ds4_deepseek41_cpu.inc"
+
 struct ds4_session {
     ds4_engine *engine;
     ds4_dist_session *distributed;
@@ -61220,6 +61268,7 @@ struct ds4_session {
     int dspark_rewind_end;
     uint32_t dspark_rewind_prefixes;
 #endif
+    ds41_cpu_state *ds41_cpu;
     ds4_kv_cache cpu_cache;
     ds4_cpu_decode_scratch cpu_scratch;
     token_vec checkpoint;
@@ -62342,6 +62391,10 @@ static uint64_t session_cpu_payload_live_tensor_bytes(const ds4_session *s) {
 }
 
 static void session_cpu_reset_cache(ds4_session *s) {
+    if (s->ds41_cpu) {
+        ds41_cpu_reset(s->ds41_cpu);
+        return;
+    }
     kv_cache_free(&s->cpu_cache);
     kv_cache_init(&s->cpu_cache, (uint32_t)s->ctx_size, 0);
 }
@@ -63511,7 +63564,16 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
 static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows);
 #endif
 
+#include "ds4_deepseek41_cpu_state_io.inc"
+
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
+    if (s && s->ds41_cpu) {
+        if (!s->checkpoint_valid || s->checkpoint.len <= 0 || !s->ds41_cpu->valid ||
+            !ds41_cpu_payload_storage_valid(s->ds41_cpu, s->ds41_cpu->pos) ||
+            s->ds41_cpu->pos != (uint32_t)s->checkpoint.len) return 0;
+        return DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t) +
+            ds41_cpu_payload_body_bytes(s->ds41_cpu, (uint32_t)s->checkpoint.len);
+    }
     if (s && !s->distributed && ds4_session_is_qwen4(s)) {
 #ifndef DS4_HAS_QWEN4_GPU
         return 0;
@@ -63905,8 +63967,9 @@ int ds4_session_save_payload(ds4_session *s, FILE *fp, char *err, size_t errlen)
         return ds4_dist_session_save_payload(s->distributed, s, fp, err, errlen);
     }
 #ifdef DS4_HAS_DEEPSEEK41_GPU
-    if (ds4_session_is_ds41(s)) return ds41_save_payload(s, fp, err, errlen);
+    if (ds4_session_is_ds41(s) && !ds4_session_is_cpu(s)) return ds41_save_payload(s, fp, err, errlen);
 #endif
+    if (s->ds41_cpu) return ds41_cpu_save_payload(s, fp, err, errlen);
     if (ds4_session_is_qwen4(s)) {
 #ifndef DS4_HAS_QWEN4_GPU
         payload_set_err(err, errlen, "graph backend support is not compiled in");
@@ -64292,8 +64355,9 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         return rc;
     }
 #ifdef DS4_HAS_DEEPSEEK41_GPU
-    if (ds4_session_is_ds41(s)) return ds41_load_payload(s, fp, h, remaining, err, errlen);
+    if (ds4_session_is_ds41(s) && !ds4_session_is_cpu(s)) return ds41_load_payload(s, fp, h, remaining, err, errlen);
 #endif
+    if (s->ds41_cpu) return ds41_cpu_load_payload(s, fp, h, remaining, err, errlen);
     if (ds4_session_is_qwen4(s)) {
 #ifndef DS4_HAS_QWEN4_GPU
         payload_set_err(err, errlen, "graph backend support is not compiled in");
@@ -66098,6 +66162,55 @@ int ds4_engine_generate_argmax(
     const ds4_model *model = &e->model;
     const ds4_vocab *vocab = &e->vocab;
     const ds4_weights *weights = &e->weights;
+
+    /* V4.1 owns compression and Engram history in its session state. The
+     * original V4 CPU generator below cannot represent that timeline. */
+    if (e->backend == DS4_BACKEND_CPU &&
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        ds4_session *s = NULL;
+        char err[256] = {0};
+        if (ds4_session_create(&s, e, ctx_size) != 0) {
+            fprintf(stderr, "ds4: failed to create V4.1 CPU session\n");
+            return 1;
+        }
+        ds4_session_set_progress(s, progress, progress_ud);
+        const double prefill_start = now_sec();
+        int rc = ds4_session_sync(s, prompt, err, sizeof(err));
+        ds4_session_set_progress(s, NULL, NULL);
+        const double prefill_end = now_sec();
+        if (rc != 0) {
+            fprintf(stderr, "ds4: V4.1 CPU prefill failed: %s\n", err);
+            ds4_session_free(s);
+            return rc;
+        }
+        int generated = 0;
+        const double decode_start = now_sec();
+        while (generated < n_predict && ds4_session_pos(s) < ctx_size) {
+            const int token = ds4_session_argmax(s);
+            if (token < 0) {
+                fprintf(stderr, "ds4: V4.1 CPU argmax failed\n");
+                rc = 1;
+                break;
+            }
+            if (ds4_token_is_stop(e, token)) break;
+            if (emit) emit(emit_ud, token);
+            generated++;
+            if (generated == n_predict || ds4_session_pos(s) + 1 >= ctx_size) break;
+            rc = ds4_session_eval(s, token, err, sizeof(err));
+            if (rc != 0) {
+                fprintf(stderr, "ds4: V4.1 CPU decode failed: %s\n", err);
+                break;
+            }
+        }
+        const double decode_end = now_sec();
+        if (done) done(emit_ud);
+        ds4_log(stderr, DS4_LOG_TIMING,
+                "ds4: prefill: %.2f t/s, generation: %.2f t/s\n",
+                prefill_end > prefill_start ? prompt->len / (prefill_end - prefill_start) : 0.0,
+                decode_end > decode_start ? generated / (decode_end - decode_start) : 0.0);
+        ds4_session_free(s);
+        return rc;
+    }
 
     if (ds4_backend_uses_graph(e->backend)) {
 #ifndef DS4_NO_GPU
@@ -71883,6 +71996,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
     }
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && !opt->inspect_only) {
         const bool supported = (e->backend == DS4_BACKEND_METAL ||
+                (e->backend == DS4_BACKEND_CPU && opt->tp.role == DS4_TP_NONE &&
+                 !opt->cuda_tensor_parallel && !e->ssd_streaming && !opt->dspark &&
+                 (!opt->mtp_path || !opt->mtp_path[0])) ||
 #if defined(DS4_HAS_DEEPSEEK41_GPU) && !defined(__APPLE__)
                 (e->backend == DS4_BACKEND_CUDA && !opt->cuda_tensor_parallel &&
                  (!gpu_cfg || gpu_cfg->n_gpus <= 1)) ||
@@ -71897,7 +72013,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             (!opt->directional_steering_file || !opt->directional_steering_file[0]) &&
             e->power_percent == 100 && opt->context_size <= 1048576;
         if (!supported) {
-            fprintf(stderr, "ds4: V4.1 requires Metal, single-GPU CUDA or ROCm (network TP on Metal/CUDA); "
+            fprintf(stderr, "ds4: V4.1 requires CPU text inference, Metal, single-GPU CUDA or ROCm (network TP on Metal/CUDA); "
                             "steering and legacy diagnostics "
                             "are not supported (maximum context 1048576)\n");
             ds4_engine_close(e);
@@ -71914,7 +72030,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
             return 1;
         }
     }
-    if (engine_warm_full_model(opt) && DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41)
+    if (engine_warm_full_model(opt) &&
+        (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41 || e->backend == DS4_BACKEND_CPU))
         model_warm_weights(&e->model);
     if (opt->vision_path && opt->vision_path[0]) {
         if (!ds4_model_is_glm53() && !g_ds4_flash_vision_exp && !ds4_model_is_qwen4() &&
@@ -72102,7 +72219,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
     }
 #endif
 #ifdef DS4_HAS_DEEPSEEK41_GPU
-    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && !opt->inspect_only) {
+    if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41 && !opt->inspect_only &&
+        ds4_backend_uses_graph(e->backend)) {
         const uint32_t ctx = opt->context_size > 0 ? (uint32_t)opt->context_size : 4096;
         const uint32_t sessions = e->placement_session_count_hint > 0 ?
             (uint32_t)e->placement_session_count_hint : 1;
@@ -74250,8 +74368,20 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         s->ctx_size = ctx_size;
         s->prefill_cap = ds4_prefill_cap_for_prompt(ctx_size,
                                                      e->prefill_chunk);
-        kv_cache_init(&s->cpu_cache, (uint32_t)ctx_size, 0);
-        cpu_decode_scratch_init(&s->cpu_scratch, (uint32_t)ctx_size);
+        if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+            char err[256] = "";
+            s->prefill_cap = 1;
+            s->ds41_cpu = ds41_cpu_create(&e->model, &e->weights, e->model_path,
+                                         (uint32_t)ctx_size, err, sizeof(err));
+            if (!s->ds41_cpu) {
+                fprintf(stderr, "ds4: V4.1 CPU session: %s\n", err);
+                free(s);
+                return 1;
+            }
+        } else {
+            kv_cache_init(&s->cpu_cache, (uint32_t)ctx_size, 0);
+            cpu_decode_scratch_init(&s->cpu_scratch, (uint32_t)ctx_size);
+        }
         s->logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
         s->sample_probs = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->sample_probs[0]));
         if (!ds4_session_tp_register(s)) {
@@ -74734,6 +74864,7 @@ void ds4_session_free(ds4_session *s) {
 #endif
     ds4_dist_session_free(s->distributed);
     if (ds4_session_is_cpu(s)) {
+        ds41_cpu_free(s->ds41_cpu);
         kv_cache_free(&s->cpu_cache);
         cpu_decode_scratch_free(&s->cpu_scratch);
     }
@@ -76795,6 +76926,38 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         return 0;
     }
 #endif
+    if (s->ds41_cpu) {
+        ds41_cpu_state *g = s->ds41_cpu;
+        for (int i = 0; i < prompt->len; i++) {
+            if (prompt->v[i] < 0 || (uint32_t)prompt->v[i] >= DS4_N_VOCAB) {
+                snprintf(err, errlen, "token id %d at position %d is outside the vocabulary", prompt->v[i], i);
+                return 1;
+            }
+        }
+        if (!s->checkpoint_valid || !g->valid || g->pos != (uint32_t)s->checkpoint.len ||
+            !ds4_tokens_starts_with(prompt, &s->checkpoint)) {
+            ds41_cpu_reset(g);
+            s->checkpoint.len = 0;
+            s->checkpoint_valid = false;
+        }
+        s->mtp_draft_valid = false;
+        for (int i = s->checkpoint.len; i < prompt->len; i++) {
+            if (ds4_session_cancelled(s)) {
+                snprintf(err, errlen, "interrupted");
+                return DS4_SESSION_SYNC_INTERRUPTED;
+            }
+            if (!ds41_cpu_forward(g, prompt->v[i], s->logits, err, errlen)) {
+                s->checkpoint_valid = false;
+                return 1;
+            }
+            token_vec_push(&s->checkpoint, prompt->v[i]);
+            s->checkpoint_valid = true;
+            if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
+        }
+        s->greedy_splitkv_segment.len = 0;
+        s->greedy_splitkv_anchor_valid = false;
+        return 0;
+    }
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
         if (s->checkpoint_valid &&
@@ -78914,6 +79077,22 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
                                      s->logits,
                                      err,
                                      errlen);
+    }
+    if (s->ds41_cpu) {
+        if (token < 0 || (uint32_t)token >= DS4_N_VOCAB || s->checkpoint.len >= s->ctx_size) {
+            snprintf(err, errlen, "invalid token or full V4.1 CPU context");
+            return 1;
+        }
+        if (!s->checkpoint_valid || s->ds41_cpu->pos != (uint32_t)s->checkpoint.len ||
+            !ds41_cpu_forward(s->ds41_cpu, token, s->logits, err, errlen)) {
+            s->checkpoint_valid = false;
+            if (errlen && !err[0]) snprintf(err, errlen, "V4.1 CPU decode failed");
+            return 1;
+        }
+        token_vec_push(&s->checkpoint, token);
+        s->checkpoint_valid = true;
+        s->mtp_draft_valid = false;
+        return 0;
     }
     if (ds4_session_is_cpu(s)) {
         ds4_engine *e = s->engine;
@@ -86208,7 +86387,7 @@ static int ds4_session_eval_speculative_argmax_impl(
     }
     if (accepted_cap > max_tokens) accepted_cap = max_tokens;
 #ifdef DS4_HAS_DEEPSEEK41_GPU
-    if (ds4_session_is_ds41(s))
+    if (ds4_session_is_ds41(s) && !ds4_session_is_cpu(s))
         return ds41_session_speculate(s, first_token, accepted_cap, eos_token, ignore_eos,
             think_mode, 0, 0, 1, 0, NULL, accepted, err, errlen);
 #endif
@@ -87090,7 +87269,7 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
     }
     if (accepted_cap > max_tokens) accepted_cap = max_tokens;
 #ifdef DS4_HAS_DEEPSEEK41_GPU
-    if (ds4_session_is_ds41(s))
+    if (ds4_session_is_ds41(s) && !ds4_session_is_cpu(s))
         return ds41_session_speculate(s, first_token, accepted_cap, eos_token, false,
             DS4_THINK_HIGH, temperature, top_k, top_p, min_p, rng, accepted, err, errlen);
 #endif
@@ -87239,6 +87418,7 @@ void ds4_session_invalidate(ds4_session *s) {
 #endif
     ds4_session_glm_reset_dense_cache(s);
 #endif
+    if (s->ds41_cpu) ds41_cpu_reset(s->ds41_cpu);
 }
 
 /* Internal state-only restore. The coordinator must replay from this prefix

@@ -96,6 +96,12 @@
 /tests/test_cuda_ssd_batch
 /tests/test_cuda_ssd_repack
 /tests/test_deepseek41_gguf
+/tests/test_deepseek41_cpu_math
+/tests/test_deepseek41_cpu_attention
+/tests/test_deepseek41_cpu_payload
+/tests/test_deepseek41_cpu_session
+/tests/test_deepseek41_cpu_live
+/tests/test_deepseek41_cpu_x86
 /tests/test_qwen4_ngrams
 /tests/test_qwen4_ngram_state
 /tests/test_deepseek41_graph
@@ -114,3 +120,4 @@ __pycache__/
 
 /tests/test_qwen4_conv_parallel
 /tests/test_q8_prefill_variants
+/tests/test_cpu_quant_x86
