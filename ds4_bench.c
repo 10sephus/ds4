@@ -60,6 +60,7 @@ typedef struct {
     uint64_t simulate_used_memory_bytes;
     double step_mul;
     const char *dump_frontier_logits_dir;
+    const char *dump_decode_logits_dir;
     ds4_dist_options dist;
     ds4_tp_options tp;
     bool warm_weights;
@@ -303,6 +304,8 @@ static bench_config parse_options(int argc, char **argv) {
             c.csv_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dump-frontier-logits-dir")) {
             c.dump_frontier_logits_dir = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dump-decode-logits-dir")) {
+            c.dump_decode_logits_dir = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--expert-profile")) {
             c.expert_profile_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-t") || !strcmp(arg, "--threads")) {
@@ -396,6 +399,12 @@ static bench_config parse_options(int argc, char **argv) {
                 "--teacher-forced-decode\n");
         exit(2);
     }
+    if (c.dspark && c.dump_decode_logits_dir) {
+        fprintf(stderr,
+                "ds4-bench: --dspark cannot be combined with "
+                "--dump-decode-logits-dir\n");
+        exit(2);
+    }
     if (c.ctx_start > c.ctx_max) {
         fprintf(stderr, "ds4-bench: --ctx-start must be <= --ctx-max\n");
         exit(2);
@@ -459,14 +468,19 @@ static void json_write_string(FILE *fp, const char *s) {
     fputc('"', fp);
 }
 
-static int write_frontier_logits_json(
+/* Dump the current session logits as JSON.  Frontier dumps (decode_step < 0)
+ * describe the prefill state at the frontier; decode dumps describe the state
+ * after the given decode step consumed `token`.  Both share one format so the
+ * same comparison tooling covers prefill and decode paths. */
+static int write_logits_json(
         const bench_config *cfg,
         ds4_engine         *engine,
         ds4_session        *session,
+        const char         *dir,
         int                 frontier,
-        int                 previous) {
-    if (!cfg->dump_frontier_logits_dir) return 0;
-
+        int                 previous,
+        int                 decode_step,
+        int                 token) {
     const int vocab = ds4_engine_vocab_size(engine);
     float *logits = malloc((size_t)vocab * sizeof(logits[0]));
     if (!logits) {
@@ -480,11 +494,9 @@ static int write_frontier_logits_json(
     }
 
     char path[PATH_MAX];
-    const int n = snprintf(path,
-                           sizeof(path),
-                           "%s/frontier_%06d.logits.json",
-                           cfg->dump_frontier_logits_dir,
-                           frontier);
+    const int n = decode_step < 0
+        ? snprintf(path, sizeof(path), "%s/frontier_%06d.logits.json", dir, frontier)
+        : snprintf(path, sizeof(path), "%s/decode_%06d_%04d.logits.json", dir, frontier, decode_step);
     if (n <= 0 || (size_t)n >= sizeof(path)) {
         fprintf(stderr, "ds4-bench: frontier logits path is too long\n");
         free(logits);
@@ -505,6 +517,7 @@ static int write_frontier_logits_json(
             ",\n  \"backend\":\"%s\",\n  \"quality\":%s,\n"
             "  \"quant_bits\":%d,\n  \"prompt_tokens\":%d,\n"
             "  \"frontier_tokens\":%d,\n  \"prefill_tokens\":%d,\n"
+            "  \"decode_step\":%d,\n  \"decode_token\":%d,\n"
             "  \"ctx\":%d,\n  \"vocab\":%d,\n"
             "  \"argmax_id\":%d,\n  \"argmax_logit\":%.9g,\n  \"logits\":[",
             ds4_backend_name(cfg->backend),
@@ -513,6 +526,8 @@ static int write_frontier_logits_json(
             frontier,
             frontier,
             frontier - previous,
+            decode_step,
+            token,
             cfg->ctx_alloc,
             vocab,
             argmax,
@@ -531,6 +546,29 @@ static int write_frontier_logits_json(
     }
     free(logits);
     return 0;
+}
+
+static int write_frontier_logits_json(
+        const bench_config *cfg,
+        ds4_engine         *engine,
+        ds4_session        *session,
+        int                 frontier,
+        int                 previous) {
+    if (!cfg->dump_frontier_logits_dir) return 0;
+    return write_logits_json(cfg, engine, session, cfg->dump_frontier_logits_dir,
+                             frontier, previous, -1, -1);
+}
+
+static int write_decode_logits_json(
+        const bench_config *cfg,
+        ds4_engine         *engine,
+        ds4_session        *session,
+        int                 frontier,
+        int                 step,
+        int                 token) {
+    if (!cfg->dump_decode_logits_dir) return 0;
+    return write_logits_json(cfg, engine, session, cfg->dump_decode_logits_dir,
+                             frontier, frontier, step, token);
 }
 
 static int next_frontier(const bench_config *c, int cur) {
@@ -951,6 +989,10 @@ int main(int argc, char **argv) {
                 toks[0] = token;
                 if (ds4_session_eval(session, token, err, sizeof(err)) != 0) {
                     fprintf(stderr, "ds4-bench: decode at frontier %d failed: %s\n", frontier, err);
+                    rc = 1;
+                    break;
+                }
+                if (write_decode_logits_json(&cfg, engine, session, frontier, gen_done, token) != 0) {
                     rc = 1;
                     break;
                 }
