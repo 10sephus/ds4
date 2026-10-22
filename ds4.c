@@ -10070,13 +10070,15 @@ typedef struct {
 
 /* 16-token activation tiles for the x86 batched Q8_0 GEMM below.  Tile i of
  * a group holds tokens 16i..16i+15: xq is [tile][block][8 groups of 4][16
- * tokens][4 bytes] with +128 applied, xs is [tile][block][16 tokens].  Empty
- * (n_tiles = 0) below 16 tokens or without AVX-512 VNNI; tokens past the last
- * full tile take the generic per-row path. */
+ * tokens][4 bytes] with +128 applied, xs is [tile][block][16 tokens].  A
+ * trailing partial tile of at least q8_0_tile_tail_min() tokens is padded
+ * with zero lanes whose results are never stored; shorter tails (and builds
+ * without AVX-512 VNNI, n_tiles = 0) take the generic per-row path. */
 typedef struct {
     uint8_t *xq;
     float   *xs;
     uint64_t n_tiles;   /* per group */
+    uint64_t n_tok;     /* valid tokens; the last tile may be partial */
 } q8_0_tiles;
 
 typedef struct {
@@ -10562,6 +10564,16 @@ static void q8_0_tiles_pack_worker(void *vctx, uint64_t i0, uint64_t i1) {
         float *xs16 = ctx->tiles.xs + idx * blocks * 16;
 
         for (unsigned j = 0; j < 16; j++) {
+            if (tile * 16 + j >= ctx->tiles.n_tok) {
+                /* Padding lane: zero activations and scales. */
+                for (uint64_t b = 0; b < blocks; b++) {
+                    xs16[b * 16 + j] = 0.0f;
+                    for (unsigned k = 0; k < 8; k++) {
+                        memset(xq16 + ((b * 8 + k) * 16 + j) * 4, 0x80, 4);
+                    }
+                }
+                continue;
+            }
             const uint64_t src = ((tile * 16 + j) * ctx->n_groups + group) * blocks;
             const int8_t *xq = ctx->xq + src * 32;
             const float *xs = ctx->xscale + src;
@@ -10579,6 +10591,17 @@ static void q8_0_tiles_pack_worker(void *vctx, uint64_t i0, uint64_t i1) {
     }
 }
 
+/* Smallest token tail worth a padded tile.  The tile kernel is compute
+ * bound: a 16-lane pass costs about as much as 6-8 tokens of per-row dots,
+ * so a pass of fewer than 16 tokens pads from 8.  After full tiles the
+ * per-row tail also streams every weight row from DRAM a second time, so
+ * padding pays from 3 (measured on Cascade Lake, standalone at 4 and 10
+ * threads and on whole V4 Flash passes at 40).  Results are bitwise
+ * identical either way. */
+static uint64_t q8_0_tile_tail_min(bool after_full_tiles) {
+    return after_full_tiles ? 3 : 8;
+}
+
 static q8_0_tiles q8_0_tiles_pack(
         const int8_t *xq,
         const float  *xscale,
@@ -10586,8 +10609,10 @@ static q8_0_tiles q8_0_tiles_pack(
         uint64_t      n_groups,
         uint64_t      in_dim,
         uint64_t      blocks) {
+    uint64_t n_tiles = n_tok / 16;
+    if (n_tok % 16 >= q8_0_tile_tail_min(n_tiles != 0)) n_tiles++;
     q8_0_tiles_pack_ctx ctx = {
-        .tiles = { .n_tiles = n_tok / 16 },
+        .tiles = { .n_tiles = n_tiles, .n_tok = n_tok },
         .xq = xq,
         .xscale = xscale,
         .n_groups = n_groups,
@@ -10709,8 +10734,10 @@ static uint64_t matmul_q8_0_tiles_range(
                     tabs[i] = tab + ri * blocks;
                 }
                 q8_0_gemm_4x16(rows, tabs, xq16, xs16, blocks, res);
+                const uint64_t nj = tiles->n_tok - tile * 16 < 16 ?
+                                    tiles->n_tok - tile * 16 : 16;
                 for (unsigned i = 0; i < 4 && r + i < n; i++) {
-                    for (unsigned j = 0; j < 16; j++) {
+                    for (unsigned j = 0; j < nj; j++) {
                         out[(tile * 16 + j) * out_stride + rb + r + i] = res[i][j];
                     }
                 }
@@ -10718,7 +10745,7 @@ static uint64_t matmul_q8_0_tiles_range(
         }
     }
     free(tab);
-    return tiles->n_tiles * 16;
+    return tiles->n_tiles * 16 < tiles->n_tok ? tiles->n_tiles * 16 : tiles->n_tok;
 }
 
 static uint64_t matmul_q8_0_tiles_rows(

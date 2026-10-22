@@ -983,7 +983,7 @@ static void q8_0_expect_batch(const char *name, const float *out, const uint8_t 
 static void check_q8_0_batch(void) {
     const uint64_t dims[] = {32, 64, 96, 100, 130, 200, 1024, 4096};
     const uint64_t rows[] = {1, 3, 4, 5, 13, 64, 513};
-    const uint64_t toks[] = {1, 15, 16, 17, 32, 37, 48};
+    const uint64_t toks[] = {1, 2, 4, 5, 8, 15, 16, 17, 20, 32, 37, 48};
     for (size_t d = 0; d < sizeof(dims) / sizeof(*dims); d++) {
         const uint64_t in_dim = dims[d], blocks = (in_dim + 31) / 32;
         for (size_t rr = 0; rr < sizeof(rows) / sizeof(*rows); rr++) {
