@@ -9754,6 +9754,67 @@ static void matvec_f16(float *out, const ds4_model *m, const ds4_tensor *w, cons
     ds4_parallel_for_min_rows(groups, matvec_f16_group_worker, &ctx, min_groups);
 }
 
+/* Up to four dense F16 matrices sharing in_dim and x, as one dispatch of
+ * DS4_F16_ROWS groups instead of one per matrix.  The virtual group order is
+ * the first half of every matrix, then every second half, so the pool's
+ * node 0 cursor reads the rows model_place_weights() put on node 0.  Each
+ * row is still one dot_f16_rows lane, so results equal matvec_f16's. */
+#define DS4_F16_MULTI_MAX 4
+typedef struct {
+    float *out;
+    const uint16_t *data;
+    uint64_t rows;
+    uint64_t g0;        /* first group of this segment within its matrix */
+    uint64_t n_groups;
+} matvec_f16_seg;
+
+typedef struct {
+    matvec_f16_seg seg[2 * DS4_F16_MULTI_MAX];
+    uint32_t n_seg;
+    const float *x;
+    uint64_t in_dim;
+} matvec_f16_multi_ctx;
+
+static void matvec_f16_multi_worker(void *vctx, uint64_t v0, uint64_t v1) {
+    matvec_f16_multi_ctx *ctx = vctx;
+    uint64_t base = 0;
+    for (uint32_t s = 0; s < ctx->n_seg && v0 < v1; s++) {
+        const matvec_f16_seg *sg = &ctx->seg[s];
+        const uint64_t end = base + sg->n_groups;
+        if (v0 < end) {
+            const uint64_t a = sg->g0 + (v0 - base);
+            const uint64_t b = sg->g0 + ((v1 < end ? v1 : end) - base);
+            const uint64_t row1 = b * DS4_F16_ROWS < sg->rows ? b * DS4_F16_ROWS : sg->rows;
+            for (uint64_t o = a * DS4_F16_ROWS; o < row1; o += DS4_F16_ROWS) {
+                const uint64_t n_rows = row1 - o < DS4_F16_ROWS ? row1 - o : DS4_F16_ROWS;
+                dot_f16_rows(sg->out + o, sg->data + o * ctx->in_dim, n_rows, ctx->x, ctx->in_dim);
+            }
+            v0 = end < v1 ? end : v1;
+        }
+        base = end;
+    }
+}
+
+static void matvec_f16_multi(float * const *out, const ds4_model *m,
+                             const ds4_tensor * const *w, uint32_t n, const float *x) {
+    if (n == 0 || n > DS4_F16_MULTI_MAX) ds4_die("bad F16 multi matvec count");
+    matvec_f16_multi_ctx ctx = { .n_seg = 2 * n, .x = x, .in_dim = w[0]->dim[0] };
+    uint64_t total = 0;
+    for (uint32_t k = 0; k < n; k++) {
+        if (w[k]->type != 1 || w[k]->ndim != 2 || w[k]->dim[0] != ctx.in_dim) {
+            ds4_die("expected 2D F16 tensors with one input width");
+        }
+        const uint64_t rows = w[k]->dim[1];
+        const uint64_t groups = (rows + DS4_F16_ROWS - 1) / DS4_F16_ROWS;
+        const uint64_t half = groups / 2;
+        const uint16_t *data = tensor_data(m, w[k]);
+        ctx.seg[k] = (matvec_f16_seg){ out[k], data, rows, 0, half };
+        ctx.seg[n + k] = (matvec_f16_seg){ out[k], data, rows, half, groups - half };
+        total += groups;
+    }
+    ds4_parallel_for_min_rows(total, matvec_f16_multi_worker, &ctx, 1);
+}
+
 /* Same matvec on the calling thread, for callers already inside a worker. */
 static void matvec_f16_serial(float *out, const ds4_model *m, const ds4_tensor *w, const float *x) {
     if (w->type != 1 || w->ndim != 2) ds4_die("expected a 2D F16 tensor");
@@ -14965,8 +15026,10 @@ static void cpu_decode_scratch_init(ds4_cpu_decode_scratch *scratch, uint32_t ct
 
     scratch->comp = xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(float));
     scratch->index_comp = xmalloc((size_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float));
-    scratch->comp_kv_cur = xmalloc((size_t)2u * DS4_N_HEAD_DIM * sizeof(float));
-    scratch->comp_sc_cur = xmalloc((size_t)2u * DS4_N_HEAD_DIM * sizeof(float));
+    /* Attention compressor rows, then the indexer compressor rows that
+     * compressor_project_decode_f16() projects in the same dispatch. */
+    scratch->comp_kv_cur = xmalloc((size_t)2u * (DS4_N_HEAD_DIM + DS4_N_INDEXER_HEAD_DIM) * sizeof(float));
+    scratch->comp_sc_cur = xmalloc((size_t)2u * (DS4_N_HEAD_DIM + DS4_N_INDEXER_HEAD_DIM) * sizeof(float));
 
     scratch->index_allowed = xmalloc((size_t)comp_cap * sizeof(bool));
     scratch->index_q = xmalloc((size_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
@@ -15470,6 +15533,35 @@ static bool compressor_decode_one_decode_scratch(
     return compressor_update_one(out_comp, model, ape, norm, kv_cur, sc_cur,
                                  state_kv, state_score,
                                  head_dim, compress_ratio, il, pos);
+}
+
+/* Project the attention compressor kv/score rows and, on ratio-4 layers, the
+ * indexer compressor rows: all four read the same normed input, so F16
+ * checkpoints run them as one pooled dispatch of 8-row groups.  The indexer
+ * rows land after the 2 * head_dim attention rows of each scratch buffer.
+ * False (nothing done) for other tensor types. */
+static bool compressor_project_decode_f16(
+        const ds4_model         * model,
+        const ds4_layer_weights * layer,
+        uint32_t                  ratio,
+        const float             * x,
+        ds4_cpu_decode_scratch  * scratch) {
+    const ds4_tensor *w[4] = {
+        layer->attn_compressor_kv, layer->attn_compressor_gate,
+        layer->indexer_compressor_kv, layer->indexer_compressor_gate,
+    };
+    const uint32_t n = ratio == 4 ? 4u : 2u;
+    for (uint32_t k = 0; k < n; k++) {
+        if (!w[k] || w[k]->type != 1 || w[k]->ndim != 2 || w[k]->dim[0] != w[0]->dim[0]) return false;
+        const uint64_t cap = 2u * (k < 2 ? DS4_N_HEAD_DIM : DS4_N_INDEXER_HEAD_DIM);
+        if (w[k]->dim[1] > cap) return false;
+    }
+    float *out[4] = {
+        scratch->comp_kv_cur, scratch->comp_sc_cur,
+        scratch->comp_kv_cur + 2u * DS4_N_HEAD_DIM, scratch->comp_sc_cur + 2u * DS4_N_HEAD_DIM,
+    };
+    matvec_f16_multi(out, model, w, n, x);
+    return true;
 }
 
 /* Attention over raw SWA rows plus optional compressed rows.  Ratio-4 layers
@@ -16471,7 +16563,17 @@ static void layer_forward_raw_swa_one(
 
     if (ratio != 0) {
         t0 = profile ? now_sec() : 0.0;
-        if (compressor_decode_one_decode_scratch(scratch->comp, model,
+        const bool projected = compressor_project_decode_f16(model, layer, ratio, scratch->attn_norm, scratch);
+        if (projected ?
+            compressor_update_one(scratch->comp, model,
+                                  layer->attn_compressor_ape,
+                                  layer->attn_compressor_norm,
+                                  scratch->comp_kv_cur,
+                                  scratch->comp_sc_cur,
+                                  cache->attn_state_kv,
+                                  cache->attn_state_score,
+                                  DS4_N_HEAD_DIM, ratio, il, pos) :
+            compressor_decode_one_decode_scratch(scratch->comp, model,
                                                  layer->attn_compressor_kv,
                                                  layer->attn_compressor_gate,
                                                  layer->attn_compressor_ape,
@@ -16488,7 +16590,16 @@ static void layer_forward_raw_swa_one(
         }
 
         if (ratio == 4) {
-            if (compressor_decode_one_decode_scratch(scratch->index_comp, model,
+            if (projected ?
+                compressor_update_one(scratch->index_comp, model,
+                                      layer->indexer_compressor_ape,
+                                      layer->indexer_compressor_norm,
+                                      scratch->comp_kv_cur + 2u * DS4_N_HEAD_DIM,
+                                      scratch->comp_sc_cur + 2u * DS4_N_HEAD_DIM,
+                                      cache->index_state_kv,
+                                      cache->index_state_score,
+                                      DS4_N_INDEXER_HEAD_DIM, ratio, il, pos) :
+                compressor_decode_one_decode_scratch(scratch->index_comp, model,
                                                      layer->indexer_compressor_kv,
                                                      layer->indexer_compressor_gate,
                                                      layer->indexer_compressor_ape,
