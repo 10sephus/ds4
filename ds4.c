@@ -3877,6 +3877,44 @@ static void dsv4_indexer_qat_rows_inplace_cpu(float *x, uint32_t rows, uint32_t 
     }
 }
 
+#if defined(DS4_NO_GPU) && defined(__AVX512F__)
+/* One Q8_K block with the scalar arithmetic of ds4_quantize_row_q8_K().  The
+ * maximum of |x| is exact in any order, and max(|x|, m) returns m for a NaN
+ * |x| just as the scalar compare skips it.  The scalar loop takes the sign
+ * from the first x whose |x| reaches the maximum: the first equal lane here.
+ * vcvtps2dq rounds to nearest even like lrintf, but returns INT32_MIN for a
+ * NaN or out-of-range product, where (int)lrintf() truncates the 64-bit
+ * indefinite value to 0.  Such blocks (NaN, infinite or tiny nonzero inputs)
+ * and all-zero blocks return false and the scalar code rewrites the block. */
+static inline bool quantize_q8_K_block_avx512(const float *x, block_q8_K *y) {
+    __m512 m = _mm512_setzero_ps();
+    for (int j = 0; j < QK_K; j += 16) m = _mm512_max_ps(_mm512_abs_ps(_mm512_loadu_ps(x + j)), m);
+    const float amax = _mm512_reduce_max_ps(m);
+    if (amax == 0.0f) return false;
+
+    float max = 0.0f;
+    for (int j = 0; j < QK_K; j += 16) {
+        const __mmask16 hit = _mm512_cmp_ps_mask(_mm512_abs_ps(_mm512_loadu_ps(x + j)),
+                                                 _mm512_set1_ps(amax), _CMP_EQ_OQ);
+        if (hit) {
+            max = x[j + __builtin_ctz(hit)];
+            break;
+        }
+    }
+
+    const float iscale = -127.0f / max;
+    for (int j = 0; j < QK_K; j += 16) {
+        const __m512i v = _mm512_cvtps_epi32(_mm512_mul_ps(_mm512_set1_ps(iscale), _mm512_loadu_ps(x + j)));
+        if (_mm512_cmpeq_epi32_mask(v, _mm512_set1_epi32(INT32_MIN))) return false;
+        const __m128i q = _mm512_cvtsepi32_epi8(v); /* saturates like the scalar clamp */
+        _mm_storeu_si128((__m128i *)(y->qs + j), q);
+        y->bsums[j / 16] = (int16_t)_mm512_reduce_add_epi32(_mm512_cvtepi8_epi32(q));
+    }
+    y->d = 1.0f / iscale;
+    return true;
+}
+#endif
+
 /* Quantize a float activation into Q8_K blocks so GGUF Q2_K/IQ2_XXS expert
  * kernels can reuse the same activation for many expert rows. */
 static void ds4_quantize_row_q8_K(const float *x, block_q8_K *y, int64_t k) {
@@ -3884,6 +3922,12 @@ static void ds4_quantize_row_q8_K(const float *x, block_q8_K *y, int64_t k) {
     const int64_t nb = k / QK_K;
 
     for (int64_t b = 0; b < nb; b++) {
+#if defined(DS4_NO_GPU) && defined(__AVX512F__)
+        if (quantize_q8_K_block_avx512(x, &y[b])) {
+            x += QK_K;
+            continue;
+        }
+#endif
         float max = 0.0f;
         float amax = 0.0f;
         for (int j = 0; j < QK_K; j++) {
@@ -9213,6 +9257,62 @@ static inline int32_t dot_i8_32(const int8_t *a, const int8_t *b, uint64_t n) {
     return sum;
 }
 
+/* One Q8_0 block's term of a row dot, in the reference order: the f16 weight
+ * scale times the activation scale, times the exact integer dot. */
+static inline float dot_q8_0_block(
+        const uint8_t *row,
+        const int8_t  *xq,
+        const float   *xscale,
+        uint64_t       in_dim,
+        uint64_t       b) {
+    uint16_t scale_bits;
+    memcpy(&scale_bits, row + b * 34, sizeof(scale_bits));
+    const int8_t *qs = (const int8_t *)(row + b * 34 + 2);
+    const uint64_t i0 = b * 32;
+    const uint64_t n = in_dim - i0 < 32 ? in_dim - i0 : 32;
+    return f16_to_f32(scale_bits) * xscale[b] * (float)dot_i8_32(qs, xq + i0, n);
+}
+
+#if defined(DS4_NO_GPU) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__F16C__)
+/* Sum of the first 8 * groups blocks of a Q8_0 row dot, accumulated exactly
+ * like dot_q8_0_block() steps.  vpdpbusd multiplies unsigned by signed bytes,
+ * so the weights are biased to w + 128 and 128 * sum(x) is subtracted again:
+ * the int32 dots are exact for every int8 pair, -128 included.  F16C converts
+ * the scales like f16_to_f32() except that signalling NaNs come out quiet, as
+ * the multiply by the activation scale makes them anyway.  The per-block
+ * products are the scalar ones and are added one block at a time. */
+static float dot_q8_0_row_8x(const uint8_t *row, const int8_t *xq, const float *xscale, uint64_t groups) {
+    const __m256i bias = _mm256_set1_epi8((char)0x80);
+    float acc = 0.0f;
+    for (uint64_t g = 0; g < groups; g++, row += 8 * 34, xq += 8 * 32, xscale += 8) {
+        __m256i dot[8];
+        uint64_t scale_bits[2] = {0, 0};
+        for (int i = 0; i < 8; i++) {
+            const __m256i w = _mm256_loadu_si256((const __m256i *)(row + i * 34 + 2));
+            const __m256i x = _mm256_loadu_si256((const __m256i *)(xq + i * 32));
+            dot[i] = _mm256_sub_epi32(
+                _mm256_dpbusd_epi32(_mm256_setzero_si256(), _mm256_xor_si256(w, bias), x),
+                _mm256_dpbusd_epi32(_mm256_setzero_si256(), bias, x));
+            uint16_t h;
+            memcpy(&h, row + i * 34, sizeof(h));
+            scale_bits[i / 4] |= (uint64_t)h << (16 * (i % 4));
+        }
+        /* Horizontal sums: lane i of sum is block i's dot. */
+        const __m256i h0123 = _mm256_hadd_epi32(_mm256_hadd_epi32(dot[0], dot[1]),
+                                                _mm256_hadd_epi32(dot[2], dot[3]));
+        const __m256i h4567 = _mm256_hadd_epi32(_mm256_hadd_epi32(dot[4], dot[5]),
+                                                _mm256_hadd_epi32(dot[6], dot[7]));
+        const __m256i sum = _mm256_add_epi32(_mm256_permute2x128_si256(h0123, h4567, 0x20),
+                                             _mm256_permute2x128_si256(h0123, h4567, 0x31));
+        const __m256 d = _mm256_cvtph_ps(_mm_set_epi64x((long long)scale_bits[1], (long long)scale_bits[0]));
+        float p[8];
+        _mm256_storeu_ps(p, _mm256_mul_ps(_mm256_mul_ps(d, _mm256_loadu_ps(xscale)), _mm256_cvtepi32_ps(sum)));
+        for (int i = 0; i < 8; i++) acc += p[i];
+    }
+    return acc;
+}
+#endif
+
 static inline float dot_q8_0_row(
         const uint8_t *row,
         const int8_t  *xq,
@@ -9264,15 +9364,13 @@ static inline float dot_q8_0_row(
 #endif
 
     float acc = 0.0f;
-    for (uint64_t b = 0; b < blocks; b++) {
-        uint16_t scale_bits;
-        memcpy(&scale_bits, row + b * 34, sizeof(scale_bits));
-        const int8_t *qs = (const int8_t *)(row + b * 34 + 2);
-
-        const uint64_t i0 = b * 32;
-        const uint64_t n = in_dim - i0 < 32 ? in_dim - i0 : 32;
-        acc += f16_to_f32(scale_bits) * xscale[b] * (float)dot_i8_32(qs, xq + i0, n);
-    }
+    uint64_t b = 0;
+#if defined(DS4_NO_GPU) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__F16C__)
+    const uint64_t groups = in_dim / 256; /* groups of eight full blocks */
+    acc = dot_q8_0_row_8x(row, xq, xscale, groups);
+    b = groups * 8;
+#endif
+    for (; b < blocks; b++) acc += dot_q8_0_block(row, xq, xscale, in_dim, b);
     return acc;
 }
 
@@ -9434,27 +9532,51 @@ static inline DS4_MAYBE_UNUSED void dot_q8_0_row_pair(
 
     float acc0 = 0.0f;
     float acc1 = 0.0f;
-    for (uint64_t b = 0; b < blocks; b++) {
-        uint16_t s0_bits;
-        uint16_t s1_bits;
-        memcpy(&s0_bits, row0 + b * 34, sizeof(s0_bits));
-        memcpy(&s1_bits, row1 + b * 34, sizeof(s1_bits));
-        const int8_t *q0 = (const int8_t *)(row0 + b * 34 + 2);
-        const int8_t *q1 = (const int8_t *)(row1 + b * 34 + 2);
-        const uint64_t i0 = b * 32;
-        const uint64_t n = in_dim - i0 < 32 ? in_dim - i0 : 32;
-        acc0 += f16_to_f32(s0_bits) * xscale[b] * (float)dot_i8_32(q0, xq + i0, n);
-        acc1 += f16_to_f32(s1_bits) * xscale[b] * (float)dot_i8_32(q1, xq + i0, n);
+    uint64_t b = 0;
+#if defined(DS4_NO_GPU) && defined(__AVX512VNNI__) && defined(__AVX512VL__) && defined(__F16C__)
+    const uint64_t groups = in_dim / 256; /* groups of eight full blocks */
+    acc0 = dot_q8_0_row_8x(row0, xq, xscale, groups);
+    acc1 = dot_q8_0_row_8x(row1, xq, xscale, groups);
+    b = groups * 8;
+#endif
+    for (; b < blocks; b++) {
+        acc0 += dot_q8_0_block(row0, xq, xscale, in_dim, b);
+        acc1 += dot_q8_0_block(row1, xq, xscale, in_dim, b);
     }
     *out0 = acc0;
     *out1 = acc1;
 }
+
+#if defined(DS4_NO_GPU) && defined(__AVX512F__)
+/* One full Q8_0 activation block with the scalar arithmetic of
+ * quantize_q8_0_activation(); see quantize_q8_K_block_avx512() for why the
+ * max and the rounding match.  Blocks with a NaN or out-of-range product
+ * return false and are left to the scalar code. */
+static inline bool quantize_q8_0_block_avx512(const float *x, int8_t *xq, float *scale) {
+    const __m512 x0 = _mm512_loadu_ps(x);
+    const __m512 x1 = _mm512_loadu_ps(x + 16);
+    const __m512 m = _mm512_max_ps(_mm512_abs_ps(x1), _mm512_max_ps(_mm512_abs_ps(x0), _mm512_setzero_ps()));
+    const float d = _mm512_reduce_max_ps(m) / 127.0f;
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+    const __m512i v0 = _mm512_cvtps_epi32(_mm512_mul_ps(x0, _mm512_set1_ps(id)));
+    const __m512i v1 = _mm512_cvtps_epi32(_mm512_mul_ps(x1, _mm512_set1_ps(id)));
+    const __m512i bad = _mm512_set1_epi32(INT32_MIN);
+    if (_mm512_cmpeq_epi32_mask(v0, bad) | _mm512_cmpeq_epi32_mask(v1, bad)) return false;
+    _mm_storeu_si128((__m128i *)xq, _mm512_cvtsepi32_epi8(v0));
+    _mm_storeu_si128((__m128i *)(xq + 16), _mm512_cvtsepi32_epi8(v1));
+    *scale = d;
+    return true;
+}
+#endif
 
 static void quantize_q8_0_activation(const float *x, int8_t *xq, float *scale, uint64_t n) {
     const uint64_t blocks = (n + 31) / 32;
     for (uint64_t b = 0; b < blocks; b++) {
         const uint64_t i0 = b * 32;
         const uint64_t bn = n - i0 < 32 ? n - i0 : 32;
+#if defined(DS4_NO_GPU) && defined(__AVX512F__)
+        if (bn == 32 && quantize_q8_0_block_avx512(x + i0, xq + i0, scale + b)) continue;
+#endif
         float amax = 0.0f;
         for (uint64_t i = 0; i < bn; i++) {
             const float ax = fabsf(x[i0 + i]);

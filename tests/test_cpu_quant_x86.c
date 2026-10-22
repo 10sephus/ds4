@@ -453,8 +453,230 @@ static void check_f16_rows(void) {
     }
 }
 
+
+/* Verbatim copies of the scalar Q8_0/Q8_K activation quantizers and Q8_0 row
+ * dot: the SIMD block paths must reproduce them bit for bit. */
+static void q8_0_quantize_oracle(const float *x, int8_t *xq, float *scale, uint64_t n) {
+    const uint64_t blocks = (n + 31) / 32;
+    for (uint64_t b = 0; b < blocks; b++) {
+        const uint64_t i0 = b * 32;
+        const uint64_t bn = n - i0 < 32 ? n - i0 : 32;
+        float amax = 0.0f;
+        for (uint64_t i = 0; i < bn; i++) {
+            const float ax = fabsf(x[i0 + i]);
+            if (ax > amax) amax = ax;
+        }
+        const float d = amax / 127.0f;
+        const float id = d != 0.0f ? 1.0f / d : 0.0f;
+        scale[b] = d;
+        for (uint64_t i = 0; i < bn; i++) {
+            int v = (int)lrintf(x[i0 + i] * id);
+            if (v > 127) v = 127;
+            if (v < -128) v = -128;
+            xq[i0 + i] = (int8_t)v;
+        }
+        for (uint64_t i = bn; i < 32; i++) xq[i0 + i] = 0;
+    }
+}
+
+static void q8_K_quantize_oracle(const float *x, block_q8_K *y, int64_t k) {
+    for (int64_t b = 0; b < k / QK_K; b++, x += QK_K) {
+        float max = 0.0f, amax = 0.0f;
+        for (int j = 0; j < QK_K; j++) {
+            const float ax = fabsf(x[j]);
+            if (ax > amax) { amax = ax; max = x[j]; }
+        }
+        if (amax == 0.0f) {
+            y[b].d = 0.0f;
+            memset(y[b].qs, 0, sizeof(y[b].qs));
+            memset(y[b].bsums, 0, sizeof(y[b].bsums));
+            continue;
+        }
+        const float iscale = -127.0f / max;
+        for (int j = 0; j < QK_K; j++) {
+            int v = (int)lrintf(iscale * x[j]);
+            if (v > 127) v = 127;
+            if (v < -128) v = -128;
+            y[b].qs[j] = (int8_t)v;
+        }
+        for (int j = 0; j < QK_K / 16; j++) {
+            int sum = 0;
+            for (int i = 0; i < 16; i++) sum += y[b].qs[j * 16 + i];
+            y[b].bsums[j] = (int16_t)sum;
+        }
+        y[b].d = 1.0f / iscale;
+    }
+}
+
+static float q8_0_dot_oracle(const uint8_t *row, const int8_t *xq, const float *xscale, uint64_t in_dim) {
+    float acc = 0.0f;
+    for (uint64_t b = 0; b * 32 < in_dim; b++) {
+        uint16_t h;
+        memcpy(&h, row + b * 34, sizeof(h));
+        int64_t dot = 0;
+        for (uint64_t i = 0; i < 32 && b * 32 + i < in_dim; i++)
+            dot += (int64_t)(int8_t)row[b * 34 + 2 + i] * xq[b * 32 + i];
+        acc += f16_to_f32(h) * xscale[b] * (float)dot;
+    }
+    return acc;
+}
+
+static float quant_float_bits(uint32_t bits) { float f; memcpy(&f, &bits, sizeof(f)); return f; }
+
+static float quant_uniform(float scale) {
+    return scale * (((float)(int32_t)(quant_random() % 2000001u) - 1000000.0f) * 1e-6f);
+}
+
+/* Activations that stress the max search, the 1/d rounding and the clamp:
+ * exact +/-amax ties, zero rows, round-half-even products, subnormal or
+ * zero d, NaN, infinities and arbitrary bit patterns. */
+static void quant_activation(float *x, uint64_t n, unsigned pattern) {
+    for (uint64_t i = 0; i < n; i++) x[i] = quant_uniform(4.0f);
+    switch (pattern) {
+    case 0: break;
+    case 1: /* the same |x| at several places, either sign: first one wins */
+        for (uint64_t i = 0; i < n; i++) x[i] = quant_uniform(2.0f);
+        for (unsigned t = 0; t < 6; t++) {
+            const uint64_t base = quant_random() % n;
+            x[base] = -3.0f;
+            x[(base + 1 + quant_random() % 20) % n] = 3.0f;
+            x[(base + 1 + quant_random() % 20) % n] = (quant_random() & 1) ? 3.0f : -3.0f;
+        }
+        break;
+    case 2: for (uint64_t i = 0; i < n; i++) x[i] = (quant_random() & 1) ? 0.0f : -0.0f; break;
+    case 3: /* amax 127: products are the inputs, many exact .5 ties */
+        for (uint64_t i = 0; i < n; i++) x[i] = (float)((int)(quant_random() % 255u) - 127) + 0.5f * (float)(quant_random() & 1);
+        for (uint64_t i = 0; i < n; i += 16) x[i] = (quant_random() & 1) ? 127.0f : -127.0f;
+        break;
+    case 4: for (uint64_t i = 0; i < n; i++) x[i] = quant_uniform(0x1p-128f); break; /* subnormal amax */
+    case 5: for (uint64_t i = 0; i < n; i++) x[i] = quant_uniform(0x1p-120f); break; /* subnormal d, finite 1/d */
+    case 6: x[quant_random() % n] = quant_float_bits(0x7fc00000u | (quant_random() & 0x3fffffu)); break;
+    case 7: x[quant_random() % n] = (quant_random() & 1) ? INFINITY : -INFINITY; break;
+    case 8: for (uint64_t i = 0; i < n; i++) x[i] = quant_uniform(FLT_MAX); break;
+    case 9: for (uint64_t i = 0; i < n; i++) x[i] = quant_float_bits(quant_random()); break;
+    case 10: /* one large value per 32, the rest tiny or zero */
+        for (uint64_t i = 0; i < n; i++) x[i] = (i % 32 == 7) ? quant_uniform(1e6f) : quant_uniform(1e-3f) * (float)(quant_random() & 1);
+        break;
+    default: for (uint64_t i = 0; i < n; i++) x[i] = quant_uniform(8.0f) * (float)(quant_random() & 3); break;
+    }
+}
+
+static void check_q8_quantizers(void) {
+    enum { MAXN = 4096 + 40, PATTERNS = 12 };
+    static float x[MAXN];
+    static int8_t q0[MAXN + 32], q1[MAXN + 32];
+    static float s0[MAXN / 32 + 1], s1[MAXN / 32 + 1];
+    static block_q8_K k0[MAXN / QK_K], k1[MAXN / QK_K];
+    const uint64_t lengths[] = {1, 7, 31, 32, 33, 64, 100, 256, 512, 1000, 1024, 4096, 4096 + 33};
+    for (unsigned rep = 0; rep < 8; rep++) {
+        for (unsigned p = 0; p < PATTERNS; p++) {
+            for (unsigned l = 0; l < sizeof(lengths) / sizeof(*lengths); l++) {
+                const uint64_t n = lengths[l], blocks = (n + 31) / 32;
+                quant_activation(x, n, p);
+                memset(q0, 0x5a, sizeof(q0)); memset(q1, 0x5a, sizeof(q1));
+                memset(s0, 0x5a, sizeof(s0)); memset(s1, 0x5a, sizeof(s1));
+                q8_0_quantize_oracle(x, q0, s0, n);
+                quantize_q8_0_activation(x, q1, s1, n);
+                if (memcmp(q0, q1, sizeof(q0)) || memcmp(s0, s1, blocks * sizeof(*s0))) {
+                    fprintf(stderr, "Q8_0 quantizer mismatch n=%llu pattern=%u\n", (unsigned long long)n, p);
+                    exit(1);
+                }
+                if (n % QK_K) continue;
+                memset(k0, 0x5a, sizeof(k0)); memset(k1, 0x5a, sizeof(k1));
+                q8_K_quantize_oracle(x, k0, (int64_t)n);
+                ds4_quantize_row_q8_K(x, k1, (int64_t)n);
+                if (memcmp(k0, k1, n / QK_K * sizeof(*k0))) {
+                    fprintf(stderr, "Q8_K quantizer mismatch n=%llu pattern=%u\n", (unsigned long long)n, p);
+                    exit(1);
+                }
+            }
+        }
+    }
+}
+
+static void check_q8_0_dots(void) {
+    const uint64_t dims[] = {32, 64, 224, 256, 260, 288, 512, 1000, 1024, 2048 + 96, 4096, 4096 + 17};
+    const uint16_t half[] = {0, 0x8000, 1, 0x8001, 0x03ff, 0x83ff, 0x0400, 0x1801, 0x9a17,
+                             0x2c00, 0xae66, 0x3555, 0xba31, 0x7bff, 0xfbff};
+    const float scales[] = {0.0f, -0.0f, 0x1p-149f, 0x1p-130f, 0x1p-20f, 0.00173f, 0.375f, 17.3f, 1024.0f};
+    const uint16_t special[] = {0x7c00, 0xfc00, 0x7c01, 0xfd55, 0x7e00};
+    for (unsigned d = 0; d < sizeof(dims) / sizeof(*dims); d++) {
+        const uint64_t in_dim = dims[d], blocks = (in_dim + 31) / 32;
+        quant_buffer r0b = quant_alloc(blocks * 34), r1b = quant_alloc(blocks * 34);
+        quant_buffer xb = quant_alloc(blocks * 32), sb = quant_alloc(blocks * sizeof(float));
+        uint8_t *row0 = r0b.data, *row1 = r1b.data;
+        int8_t *xq = (int8_t *)xb.data;
+        float *xscale = (float *)sb.data;
+        for (unsigned p = 0; p < 36; p++) {
+            for (uint64_t b = 0; b < blocks; b++) {
+                uint16_t h0 = half[(p + b) % 15], h1 = half[(3 * p + 7 * b) % 15];
+                xscale[b] = scales[(p + 5 * b) % 9];
+                if (p >= 12) { /* random finite scales: every add rounds */
+                    h0 = (uint16_t)quant_random();
+                    h1 = (uint16_t)quant_random();
+                    if ((h0 & 0x7c00) == 0x7c00) h0 ^= 0x4000;
+                    if ((h1 & 0x7c00) == 0x7c00) h1 ^= 0x4000;
+                    xscale[b] = fabsf(quant_uniform(0.05f));
+                }
+                memcpy(row0 + b * 34, &h0, 2);
+                memcpy(row1 + b * 34, &h1, 2);
+                for (unsigned i = 0; i < 32; i++) {
+                    row0[b * 34 + 2 + i] = (uint8_t)quant_byte(p % 6, i + (unsigned)b);
+                    row1[b * 34 + 2 + i] = (uint8_t)quant_byte((p + 3) % 6, 3 * i + (unsigned)b);
+                    /* Padding past in_dim must be ignored, whatever it holds. */
+                    xq[b * 32 + i] = quant_byte((p / 6 + 5) % 6, 7 * i + (unsigned)b);
+                }
+            }
+            /* One infinite or NaN weight scale (several would make the NaN
+             * payload depend on add operand order, not on the kernel). */
+            if (p >= 30) {
+                const uint16_t h = special[p - 30 < 5 ? p - 30 : 0];
+                memcpy(row1 + (quant_random() % blocks) * 34, &h, 2);
+            }
+            const float e0 = q8_0_dot_oracle(row0, xq, xscale, in_dim);
+            const float e1 = q8_0_dot_oracle(row1, xq, xscale, in_dim);
+            float a0, a1;
+            quant_equal("Q8_0", e0, dot_q8_0_row(row0, xq, xscale, in_dim, blocks), (unsigned)blocks, p);
+            dot_q8_0_row_pair(row0, row1, xq, xscale, in_dim, blocks, &a0, &a1);
+            quant_equal("Q8_0 pair row0", e0, a0, (unsigned)blocks, p);
+            quant_equal("Q8_0 pair row1", e1, a1, (unsigned)blocks, p);
+            dot_q8_0_row_2(row1, xq, xscale, xq, xscale, in_dim, blocks, &a0, &a1);
+            quant_equal("Q8_0 row_2", e1, a0, (unsigned)blocks, p);
+            quant_equal("Q8_0 row_2", e1, a1, (unsigned)blocks, p);
+        }
+        quant_free(sb); quant_free(xb); quant_free(r1b); quant_free(r0b);
+    }
+}
+
+#if defined(DS4_NO_GPU) && defined(__AVX2__) && defined(__F16C__)
+/* The SIMD Q8_0 path converts weight scales with F16C.  Exhaustively: equal
+ * bits except that F16C quiets signalling NaNs, and equal products with the
+ * activation scales either way. */
+static void check_f16c_scales(void) {
+    /* volatile: the compiler may fold x * 1.0f to x, the hardware does not */
+    static volatile float act[] = {0.0f, -0.0f, 0x1p-149f, 0x1p-130f, 0.00173f, 1.0f, 17.3f, 0x1p100f, -2.5f};
+    for (uint32_t h = 0; h < 65536; h++) {
+        const float sw = f16_to_f32((uint16_t)h);
+        const float hw = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128((int)h)));
+        uint32_t a, b;
+        memcpy(&a, &sw, sizeof(a)); memcpy(&b, &hw, sizeof(b));
+        CHECK(sw != sw ? (a | 0x00400000u) == b : a == b);
+        for (unsigned i = 0; i < sizeof(act) / sizeof(*act); i++) {
+            const float ps = sw * act[i], ph = hw * act[i];
+            memcpy(&a, &ps, sizeof(a)); memcpy(&b, &ph, sizeof(b));
+            CHECK(a == b);
+        }
+    }
+}
+#endif
+
 int main(void) {
     check_integer_dots();
+#if defined(DS4_NO_GPU) && defined(__AVX2__) && defined(__F16C__)
+    check_f16c_scales();
+#endif
+    check_q8_quantizers();
+    puts("CPU Q8_0/Q8_K activation quantizers match the scalar code bitwise");
     check_indexer();
     check_indexer_selection();
     puts("CPU indexer row-parallel scoring and top-k selection oracle PASS");
@@ -463,6 +685,8 @@ int main(void) {
     puts("Block FP oracle skipped: existing ARM DOTPROD accumulation order differs");
 #else
     check_block_dots();
+    check_q8_0_dots();
+    puts("CPU Q8_0 row dots match the scalar block order bitwise");
     check_f16_rows();
 #if defined(DS4_NO_GPU) && defined(__AVX2__) && defined(__F16C__)
     check_f16_conversion();
