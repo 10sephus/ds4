@@ -2121,7 +2121,6 @@ static void check_ds41_q8_grouped(void) {
 
 int main(void) {
     check_ffn_graph();
-    if (getenv("DS4_TEST_FFN_GRAPH_ONLY")) return 0;
     check_thread_pool();
     check_ds41_q8_grouped();
     puts("CPU V4.1 grouped and paired Q8_0 projections bitwise against the reference PASS");
