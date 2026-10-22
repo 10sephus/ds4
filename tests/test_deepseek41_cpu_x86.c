@@ -158,6 +158,55 @@ static void check_half(void) {
     }
 }
 
+/* The IQ2_XXS pair kernel against the scalar dot, row by row: every grid
+ * index and every sign index in each of the four positions of a sub-block,
+ * all scale nibbles, edge-case F16 scales and signed zero activations. */
+static void check_iq2xxs_pair(void) {
+    const uint64_t k = 5120, rows = 64, stride = k / QK_K * sizeof(block_iq2_xxs);
+    test_buffer g = test_alloc(rows * stride), u = test_alloc(rows * stride);
+    test_buffer xb = test_alloc(k * sizeof(float));
+    float *x = (float *)xb.data;
+    for (uint64_t i = 0; i < k; i++) {
+        x[i] = test_float();
+        if (test_random() % 61 == 0) x[i] = (test_random() & 1) ? -0.0f : 0.0f;
+    }
+    uint32_t n = 0;
+    for (unsigned m = 0; m < 2; m++) {
+        uint8_t *w = m ? u.data : g.data;
+        test_fill_quants(w, rows * stride, DS4_TENSOR_IQ2_XXS);
+        for (uint64_t r = 0; r < rows; r++) {
+            for (uint64_t b = 0; b < k / QK_K; b++) {
+                uint8_t *q = w + r * stride + b * sizeof(block_iq2_xxs) + offsetof(block_iq2_xxs, qs);
+                for (unsigned ib = 0; ib < QK_K / 32; ib++, n++) {
+                    uint32_t aux[2] = {0, (n % 16u) << 28};
+                    for (unsigned l = 0; l < 4; l++) {
+                        aux[0] |= ((n + 64u * l) & 255u) << (8 * l);
+                        aux[1] |= ((n / 2u + 32u * l) & 127u) << (7 * l);
+                    }
+                    memcpy(q + ib * 8u, aux, sizeof(aux));
+                }
+            }
+        }
+    }
+    for (uint64_t row = 0; row < rows; row += 16) {
+        __m512 sums[2];
+        float a[2][16], b[2][16];
+        ds41_cpu_iq2xxs_pair16(sums, g.data + row * stride, stride,
+                               u.data + row * stride, stride, x, k);
+        _mm512_storeu_ps(b[0], sums[0]);
+        _mm512_storeu_ps(b[1], sums[1]);
+        for (unsigned lane = 0; lane < 16; lane++) {
+            a[0][lane] = ds4_vec_dot_iq2_xxs_f32((int)k,
+                (const block_iq2_xxs *)(g.data + (row + lane) * stride), x);
+            a[1][lane] = ds4_vec_dot_iq2_xxs_f32((int)k,
+                (const block_iq2_xxs *)(u.data + (row + lane) * stride), x);
+        }
+        test_equal("IQ2_XXS pair gate", a[0], b[0], 16);
+        test_equal("IQ2_XXS pair up", a[1], b[1], 16);
+    }
+    test_free(xb); test_free(u); test_free(g);
+}
+
 /* Full MoE layouts require multiples of 256. Exercise worker row tails
  * directly as well, including a worker range split at an expert boundary. */
 static void check_q4_tails(void) {
@@ -206,10 +255,12 @@ static void check_q4_tails(void) {
             ds41_cpu_down_worker(&dc, 0, (n + 15) / 16);
             test_equal("Q2_K down tails", a, b, n);
             const uint64_t stride3 = k / QK_K * sizeof(block_iq2_xxs);
-            test_buffer w3 = test_alloc(n * stride3);
+            test_buffer w3 = test_alloc(n * stride3), w4 = test_alloc(n * stride3);
             test_fill_quants(w3.data, n * stride3, DS4_TENSOR_IQ2_XXS);
+            test_fill_quants(w4.data, n * stride3, DS4_TENSOR_IQ2_XXS);
             mc.mid = a;
-            mc.gate_base[0] = mc.gate_base[1] = mc.up_base[0] = mc.up_base[1] = w3.data;
+            mc.gate_base[0] = mc.up_base[1] = w3.data;
+            mc.gate_base[1] = mc.up_base[0] = w4.data;
             mc.gate_row_bytes[0] = mc.gate_row_bytes[1] = stride3;
             mc.up_row_bytes[0] = mc.up_row_bytes[1] = stride3;
             mc.gate_type = mc.up_type = DS4_TENSOR_IQ2_XXS;
@@ -218,7 +269,7 @@ static void check_q4_tails(void) {
             ds41_cpu_mid_worker(&mc, 0, 1);
             ds41_cpu_mid_worker(&mc, 1, tiles);
             test_equal("IQ2_XXS mid tails", a, b, 2 * n);
-            test_free(w3); test_free(w2); test_free(xb); test_free(w);
+            test_free(w4); test_free(w3); test_free(w2); test_free(xb); test_free(w);
         }
     }
 }
@@ -227,7 +278,9 @@ static void check_q4_tails(void) {
 int main(void) {
     const ds4_shape saved = g_ds4_shape;
 #if defined(__AVX512F__) && defined(__AVX512BW__)
+    CHECK(pthread_once(&ds41_iq2xxs_once, ds41_iq2xxs_tables_init) == 0);
     check_half();
+    check_iq2xxs_pair();
     check_q4_tails();
 #endif
     /* Both pool layouts: NUMA halves per group (on a two-node host) and one cursor. */

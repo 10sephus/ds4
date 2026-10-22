@@ -106,55 +106,132 @@ static __m512 ds41_cpu_q4_rows16(const uint8_t *rows, const float *x,
     return sum;
 }
 
-/* ds4_vec_dot_iq2_xxs_f32 per lane: (0.125 * d) * (2 * s + 1) as the scale,
- * then (scale * signed grid byte) * x added in row order. Sign bytes are
- * ksigns_iq2xs[i] = i | parity(i) << 7, computed instead of gathered. */
-static __m512 ds41_cpu_iq2xxs_rows16(const uint8_t *rows, const float *x,
-                                    uint64_t in_dim, uint64_t row_bytes) {
-    const __m512i offsets = ds41_cpu_row_offsets(row_bytes);
-    const __m512i byte = _mm512_set1_epi32(255), zero = _mm512_setzero_si512();
-    const long long *grid = (const long long *)iq2xxs_grid;
-    __m512 sum = _mm512_setzero_ps();
+/* IQ2_XXS grid entries as 2-bit magnitude codes (8 -> 0, 25 -> 1, 43 -> 2),
+ * element j at bits 2 * j, for in-register VPERMI2W lookups. */
+static uint16_t ds41_iq2xxs_codes[256] __attribute__((aligned(64)));
+static pthread_once_t ds41_iq2xxs_once = PTHREAD_ONCE_INIT;
+
+static void ds41_iq2xxs_tables_init(void) {
+    for (uint32_t g = 0; g < 256; g++) {
+        const uint8_t *grid = (const uint8_t *)(iq2xxs_grid + g);
+        uint32_t codes = 0;
+        for (uint32_t j = 0; j < 8; j++) {
+            if (grid[j] != 8 && grid[j] != 25 && grid[j] != 43)
+                ds4_die("unexpected IQ2_XXS grid value");
+            codes |= (uint32_t)((grid[j] > 8) + (grid[j] > 25)) << (2 * j);
+        }
+        ds41_iq2xxs_codes[g] = (uint16_t)codes;
+    }
+}
+
+/* The codes of the four grid indices in each dword lane of idx: lane r of
+ * c01 holds those of bytes 0 and 1 in its two words, lane r of c23 those of
+ * bytes 2 and 3.  Four 64-entry VPERMI2W lookups are chosen by index bits 6
+ * and 7. */
+static inline void ds41_iq2xxs_codes16(__m512i idx, const __m512i *t,
+                                      __m512i *c01, __m512i *c23) {
+    __m512i c[2];
+    for (unsigned h = 0; h < 2; h++) {
+        const __m512i w = _mm512_cvtepu8_epi16(h ? _mm512_extracti64x4_epi64(idx, 1) :
+                                                   _mm512_castsi512_si256(idx));
+        const __mmask32 bit6 = _mm512_test_epi16_mask(w, _mm512_set1_epi16(64));
+        const __mmask32 bit7 = _mm512_test_epi16_mask(w, _mm512_set1_epi16(128));
+        c[h] = _mm512_mask_blend_epi16(bit7,
+            _mm512_mask_blend_epi16(bit6, _mm512_permutex2var_epi16(t[0], w, t[1]),
+                                          _mm512_permutex2var_epi16(t[2], w, t[3])),
+            _mm512_mask_blend_epi16(bit6, _mm512_permutex2var_epi16(t[4], w, t[5]),
+                                          _mm512_permutex2var_epi16(t[6], w, t[7])));
+    }
+    *c01 = _mm512_permutex2var_epi32(c[0], _mm512_setr_epi32(
+        0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30), c[1]);
+    *c23 = _mm512_permutex2var_epi32(c[0], _mm512_setr_epi32(
+        1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31), c[1]);
+}
+
+/* Bit 7 * l is the parity of the 7-bit sign index at bits 7 * l .. 7 * l + 6,
+ * the last bit of ksigns_iq2xs[index]. */
+static inline __m512i ds41_iq2xxs_parity(__m512i aux) {
+    const __m512i p1 = _mm512_xor_si512(aux, _mm512_srli_epi32(aux, 1));
+    const __m512i p2 = _mm512_xor_si512(p1, _mm512_srli_epi32(p1, 2));
+    return _mm512_ternarylogic_epi32(p2, _mm512_srli_epi32(p1, 4),
+                                     _mm512_srli_epi32(aux, 6), 0x96);
+}
+
+/* ds4_vec_dot_iq2_xxs_f32 per lane for 16 rows of two matrices at once, such
+ * as an expert's gate and up rows: two independent sums that share the
+ * activation broadcasts.  Each lane computes (0.125 * d) * (2 * s + 1) as the
+ * scale and adds (scale * signed grid value) * x in row order, the reference's
+ * operations in its order.  The grid values are built in registers, a VPERMPS
+ * of the magnitude code with the ksigns_iq2xs bit xored into the sign, so the
+ * only gathers left read the 16 rows' blocks.  ds41_iq2xxs_codes must be
+ * initialized. */
+static void ds41_cpu_iq2xxs_pair16(__m512 out[2], const uint8_t *rows0, uint64_t row_bytes0,
+                                  const uint8_t *rows1, uint64_t row_bytes1,
+                                  const float *x, uint64_t in_dim) {
+    const __m512i off0 = ds41_cpu_row_offsets(row_bytes0);
+    const __m512i off1 = ds41_cpu_row_offsets(row_bytes1);
+    const __m512i one = _mm512_set1_epi32(1), sign = _mm512_set1_epi32((int)0x80000000u);
+    const __m512 values = _mm512_setr_ps(8.0f, 25.0f, 43.0f, 0.0f, 8.0f, 25.0f, 43.0f, 0.0f,
+                                         8.0f, 25.0f, 43.0f, 0.0f, 8.0f, 25.0f, 43.0f, 0.0f);
+    const __m512i *t = (const __m512i *)ds41_iq2xxs_codes;
+    __m512 sum0 = _mm512_setzero_ps(), sum1 = _mm512_setzero_ps();
     for (uint64_t b = 0; b < in_dim / QK_K; b++) {
-        const uint8_t *block = rows + b * sizeof(block_iq2_xxs);
-        const __m512 d = _mm512_mul_ps(_mm512_set1_ps(0.125f),
-            ds41_cpu_half16(_mm512_i32gather_epi32(offsets, block, 1)));
+        const uint8_t *block0 = rows0 + b * sizeof(block_iq2_xxs);
+        const uint8_t *block1 = rows1 + b * sizeof(block_iq2_xxs);
+        const __m512 d0 = _mm512_mul_ps(_mm512_set1_ps(0.125f),
+            ds41_cpu_half16(_mm512_i32gather_epi32(off0, block0, 1)));
+        const __m512 d1 = _mm512_mul_ps(_mm512_set1_ps(0.125f),
+            ds41_cpu_half16(_mm512_i32gather_epi32(off1, block1, 1)));
         for (unsigned ib = 0; ib < QK_K / 32; ib++) {
-            const uint8_t *q = block + offsetof(block_iq2_xxs, qs) + ib * 8u;
-            const __m512i aux0 = _mm512_i32gather_epi32(offsets, q, 1);
-            const __m512i aux1 = _mm512_i32gather_epi32(offsets, q + 4, 1);
-            const __m512 scale = _mm512_mul_ps(d, _mm512_cvtepi32_ps(_mm512_add_epi32(
-                _mm512_slli_epi32(_mm512_srli_epi32(aux1, 28), 1), _mm512_set1_epi32(1))));
-            const float *xb = x + b * QK_K + ib * 32u;
+            const uint8_t *q0 = block0 + offsetof(block_iq2_xxs, qs) + ib * 8u;
+            const uint8_t *q1 = block1 + offsetof(block_iq2_xxs, qs) + ib * 8u;
+            const __m512i aux0 = _mm512_i32gather_epi32(off0, q0 + 4, 1);
+            const __m512i aux1 = _mm512_i32gather_epi32(off1, q1 + 4, 1);
+            __m512i c0[4], c1[4];
+            ds41_iq2xxs_codes16(_mm512_i32gather_epi32(off0, q0, 1), t, &c0[0], &c0[2]);
+            ds41_iq2xxs_codes16(_mm512_i32gather_epi32(off1, q1, 1), t, &c1[0], &c1[2]);
+            c0[1] = _mm512_srli_epi32(c0[0], 16); c0[3] = _mm512_srli_epi32(c0[2], 16);
+            c1[1] = _mm512_srli_epi32(c1[0], 16); c1[3] = _mm512_srli_epi32(c1[2], 16);
+            const __m512i par0 = ds41_iq2xxs_parity(aux0), par1 = ds41_iq2xxs_parity(aux1);
+            const __m512 scale0 = _mm512_mul_ps(d0, _mm512_cvtepi32_ps(_mm512_add_epi32(
+                _mm512_slli_epi32(_mm512_srli_epi32(aux0, 28), 1), one)));
+            const __m512 scale1 = _mm512_mul_ps(d1, _mm512_cvtepi32_ps(_mm512_add_epi32(
+                _mm512_slli_epi32(_mm512_srli_epi32(aux1, 28), 1), one)));
             for (unsigned l = 0; l < 4; l++) {
-                const __m512i idx = _mm512_and_si512(_mm512_srli_epi32(aux0, 8 * l), byte);
-                const __m512i lo = _mm512_i32gather_epi64(_mm512_castsi512_si256(idx), grid, 8);
-                const __m512i hi = _mm512_i32gather_epi64(_mm512_extracti64x4_epi64(idx, 1), grid, 8);
-                const __m512i w0 = _mm512_inserti64x4(_mm512_castsi256_si512(
-                    _mm512_cvtepi64_epi32(lo)), _mm512_cvtepi64_epi32(hi), 1);
-                const __m512i w1 = _mm512_inserti64x4(_mm512_castsi256_si512(
-                    _mm512_cvtepi64_epi32(_mm512_srli_epi64(lo, 32))),
-                    _mm512_cvtepi64_epi32(_mm512_srli_epi64(hi, 32)), 1);
-                const __m512i s7 = _mm512_and_si512(_mm512_srli_epi32(aux1, 7 * l),
-                                                    _mm512_set1_epi32(127));
-                __m512i parity = _mm512_xor_si512(s7, _mm512_srli_epi32(s7, 4));
-                parity = _mm512_xor_si512(parity, _mm512_srli_epi32(parity, 2));
-                parity = _mm512_xor_si512(parity, _mm512_srli_epi32(parity, 1));
-                const __m512i signs = _mm512_or_si512(s7, _mm512_slli_epi32(
-                    _mm512_and_si512(parity, _mm512_set1_epi32(1)), 7));
-                for (unsigned j = 0; j < 8; j++) {
-                    const __m512i g = _mm512_and_si512(
-                        _mm512_srli_epi32(j < 4 ? w0 : w1, 8 * (j & 3u)), byte);
-                    const __mmask16 neg = _mm512_test_epi32_mask(signs, _mm512_set1_epi32(1 << j));
-                    const __m512 v = _mm512_cvtepi32_ps(
-                        _mm512_mask_sub_epi32(g, neg, zero, g));
-                    sum = _mm512_add_ps(sum, _mm512_mul_ps(_mm512_mul_ps(scale, v),
-                                                           _mm512_set1_ps(xb[l * 8u + j])));
-                }
+                /* Group l: codes at bits 2 * j, sign index at bits 0-6 and
+                 * its parity at bit 0 after shifting by 7 * l. */
+                const __m512i shift = _mm512_set1_epi32((int)(7 * l));
+                const __m512i code0 = c0[l], code1 = c1[l];
+                const __m512i s0 = _mm512_srlv_epi32(aux0, shift), s1 = _mm512_srlv_epi32(aux1, shift);
+                const __m512i p0 = _mm512_srlv_epi32(par0, shift), p1 = _mm512_srlv_epi32(par1, shift);
+                const float *xl = x + b * QK_K + ib * 32u + l * 8u;
+/* Element J: magnitude by VPERMPS of its code, then the sign bit of
+ * ksigns_iq2xs[index] (index bit J, or the parity for J = 7) xored in. */
+#define DS41_IQ2_VALUE(CODE, S, P, J) _mm512_castsi512_ps(_mm512_ternarylogic_epi32( \
+    _mm512_castps_si512(_mm512_permutexvar_ps(_mm512_srli_epi32(CODE, 2 * (J)), values)), \
+    (J) < 7 ? _mm512_slli_epi32(S, 31 - (J)) : _mm512_slli_epi32(P, 31), sign, 0x78))
+#define DS41_IQ2_TERM(J) do { \
+    const __m512 xj = _mm512_set1_ps(xl[J]); \
+    const __m512 v0 = DS41_IQ2_VALUE(code0, s0, p0, J); \
+    const __m512 v1 = DS41_IQ2_VALUE(code1, s1, p1, J); \
+    sum0 = _mm512_add_ps(sum0, _mm512_mul_ps(_mm512_mul_ps(scale0, v0), xj)); \
+    sum1 = _mm512_add_ps(sum1, _mm512_mul_ps(_mm512_mul_ps(scale1, v1), xj)); \
+} while (0)
+                DS41_IQ2_TERM(0);
+                DS41_IQ2_TERM(1);
+                DS41_IQ2_TERM(2);
+                DS41_IQ2_TERM(3);
+                DS41_IQ2_TERM(4);
+                DS41_IQ2_TERM(5);
+                DS41_IQ2_TERM(6);
+                DS41_IQ2_TERM(7);
             }
+#undef DS41_IQ2_TERM
+#undef DS41_IQ2_VALUE
         }
     }
-    return sum;
+    out[0] = sum0;
+    out[1] = sum1;
 }
 
 /* q2_k_value_f32 per lane: (d * (sc & 15)) * q - dmin * (sc >> 4), then
@@ -254,14 +331,20 @@ static void ds41_cpu_mid_worker(void *vctx, uint64_t first, uint64_t last) {
         }
         float gate[16] __attribute__((aligned(64)));
         float up[16] __attribute__((aligned(64)));
-        __m512 (*rows16)(const uint8_t *, const float *, uint64_t, uint64_t) =
-            ctx->gate_type == DS4_TENSOR_IQ2_XXS ? ds41_cpu_iq2xxs_rows16 : ds41_cpu_q4_rows16;
-        _mm512_storeu_ps(gate, rows16(
-            ctx->gate_base[slot] + row * ctx->gate_row_bytes[slot], ctx->x,
-            ctx->in_dim, ctx->gate_row_bytes[slot]));
-        _mm512_storeu_ps(up, rows16(
-            ctx->up_base[slot] + row * ctx->up_row_bytes[slot], ctx->x,
-            ctx->in_dim, ctx->up_row_bytes[slot]));
+        const uint8_t *gate_rows = ctx->gate_base[slot] + row * ctx->gate_row_bytes[slot];
+        const uint8_t *up_rows = ctx->up_base[slot] + row * ctx->up_row_bytes[slot];
+        if (ctx->gate_type == DS4_TENSOR_IQ2_XXS) {
+            __m512 sums[2];
+            ds41_cpu_iq2xxs_pair16(sums, gate_rows, ctx->gate_row_bytes[slot],
+                                   up_rows, ctx->up_row_bytes[slot], ctx->x, ctx->in_dim);
+            _mm512_storeu_ps(gate, sums[0]);
+            _mm512_storeu_ps(up, sums[1]);
+        } else {
+            _mm512_storeu_ps(gate, ds41_cpu_q4_rows16(gate_rows, ctx->x, ctx->in_dim,
+                                                      ctx->gate_row_bytes[slot]));
+            _mm512_storeu_ps(up, ds41_cpu_q4_rows16(up_rows, ctx->x, ctx->in_dim,
+                                                    ctx->up_row_bytes[slot]));
+        }
         for (unsigned lane = 0; lane < 16; lane++) {
             float g = gate[lane], u = up[lane];
             if (ctx->clamp > 1.0e-6f) {
@@ -405,6 +488,7 @@ static void ds41_cpu_routed_moe(float *out, float *mid, const ds4_model *m,
                 ds4_die("V4.1 CPU routed-MoE found unexpected expert dimensions");
             mc.expert_weight[slot] = weights[slot];
         }
+        if (q2) pthread_once(&ds41_iq2xxs_once, ds41_iq2xxs_tables_init);
         /* Every expert is its own NUMA group, so each node takes the first
          * or second half of every selected expert's gate and up rows, the
          * halves --numa-place all put on it, instead of three whole experts
