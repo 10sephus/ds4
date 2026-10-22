@@ -11527,310 +11527,534 @@ static void matvec_iq2_xxs_experts_accum_prequant(
     ds4_parallel_for(out_dim0, matvec_iq2_xxs_accum_worker, &ctx);
 }
 
-typedef struct {
-    uint32_t token;
-    uint32_t slot;
-} ds4_expert_pair;
+/* =========================================================================
+ * Expert-grouped routed FFN for prefill (IQ2_XXS gate/up, Q2_K down).
+ *
+ * Prefill sorts the (token, slot) pairs by expert and walks each expert's
+ * tokens in tiles of sixteen, so an expert row is read and decoded once per
+ * tile instead of once per token.  A tile holds sixteen Q8_K activation rows
+ * interleaved for vpdpbusd: within a superblock the 64 four-byte groups of
+ * all lanes are adjacent, so one 64-byte load feeds sixteen int32 lanes; the
+ * per-row scale and the 16-value block sums (paired per 32-value sub-block)
+ * are gathered per lane.  The x16 kernels keep the integer sub-block dots
+ * exact and replay the reference dots' per-superblock float sequence lane by
+ * lane, so every lane is bitwise identical to the single-row kernels the
+ * decode path uses.  Lanes past n carry zeros and are never stored.
+ * ========================================================================= */
+
+#if defined(DS4_NO_GPU) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+#define DS4_MOE_X16 1
+#else
+#define DS4_MOE_X16 0
+#endif
+
+#define DS4_MOE_TILE 16
+/* The x16 kernels always compute sixteen lanes; a sparser tile costs less
+ * through the per-row reference dots. */
+#define DS4_MOE_X16_MIN_LANES 3
+/* Rows per pool task: a (tile, row block) pair. */
+#define DS4_MOE_ROW_BLOCK 32
+/* Tokens per moe_grouped_ffn call.  Tokens are independent, so chunking
+ * keeps the outputs and only bounds the transient per-pair buffers (mid,
+ * midq, down_pair: about 140 KB per token) to some 300 MB on long prompts. */
+#define DS4_MOE_CHUNK_TOKENS 2048
 
 typedef struct {
-    float *mid;
-    const uint8_t *gate_base[DS4_MAX_EXPERT];
-    const uint8_t *up_base[DS4_MAX_EXPERT];
-    const block_q8_K *xq;
-    const ds4_expert_pair *pairs;
-    const uint32_t *pair_ids;
-    const uint32_t *expert_offset;
-    const uint32_t *active_expert;
-    const float *pair_weight;
-    float clamp;
-    uint64_t in_dim;
-    uint64_t out_dim;
-    uint64_t gate_row_bytes[DS4_MAX_EXPERT];
-    uint64_t up_row_bytes[DS4_MAX_EXPERT];
-    uint64_t xq_blocks;
-} matvec_q2_k_batch_mid_ctx;
+    const block_q8_K *row[DS4_MOE_TILE]; /* activation rows, NULL past n */
+    const iq2xxs_q8  *iq2[DS4_MOE_TILE]; /* the same rows in the IQ2_XXS pair kernel's layout (gate/up only) */
+    uint32_t pair[DS4_MOE_TILE];         /* pair id = token * n_used + slot */
+    uint32_t n;                          /* valid lanes */
+    uint32_t expert;
+    int8_t  *q;                          /* [nb][64][16 lanes][4] */
+    float   *d;                          /* [nb][16 lanes] */
+    int16_t *bsums;                      /* [nb][8][16 lanes][2] */
+} ds4_moe_tile;
 
-static void matvec_q2_k_batch_mid_worker(void *vctx, uint64_t task0, uint64_t task1) {
-    matvec_q2_k_batch_mid_ctx *ctx = vctx;
+#define DS4_MOE_TILE_Q_STRIDE  (QK_K * DS4_MOE_TILE)
+#define DS4_MOE_TILE_BS_STRIDE (QK_K / 16 * DS4_MOE_TILE)
 
-    for (uint64_t task = task0; task < task1; task++) {
-        const uint32_t active_idx = (uint32_t)(task / ctx->out_dim);
-        const uint64_t row = task - (uint64_t)active_idx * ctx->out_dim;
-        const uint32_t expert = ctx->active_expert[active_idx];
-        const uint32_t begin = ctx->expert_offset[expert];
-        const uint32_t end = ctx->expert_offset[expert + 1];
-
-        const block_q2_K *gate_row = (const block_q2_K *)(ctx->gate_base[expert] + row * ctx->gate_row_bytes[expert]);
-        const block_q2_K *up_row = (const block_q2_K *)(ctx->up_base[expert] + row * ctx->up_row_bytes[expert]);
-
-        for (uint32_t i = begin; i < end; i++) {
-            const uint32_t pair_id = ctx->pair_ids[i];
-            const ds4_expert_pair pair = ctx->pairs[pair_id];
-            const block_q8_K *xq = ctx->xq + (uint64_t)pair.token * ctx->xq_blocks;
-            float gate = 0.0f;
-            float up = 0.0f;
-
-            ds4_vec_dot_q2_K_q8_K((int)ctx->in_dim, &gate, gate_row, xq);
-            ds4_vec_dot_q2_K_q8_K((int)ctx->in_dim, &up, up_row, xq);
-
-            if (ctx->clamp > 1.0e-6f) {
-                if (gate > ctx->clamp) gate = ctx->clamp;
-                if (up > ctx->clamp) up = ctx->clamp;
-                if (up < -ctx->clamp) up = -ctx->clamp;
+static void moe_tile_pack(ds4_moe_tile *t, uint32_t nb) {
+    for (uint32_t i = 0; i < nb; i++) {
+        int8_t *q = t->q + (size_t)i * DS4_MOE_TILE_Q_STRIDE;
+        float *d = t->d + (size_t)i * DS4_MOE_TILE;
+        int16_t *bs = t->bsums + (size_t)i * DS4_MOE_TILE_BS_STRIDE;
+        for (uint32_t lane = 0; lane < DS4_MOE_TILE; lane++) {
+            if (lane >= t->n) {
+                d[lane] = 0.0f;
+                for (uint32_t m = 0; m < QK_K / 4; m++) memset(q + (m * DS4_MOE_TILE + lane) * 4, 0, 4);
+                for (uint32_t g = 0; g < QK_K / 16; g++) bs[(g / 2 * DS4_MOE_TILE + lane) * 2 + (g & 1)] = 0;
+                continue;
             }
-
-            ctx->mid[(uint64_t)pair_id * ctx->out_dim + row] = silu(gate) * up * ctx->pair_weight[pair_id];
+            const block_q8_K *b = t->row[lane] + i;
+            d[lane] = b->d;
+            for (uint32_t m = 0; m < QK_K / 4; m++) memcpy(q + (m * DS4_MOE_TILE + lane) * 4, b->qs + m * 4, 4);
+            for (uint32_t g = 0; g < QK_K / 16; g++) bs[(g / 2 * DS4_MOE_TILE + lane) * 2 + (g & 1)] = b->bsums[g];
         }
     }
 }
 
 typedef struct {
-    float *mid;
-    const uint8_t *gate_base[DS4_MAX_EXPERT];
-    const uint8_t *up_base[DS4_MAX_EXPERT];
-    const iq2xxs_q8 *xq;
-    const ds4_expert_pair *pairs;
-    const uint32_t *pair_ids;
-    const uint32_t *expert_offset;
-    const uint32_t *active_expert;
-    const float *pair_weight;
-    float clamp;
-    uint64_t in_dim;
-    uint64_t out_dim;
-    uint64_t gate_row_bytes[DS4_MAX_EXPERT];
-    uint64_t up_row_bytes[DS4_MAX_EXPERT];
-    uint64_t xq_blocks;
-} matvec_iq2_xxs_batch_mid_ctx;
+    ds4_moe_tile *tiles;
+    const block_q8_K *rows;
+    const iq2xxs_q8 *iq2_rows; /* rows prepared for the IQ2_XXS pair kernel, NULL for the down phase */
+    uint32_t nb;
+    uint32_t pairs_per_row; /* n_used when rows are per token, 1 when per pair */
+} moe_tiles_load_ctx;
 
-typedef struct {
-    float *mid;
-    const uint8_t *gate_base[DS4_MAX_EXPERT];
-    const uint8_t *up_base[DS4_MAX_EXPERT];
-    const block_q8_K *xq;
-    const ds4_expert_pair *pairs;
-    const uint32_t *pair_ids;
-    const uint32_t *expert_offset;
-    const uint32_t *active_expert;
-    const float *pair_weight;
-    float clamp;
-    uint64_t in_dim;
-    uint64_t out_dim;
-    uint64_t xq_blocks;
-    uint64_t gate_row_bytes[DS4_MAX_EXPERT];
-    uint64_t up_row_bytes[DS4_MAX_EXPERT];
-} matvec_q8_k_batch_mid_ctx;
+/* Point every lane at its Q8_K row and, with the x16 kernels, interleave it. */
+static void moe_tiles_load_worker(void *vctx, uint64_t t0, uint64_t t1) {
+    moe_tiles_load_ctx *ctx = vctx;
+    for (uint64_t ti = t0; ti < t1; ti++) {
+        ds4_moe_tile *t = ctx->tiles + ti;
+        for (uint32_t lane = 0; lane < DS4_MOE_TILE; lane++) {
+            const uint64_t r = (uint64_t)(t->pair[lane] / ctx->pairs_per_row) * ctx->nb;
+            t->row[lane] = lane < t->n ? ctx->rows + r : NULL;
+            t->iq2[lane] = lane < t->n && ctx->iq2_rows ? ctx->iq2_rows + r : NULL;
+        }
+        if (DS4_MOE_X16) moe_tile_pack(t, ctx->nb);
+    }
+}
 
-static void matvec_iq2_xxs_batch_mid_worker(void *vctx, uint64_t task0, uint64_t task1) {
-    matvec_iq2_xxs_batch_mid_ctx *ctx = vctx;
+#if DS4_MOE_X16
+static inline __m512i moe_bcast_u8x4(const uint8_t *p) {
+    int32_t v;
+    memcpy(&v, p, sizeof(v));
+    return _mm512_set1_epi32(v);
+}
 
-    for (uint64_t task = task0; task < task1; task++) {
-        const uint32_t active_idx = (uint32_t)(task / ctx->out_dim);
-        const uint64_t row = task - (uint64_t)active_idx * ctx->out_dim;
-        const uint32_t expert = ctx->active_expert[active_idx];
-        const uint32_t begin = ctx->expert_offset[expert];
-        const uint32_t end = ctx->expert_offset[expert + 1];
-
-        const block_iq2_xxs *gate_row = (const block_iq2_xxs *)(ctx->gate_base[expert] + row * ctx->gate_row_bytes[expert]);
-        const block_iq2_xxs *up_row = (const block_iq2_xxs *)(ctx->up_base[expert] + row * ctx->up_row_bytes[expert]);
-
-        for (uint32_t i = begin; i < end; i++) {
-            const uint32_t pair_id = ctx->pair_ids[i];
-            const ds4_expert_pair pair = ctx->pairs[pair_id];
-            const iq2xxs_q8 *xq = ctx->xq + (uint64_t)pair.token * ctx->xq_blocks;
-            float gate = 0.0f;
-            float up = 0.0f;
-
-            ds4_vec_dot_iq2_xxs_pair_q8_K((int)ctx->in_dim, &gate, &up, gate_row, up_row, xq);
-
-            if (ctx->clamp > 1.0e-6f) {
-                if (gate > ctx->clamp) gate = ctx->clamp;
-                if (up > ctx->clamp) up = ctx->clamp;
-                if (up < -ctx->clamp) up = -ctx->clamp;
-            }
-
-            ctx->mid[(uint64_t)pair_id * ctx->out_dim + row] = silu(gate) * up * ctx->pair_weight[pair_id];
+/* Decode one IQ2_XXS superblock: 256 weights offset by 128 into the unsigned
+ * vpdpbusd operand, plus the eight sub-block scales.  Each group of eight is
+ * a grid entry whose ksigns bits, spread to byte masks m, negate as
+ * (g ^ m) - m; the tables are the constant ones the scalar kernel reads. */
+static inline void moe_iq2_xxs_decode(const block_iq2_xxs *x, uint8_t *w, int32_t *ls) {
+    const __m128i kmask = _mm_set_epi8(0, 0, 0, 0, 0, 0, 0, 0,
+                                       (char)0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01);
+    const __m128i bias = _mm_set1_epi8((char)0x80);
+    for (int ib = 0; ib < QK_K / 32; ib++) {
+        uint32_t aux32[2];
+        const uint8_t *aux8 = (const uint8_t *)aux32;
+        memcpy(aux32, x->qs + 4 * ib, sizeof(aux32));
+        ls[ib] = (int32_t)(2 * (aux32[1] >> 28) + 1);
+        for (int l = 0; l < 4; l++) {
+            const __m128i signs = _mm_set1_epi8((char)ksigns_iq2xs[(aux32[1] >> (7 * l)) & 127]);
+            const __m128i m = _mm_cmpeq_epi8(_mm_and_si128(signs, kmask), kmask);
+            __m128i g = _mm_loadl_epi64((const __m128i *)(iq2xxs_grid + aux8[l]));
+            g = _mm_xor_si128(_mm_sub_epi8(_mm_xor_si128(g, m), m), bias);
+            _mm_storel_epi64((__m128i *)(w + ib * 32 + l * 8), g);
         }
     }
 }
 
-static void matvec_q8_k_batch_mid_worker(void *vctx, uint64_t task0, uint64_t task1) {
-    matvec_q8_k_batch_mid_ctx *ctx = vctx;
+/* vpshufb tables mapping a 2-bit weight to weight * scale for scale 0..15. */
+#define DS4_Q2_LUT(s) { 0, (s), 2 * (s), 3 * (s), 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
+static const uint8_t moe_q2_scale_lut[16][16] = {
+    DS4_Q2_LUT(0),  DS4_Q2_LUT(1),  DS4_Q2_LUT(2),  DS4_Q2_LUT(3),
+    DS4_Q2_LUT(4),  DS4_Q2_LUT(5),  DS4_Q2_LUT(6),  DS4_Q2_LUT(7),
+    DS4_Q2_LUT(8),  DS4_Q2_LUT(9),  DS4_Q2_LUT(10), DS4_Q2_LUT(11),
+    DS4_Q2_LUT(12), DS4_Q2_LUT(13), DS4_Q2_LUT(14), DS4_Q2_LUT(15),
+};
+#undef DS4_Q2_LUT
 
-    for (uint64_t task = task0; task < task1; task++) {
-        const uint32_t active_idx = (uint32_t)(task / ctx->out_dim);
-        const uint64_t row = task - (uint64_t)active_idx * ctx->out_dim;
-        const uint32_t expert = ctx->active_expert[active_idx];
-        const uint32_t begin = ctx->expert_offset[expert];
-        const uint32_t end = ctx->expert_offset[expert + 1];
+/* Decode one Q2_K superblock to unsigned weights with the 4-bit sub-block
+ * scale folded in (at most 45): the integer dot then needs no per-block
+ * scaling, and sum(scale * w * q) is the reference's sum(scale * sum(w * q)). */
+static inline void moe_q2_k_decode(const block_q2_K *x, uint8_t *w) {
+    const __m256i m3 = _mm256_set1_epi8(3);
+    for (int k = 0; k < QK_K / 128; k++) {
+        const __m256i q = _mm256_loadu_si256((const __m256i *)(x->qs + 32 * k));
+        for (int j = 0; j < 4; j++) {
+            const int g = k * 8 + 2 * j;
+            const __m256i lut = _mm256_set_m128i(
+                _mm_loadu_si128((const __m128i *)moe_q2_scale_lut[x->scales[g + 1] & 0x0f]),
+                _mm_loadu_si128((const __m128i *)moe_q2_scale_lut[x->scales[g] & 0x0f]));
+            const __m256i v = _mm256_and_si256(_mm256_srl_epi16(q, _mm_cvtsi32_si128(2 * j)), m3);
+            _mm256_storeu_si256((__m256i *)(w + g * 16), _mm256_shuffle_epi8(lut, v));
+        }
+    }
+}
+#endif
 
-        const block_q8_K *gate_row = (const block_q8_K *)(ctx->gate_base[expert] + row * ctx->gate_row_bytes[expert]);
-        const block_q8_K *up_row = (const block_q8_K *)(ctx->up_base[expert] + row * ctx->up_row_bytes[expert]);
+/* Two IQ2_XXS rows (gate and up) against a tile: out0[lane], out1[lane] match
+ * ds4_vec_dot_iq2_xxs_q8_K(row, tile->row[lane]) bit for bit. */
+static void moe_iq2_xxs_x16(
+        const block_iq2_xxs *x0,
+        const block_iq2_xxs *x1,
+        const ds4_moe_tile  *t,
+        uint32_t             nb,
+        float               *out0,
+        float               *out1) {
+#if DS4_MOE_X16
+    if (t->n >= DS4_MOE_X16_MIN_LANES) {
+        __m512 sumf0 = _mm512_setzero_ps();
+        __m512 sumf1 = _mm512_setzero_ps();
 
-        for (uint32_t i = begin; i < end; i++) {
-            const uint32_t pair_id = ctx->pair_ids[i];
-            const ds4_expert_pair pair = ctx->pairs[pair_id];
-            const block_q8_K *xq = ctx->xq + (uint64_t)pair.token * ctx->xq_blocks;
-            float gate = 0.0f;
-            float up = 0.0f;
+        for (uint32_t i = 0; i < nb; i++) {
+            uint8_t w0[QK_K], w1[QK_K];
+            int32_t ls0[QK_K / 32], ls1[QK_K / 32];
+            moe_iq2_xxs_decode(x0 + i, w0, ls0);
+            moe_iq2_xxs_decode(x1 + i, w1, ls1);
+            const int8_t *q = t->q + (size_t)i * DS4_MOE_TILE_Q_STRIDE;
+            const int16_t *bs = t->bsums + (size_t)i * DS4_MOE_TILE_BS_STRIDE;
+            __m512i bsum0 = _mm512_setzero_si512();
+            __m512i bsum1 = _mm512_setzero_si512();
 
-            ds4_vec_dot_q8_K_pair_q8_K((int)ctx->in_dim, &gate, &up, gate_row, up_row, xq);
-
-            if (ctx->clamp > 1.0e-6f) {
-                if (gate > ctx->clamp) gate = ctx->clamp;
-                if (up > ctx->clamp) up = ctx->clamp;
-                if (up < -ctx->clamp) up = -ctx->clamp;
+            for (int ib = 0; ib < QK_K / 32; ib++) {
+                __m512i d0 = _mm512_setzero_si512();
+                __m512i d1 = _mm512_setzero_si512();
+                for (int k = 0; k < 8; k++) {
+                    const __m512i xv = _mm512_loadu_si512((const void *)(q + (ib * 8 + k) * 64));
+                    d0 = _mm512_dpbusd_epi32(d0, moe_bcast_u8x4(w0 + ib * 32 + k * 4), xv);
+                    d1 = _mm512_dpbusd_epi32(d1, moe_bcast_u8x4(w1 + ib * 32 + k * 4), xv);
+                }
+                /* (w + 128) . q = w . q + 128 * sum(q) over the sub-block. */
+                const __m512i qsum = _mm512_madd_epi16(
+                    _mm512_loadu_si512((const void *)(bs + ib * 2 * DS4_MOE_TILE)), _mm512_set1_epi16(1));
+                const __m512i corr = _mm512_slli_epi32(qsum, 7);
+                d0 = _mm512_sub_epi32(d0, corr);
+                d1 = _mm512_sub_epi32(d1, corr);
+                bsum0 = _mm512_add_epi32(bsum0, _mm512_mullo_epi32(d0, _mm512_set1_epi32(ls0[ib])));
+                bsum1 = _mm512_add_epi32(bsum1, _mm512_mullo_epi32(d1, _mm512_set1_epi32(ls1[ib])));
             }
 
-            ctx->mid[(uint64_t)pair_id * ctx->out_dim + row] = silu(gate) * up * ctx->pair_weight[pair_id];
+            const __m512 yd = _mm512_loadu_ps(t->d + (size_t)i * DS4_MOE_TILE);
+            const __m512 dd0 = _mm512_mul_ps(_mm512_set1_ps(f16_to_f32(x0[i].d)), yd);
+            const __m512 dd1 = _mm512_mul_ps(_mm512_set1_ps(f16_to_f32(x1[i].d)), yd);
+            sumf0 = _mm512_add_ps(sumf0, _mm512_mul_ps(dd0, _mm512_cvtepi32_ps(bsum0)));
+            sumf1 = _mm512_add_ps(sumf1, _mm512_mul_ps(dd1, _mm512_cvtepi32_ps(bsum1)));
+        }
+
+        _mm512_storeu_ps(out0, _mm512_mul_ps(_mm512_set1_ps(0.125f), sumf0));
+        _mm512_storeu_ps(out1, _mm512_mul_ps(_mm512_set1_ps(0.125f), sumf1));
+        return;
+    }
+#endif
+    for (uint32_t lane = 0; lane < DS4_MOE_TILE; lane++) {
+        out0[lane] = 0.0f;
+        out1[lane] = 0.0f;
+        if (lane < t->n) {
+            ds4_vec_dot_iq2_xxs_pair_q8_K((int)(nb * QK_K), &out0[lane], &out1[lane], x0, x1, t->iq2[lane]);
+        }
+    }
+}
+
+/* Two Q2_K rows against a tile: out0[lane], out1[lane] match
+ * ds4_vec_dot_q2_K_q8_K(row, tile->row[lane]) bit for bit. */
+static void moe_q2_k_x16(
+        const block_q2_K   *x0,
+        const block_q2_K   *x1,
+        const ds4_moe_tile *t,
+        uint32_t            nb,
+        float              *out0,
+        float              *out1) {
+#if DS4_MOE_X16
+    if (t->n >= DS4_MOE_X16_MIN_LANES) {
+        __m512 sumf0 = _mm512_setzero_ps();
+        __m512 sumf1 = _mm512_setzero_ps();
+
+        for (uint32_t i = 0; i < nb; i++) {
+            uint8_t w0[QK_K], w1[QK_K];
+            moe_q2_k_decode(x0 + i, w0);
+            moe_q2_k_decode(x1 + i, w1);
+            const int8_t *q = t->q + (size_t)i * DS4_MOE_TILE_Q_STRIDE;
+            const int16_t *bs = t->bsums + (size_t)i * DS4_MOE_TILE_BS_STRIDE;
+
+            /* Four accumulators per row hide the vpdpbusd latency. */
+            __m512i acc0[4], acc1[4];
+            for (int a = 0; a < 4; a++) {
+                acc0[a] = _mm512_setzero_si512();
+                acc1[a] = _mm512_setzero_si512();
+            }
+            for (int m = 0; m < QK_K / 4; m++) {
+                const __m512i xv = _mm512_loadu_si512((const void *)(q + m * 64));
+                acc0[m & 3] = _mm512_dpbusd_epi32(acc0[m & 3], moe_bcast_u8x4(w0 + m * 4), xv);
+                acc1[m & 3] = _mm512_dpbusd_epi32(acc1[m & 3], moe_bcast_u8x4(w1 + m * 4), xv);
+            }
+            const __m512i isum0 = _mm512_add_epi32(_mm512_add_epi32(acc0[0], acc0[1]),
+                                                   _mm512_add_epi32(acc0[2], acc0[3]));
+            const __m512i isum1 = _mm512_add_epi32(_mm512_add_epi32(acc1[0], acc1[1]),
+                                                   _mm512_add_epi32(acc1[2], acc1[3]));
+
+            /* summs = sum over the 16 blocks of bsums * min, two blocks per madd. */
+            __m512i summs0 = _mm512_setzero_si512();
+            __m512i summs1 = _mm512_setzero_si512();
+            for (int p = 0; p < QK_K / 32; p++) {
+                const __m512i bsv = _mm512_loadu_si512((const void *)(bs + p * 2 * DS4_MOE_TILE));
+                const int32_t m0 = (x0[i].scales[2 * p] >> 4) | ((x0[i].scales[2 * p + 1] >> 4) << 16);
+                const int32_t m1 = (x1[i].scales[2 * p] >> 4) | ((x1[i].scales[2 * p + 1] >> 4) << 16);
+                summs0 = _mm512_add_epi32(summs0, _mm512_madd_epi16(bsv, _mm512_set1_epi32(m0)));
+                summs1 = _mm512_add_epi32(summs1, _mm512_madd_epi16(bsv, _mm512_set1_epi32(m1)));
+            }
+
+            const __m512 yd = _mm512_loadu_ps(t->d + (size_t)i * DS4_MOE_TILE);
+            const __m512 dall0 = _mm512_mul_ps(yd, _mm512_set1_ps(f16_to_f32(x0[i].d)));
+            const __m512 dmin0 = _mm512_mul_ps(yd, _mm512_set1_ps(f16_to_f32(x0[i].dmin)));
+            const __m512 dall1 = _mm512_mul_ps(yd, _mm512_set1_ps(f16_to_f32(x1[i].d)));
+            const __m512 dmin1 = _mm512_mul_ps(yd, _mm512_set1_ps(f16_to_f32(x1[i].dmin)));
+            sumf0 = _mm512_add_ps(sumf0, _mm512_sub_ps(_mm512_mul_ps(dall0, _mm512_cvtepi32_ps(isum0)),
+                                                       _mm512_mul_ps(dmin0, _mm512_cvtepi32_ps(summs0))));
+            sumf1 = _mm512_add_ps(sumf1, _mm512_sub_ps(_mm512_mul_ps(dall1, _mm512_cvtepi32_ps(isum1)),
+                                                       _mm512_mul_ps(dmin1, _mm512_cvtepi32_ps(summs1))));
+        }
+
+        _mm512_storeu_ps(out0, sumf0);
+        _mm512_storeu_ps(out1, sumf1);
+        return;
+    }
+#endif
+    for (uint32_t lane = 0; lane < DS4_MOE_TILE; lane++) {
+        out0[lane] = 0.0f;
+        out1[lane] = 0.0f;
+        if (lane < t->n) {
+            ds4_vec_dot_q2_K_q8_K((int)(nb * QK_K), &out0[lane], x0, t->row[lane]);
+            ds4_vec_dot_q2_K_q8_K((int)(nb * QK_K), &out1[lane], x1, t->row[lane]);
         }
     }
 }
 
 typedef struct {
-    float *mid;
-    const uint8_t *gate_base[DS4_MAX_EXPERT];
-    const uint8_t *up_base[DS4_MAX_EXPERT];
-    const int8_t *xq;
-    const float *xscale;
-    const ds4_expert_pair *pairs;
-    const uint32_t *pair_ids;
-    const uint32_t *expert_offset;
-    const uint32_t *active_expert;
+    float *mid;                 /* [pair][mid_dim] */
+    const ds4_moe_tile *tiles;
+    const uint8_t *gate;        /* expert 0, row 0 */
+    const uint8_t *up;
     const float *pair_weight;
-    float clamp;
-    uint64_t in_dim;
+    uint64_t gate_row_bytes;
+    uint64_t up_row_bytes;
     uint64_t out_dim;
+    uint32_t nb;
+    uint32_t n_row_blocks;
+    float clamp;
+} moe_mid_tile_ctx;
+
+/* Task = (tile, row block): gate/up rows of the tile's expert against the
+ * tile, then the same clamp, SwiGLU and router weight as the decode path. */
+static void moe_mid_tile_worker(void *vctx, uint64_t task0, uint64_t task1) {
+    moe_mid_tile_ctx *ctx = vctx;
+
+    for (uint64_t task = task0; task < task1; task++) {
+        const ds4_moe_tile *t = ctx->tiles + task / ctx->n_row_blocks;
+        const uint64_t row0 = (task % ctx->n_row_blocks) * DS4_MOE_ROW_BLOCK;
+        const uint64_t row1 = row0 + DS4_MOE_ROW_BLOCK < ctx->out_dim ? row0 + DS4_MOE_ROW_BLOCK : ctx->out_dim;
+        const uint8_t *gate = ctx->gate + (uint64_t)t->expert * ctx->out_dim * ctx->gate_row_bytes;
+        const uint8_t *up = ctx->up + (uint64_t)t->expert * ctx->out_dim * ctx->up_row_bytes;
+
+        for (uint64_t row = row0; row < row1; row++) {
+            float g[DS4_MOE_TILE], u[DS4_MOE_TILE];
+            moe_iq2_xxs_x16((const block_iq2_xxs *)(gate + row * ctx->gate_row_bytes),
+                            (const block_iq2_xxs *)(up + row * ctx->up_row_bytes),
+                            t, ctx->nb, g, u);
+            for (uint32_t lane = 0; lane < t->n; lane++) {
+                float gate_v = g[lane];
+                float up_v = u[lane];
+                if (ctx->clamp > 1.0e-6f) {
+                    if (gate_v > ctx->clamp) gate_v = ctx->clamp;
+                    if (up_v > ctx->clamp) up_v = ctx->clamp;
+                    if (up_v < -ctx->clamp) up_v = -ctx->clamp;
+                }
+                ctx->mid[(uint64_t)t->pair[lane] * ctx->out_dim + row] =
+                    silu(gate_v) * up_v * ctx->pair_weight[t->pair[lane]];
+            }
+        }
+    }
+}
+
+typedef struct {
+    float *down_pair;           /* [pair][out_dim] */
+    const ds4_moe_tile *tiles;
+    const uint8_t *down;        /* expert 0, row 0 */
+    uint64_t row_bytes;
+    uint64_t out_dim;           /* even */
+    uint32_t nb;
+    uint32_t n_row_blocks;
+} moe_down_tile_ctx;
+
+/* Task = (tile, row block): two down rows per pass share the tile loads. */
+static void moe_down_tile_worker(void *vctx, uint64_t task0, uint64_t task1) {
+    moe_down_tile_ctx *ctx = vctx;
+
+    for (uint64_t task = task0; task < task1; task++) {
+        const ds4_moe_tile *t = ctx->tiles + task / ctx->n_row_blocks;
+        const uint64_t row0 = (task % ctx->n_row_blocks) * DS4_MOE_ROW_BLOCK;
+        const uint64_t row1 = row0 + DS4_MOE_ROW_BLOCK < ctx->out_dim ? row0 + DS4_MOE_ROW_BLOCK : ctx->out_dim;
+        const uint8_t *down = ctx->down + (uint64_t)t->expert * ctx->out_dim * ctx->row_bytes;
+
+        for (uint64_t row = row0; row < row1; row += 2) {
+            float v0[DS4_MOE_TILE], v1[DS4_MOE_TILE];
+            moe_q2_k_x16((const block_q2_K *)(down + row * ctx->row_bytes),
+                         (const block_q2_K *)(down + (row + 1) * ctx->row_bytes),
+                         t, ctx->nb, v0, v1);
+            for (uint32_t lane = 0; lane < t->n; lane++) {
+                float *out = ctx->down_pair + (uint64_t)t->pair[lane] * ctx->out_dim + row;
+                out[0] = v0[lane];
+                out[1] = v1[lane];
+            }
+        }
+    }
+}
+
+typedef struct {
+    const float *x;
+    block_q8_K *xq;
+    iq2xxs_q8 *iq2; /* optional copy of every row in the IQ2_XXS pair kernel's layout */
+    uint64_t dim;
     uint64_t blocks;
-    uint64_t gate_row_bytes[DS4_MAX_EXPERT];
-    uint64_t up_row_bytes[DS4_MAX_EXPERT];
-} matvec_q8_0_batch_mid_ctx;
+} quantize_q8_k_rows_ctx;
 
-static void matvec_q8_0_batch_mid_worker(void *vctx, uint64_t task0, uint64_t task1) {
-    matvec_q8_0_batch_mid_ctx *ctx = vctx;
-
-    for (uint64_t task = task0; task < task1; task++) {
-        const uint32_t active_idx = (uint32_t)(task / ctx->out_dim);
-        const uint64_t row = task - (uint64_t)active_idx * ctx->out_dim;
-        const uint32_t expert = ctx->active_expert[active_idx];
-        const uint32_t begin = ctx->expert_offset[expert];
-        const uint32_t end = ctx->expert_offset[expert + 1];
-
-        const uint8_t *gate_row = ctx->gate_base[expert] + row * ctx->gate_row_bytes[expert];
-        const uint8_t *up_row = ctx->up_base[expert] + row * ctx->up_row_bytes[expert];
-
-        for (uint32_t i = begin; i < end; i++) {
-            const uint32_t pair_id = ctx->pair_ids[i];
-            const ds4_expert_pair pair = ctx->pairs[pair_id];
-            float gate = 0.0f;
-            float up = 0.0f;
-
-            dot_q8_0_row_pair(gate_row, up_row,
-                              ctx->xq + (uint64_t)pair.token * ctx->blocks * 32u,
-                              ctx->xscale + (uint64_t)pair.token * ctx->blocks,
-                              ctx->in_dim, ctx->blocks, &gate, &up);
-
-            if (ctx->clamp > 1.0e-6f) {
-                if (gate > ctx->clamp) gate = ctx->clamp;
-                if (up > ctx->clamp) up = ctx->clamp;
-                if (up < -ctx->clamp) up = -ctx->clamp;
-            }
-
-            ctx->mid[(uint64_t)pair_id * ctx->out_dim + row] = silu(gate) * up * ctx->pair_weight[pair_id];
-        }
-    }
-}
-
-typedef struct {
-    const float *mid;
-    block_q8_K *midq;
-    uint64_t down_in_dim;
-    uint64_t down_blocks;
-} quantize_mid_pairs_ctx;
-
-static void quantize_mid_pairs_worker(void *vctx, uint64_t p0, uint64_t p1) {
-    quantize_mid_pairs_ctx *ctx = vctx;
-    for (uint64_t p = p0; p < p1; p++) {
-        ds4_quantize_row_q8_K(ctx->mid + p * ctx->down_in_dim,
-                              ctx->midq + p * ctx->down_blocks,
-                              (int64_t)ctx->down_in_dim);
-    }
-}
-
-typedef struct {
-    float *down_pair;
-    const uint8_t *base[DS4_MAX_EXPERT];
-    const block_q8_K *midq;
-    const uint32_t *pair_ids;
-    const uint32_t *expert_offset;
-    const uint32_t *active_expert;
-    uint64_t in_dim;
-    uint64_t out_dim;
-    uint64_t row_bytes[DS4_MAX_EXPERT];
-    uint64_t midq_blocks;
-} matvec_q2_k_batch_down_ctx;
-
-static DS4_MAYBE_UNUSED void matvec_q2_k_batch_down_worker(void *vctx, uint64_t task0, uint64_t task1) {
-    matvec_q2_k_batch_down_ctx *ctx = vctx;
-
-    for (uint64_t task = task0; task < task1; task++) {
-        const uint32_t active_idx = (uint32_t)(task / ctx->out_dim);
-        const uint64_t row = task - (uint64_t)active_idx * ctx->out_dim;
-        const uint32_t expert = ctx->active_expert[active_idx];
-        const uint32_t begin = ctx->expert_offset[expert];
-        const uint32_t end = ctx->expert_offset[expert + 1];
-        const block_q2_K *br = (const block_q2_K *)(ctx->base[expert] + row * ctx->row_bytes[expert]);
-
-        for (uint32_t i = begin; i < end; i++) {
-            const uint32_t pair_id = ctx->pair_ids[i];
-            const block_q8_K *xq = ctx->midq + (uint64_t)pair_id * ctx->midq_blocks;
-            ds4_vec_dot_q2_K_q8_K((int)ctx->in_dim,
-                                  ctx->down_pair + (uint64_t)pair_id * ctx->out_dim + row,
-                                  br, xq);
-        }
+static void quantize_q8_k_rows_worker(void *vctx, uint64_t r0, uint64_t r1) {
+    quantize_q8_k_rows_ctx *ctx = vctx;
+    for (uint64_t r = r0; r < r1; r++) {
+        ds4_quantize_row_q8_K(ctx->x + r * ctx->dim, ctx->xq + r * ctx->blocks, (int64_t)ctx->dim);
+        if (ctx->iq2) iq2xxs_q8_prepare(ctx->iq2 + r * ctx->blocks, ctx->xq + r * ctx->blocks, ctx->blocks);
     }
 }
 
 typedef struct {
     float *moe;
-    const uint8_t *base[DS4_MAX_EXPERT];
-    const block_q8_K *midq;
-    const ds4_expert_pair *pairs;
-    const uint32_t *pair_ids;
-    const uint32_t *expert_offset;
-    const uint32_t *active_expert;
-    uint32_t n_active;
+    const float *down_pair;
     uint32_t n_tok;
-    uint64_t in_dim;
     uint64_t out_dim;
-    uint64_t row_bytes[DS4_MAX_EXPERT];
-    uint64_t midq_blocks;
-} matvec_q2_k_batch_accum_rows_ctx;
+} sum_down_pairs_ctx;
 
-static void matvec_q2_k_batch_accum_rows_worker(void *vctx, uint64_t row0, uint64_t row1) {
-    matvec_q2_k_batch_accum_rows_ctx *ctx = vctx;
-
-    for (uint64_t row = row0; row < row1; row++) {
-        for (uint32_t t = 0; t < ctx->n_tok; t++) {
-            ctx->moe[(uint64_t)t * ctx->out_dim + row] = 0.0f;
+/* Reduce a token's down partials in router slot order: the same
+ * acc = 0; acc += v sequence as matvec_q2_k_accum_worker on the decode path. */
+static void sum_down_pairs_worker(void *vctx, uint64_t row0, uint64_t row1) {
+    sum_down_pairs_ctx *ctx = vctx;
+    for (uint64_t idx = row0; idx < row1; idx++) {
+        const uint32_t token = (uint32_t)(idx / ctx->out_dim);
+        const uint64_t row = idx - (uint64_t)token * ctx->out_dim;
+        float acc = 0.0f;
+        for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
+            const uint64_t pair_id = (uint64_t)token * DS4_N_EXPERT_USED + slot;
+            acc += ctx->down_pair[pair_id * ctx->out_dim + row];
         }
+        ctx->moe[idx] = acc;
+    }
+}
 
-        for (uint32_t ai = 0; ai < ctx->n_active; ai++) {
-            const uint32_t expert = ctx->active_expert[ai];
-            const uint32_t begin = ctx->expert_offset[expert];
-            const uint32_t end = ctx->expert_offset[expert + 1];
-            const block_q2_K *br = (const block_q2_K *)(ctx->base[expert] + row * ctx->row_bytes[expert]);
+/* Expert-grouped routed FFN for n_tok routed tokens: gate/up, SwiGLU, Q8_K
+ * requantization and the down projection over expert token tiles, then the
+ * slot-ordered reduce into moe.  Each (token, slot) pair is a lane of exactly
+ * one tile.  The expert pointers address expert 0, row 0 of each tensor. */
+static void moe_grouped_ffn(
+        float            *moe,
+        const uint8_t    *gate,
+        const uint8_t    *up,
+        const uint8_t    *down,
+        uint64_t          gate_row_bytes,
+        uint64_t          up_row_bytes,
+        uint64_t          down_row_bytes,
+        uint64_t          in_dim,
+        uint64_t          mid_dim,
+        uint64_t          out_dim,
+        const float      *norm,
+        const int        *selected,
+        const float      *pair_weight,
+        uint32_t          n_tok,
+        float             clamp) {
+    const uint32_t n_used = DS4_N_EXPERT_USED;
+    const uint32_t total_pairs = n_tok * n_used;
+    const uint32_t nb_in = (uint32_t)(in_dim / QK_K);
+    const uint32_t nb_mid = (uint32_t)(mid_dim / QK_K);
+    const uint32_t nb_max = nb_in > nb_mid ? nb_in : nb_mid;
+    if (in_dim % QK_K != 0 || mid_dim % QK_K != 0) ds4_die("routed expert rows are not QK_K aligned");
+    if (out_dim % 2 != 0) ds4_die("routed down output is not even");
 
-            for (uint32_t i = begin; i < end; i++) {
-                const uint32_t pair_id = ctx->pair_ids[i];
-                const ds4_expert_pair pair = ctx->pairs[pair_id];
-                const block_q8_K *xq = ctx->midq + (uint64_t)pair_id * ctx->midq_blocks;
-                float v = 0.0f;
+    /* The x16 kernels read the interleaved tiles; the lanes they do not
+     * serve go through the pair kernel, which wants its own row layout. */
+    block_q8_K *xq = xmalloc((size_t)n_tok * nb_in * sizeof(xq[0]));
+    iq2xxs_q8 *xq_iq2 = xmalloc((size_t)n_tok * nb_in * sizeof(xq_iq2[0]));
+    quantize_q8_k_rows_ctx xq_ctx = { .x = norm, .xq = xq, .iq2 = xq_iq2, .dim = in_dim, .blocks = nb_in };
+    ds4_parallel_for_min_rows(n_tok, quantize_q8_k_rows_worker, &xq_ctx, 1);
 
-                ds4_vec_dot_q2_K_q8_K((int)ctx->in_dim, &v, br, xq);
-                ctx->moe[(uint64_t)pair.token * ctx->out_dim + row] += v;
+    /* Counting sort of the pairs by expert, then tiles of up to 16 per expert. */
+    uint32_t counts[DS4_MAX_EXPERT + 1] = {0};
+    uint32_t cursor[DS4_MAX_EXPERT];
+    for (uint32_t p = 0; p < total_pairs; p++) {
+        if (selected[p] < 0 || (uint32_t)selected[p] >= DS4_N_EXPERT) ds4_die("selected expert is outside range");
+        counts[selected[p] + 1]++;
+    }
+    for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+        counts[e + 1] += counts[e];
+        cursor[e] = counts[e];
+    }
+    uint32_t *pair_ids = xmalloc((size_t)total_pairs * sizeof(pair_ids[0]));
+    for (uint32_t p = 0; p < total_pairs; p++) pair_ids[cursor[selected[p]]++] = p;
+
+    uint32_t n_tiles = 0;
+    for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+        n_tiles += (counts[e + 1] - counts[e] + DS4_MOE_TILE - 1) / DS4_MOE_TILE;
+    }
+    ds4_moe_tile *tiles = xmalloc((size_t)n_tiles * sizeof(tiles[0]));
+    int8_t *tile_q = DS4_MOE_X16 ? xmalloc((size_t)n_tiles * nb_max * DS4_MOE_TILE_Q_STRIDE) : NULL;
+    float *tile_d = DS4_MOE_X16 ? xmalloc((size_t)n_tiles * nb_max * DS4_MOE_TILE * sizeof(float)) : NULL;
+    int16_t *tile_bs = DS4_MOE_X16 ? xmalloc((size_t)n_tiles * nb_max * DS4_MOE_TILE_BS_STRIDE * sizeof(int16_t)) : NULL;
+    uint32_t ti = 0;
+    for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+        for (uint32_t off = counts[e]; off < counts[e + 1]; off += DS4_MOE_TILE, ti++) {
+            ds4_moe_tile *t = tiles + ti;
+            const uint32_t left = counts[e + 1] - off;
+            t->n = left < DS4_MOE_TILE ? left : DS4_MOE_TILE;
+            t->expert = e;
+            for (uint32_t lane = 0; lane < DS4_MOE_TILE; lane++) {
+                t->pair[lane] = lane < t->n ? pair_ids[off + lane] : 0;
             }
+            t->q = DS4_MOE_X16 ? tile_q + (size_t)ti * nb_max * DS4_MOE_TILE_Q_STRIDE : NULL;
+            t->d = DS4_MOE_X16 ? tile_d + (size_t)ti * nb_max * DS4_MOE_TILE : NULL;
+            t->bsums = DS4_MOE_X16 ? tile_bs + (size_t)ti * nb_max * DS4_MOE_TILE_BS_STRIDE : NULL;
         }
     }
+    free(pair_ids);
+
+    /* Gate/up over the token activations. */
+    moe_tiles_load_ctx load_ctx = { .tiles = tiles, .rows = xq, .iq2_rows = xq_iq2, .nb = nb_in, .pairs_per_row = n_used };
+    ds4_parallel_for_min_rows(n_tiles, moe_tiles_load_worker, &load_ctx, 1);
+
+    float *mid = xmalloc((size_t)total_pairs * mid_dim * sizeof(mid[0]));
+    moe_mid_tile_ctx mid_ctx = {
+        .mid = mid,
+        .tiles = tiles,
+        .gate = gate,
+        .up = up,
+        .pair_weight = pair_weight,
+        .gate_row_bytes = gate_row_bytes,
+        .up_row_bytes = up_row_bytes,
+        .out_dim = mid_dim,
+        .nb = nb_in,
+        .n_row_blocks = (uint32_t)((mid_dim + DS4_MOE_ROW_BLOCK - 1) / DS4_MOE_ROW_BLOCK),
+        .clamp = clamp,
+    };
+    ds4_parallel_for_min_rows((uint64_t)n_tiles * mid_ctx.n_row_blocks, moe_mid_tile_worker, &mid_ctx, 1);
+    free(xq_iq2);
+    free(xq);
+
+    /* Down over the requantized mids, one Q8_K row per pair. */
+    block_q8_K *midq = xmalloc((size_t)total_pairs * nb_mid * sizeof(midq[0]));
+    quantize_q8_k_rows_ctx midq_ctx = { .x = mid, .xq = midq, .dim = mid_dim, .blocks = nb_mid };
+    ds4_parallel_for_min_rows(total_pairs, quantize_q8_k_rows_worker, &midq_ctx, 1);
+    free(mid);
+
+    load_ctx = (moe_tiles_load_ctx){ .tiles = tiles, .rows = midq, .nb = nb_mid, .pairs_per_row = 1 };
+    ds4_parallel_for_min_rows(n_tiles, moe_tiles_load_worker, &load_ctx, 1);
+
+    float *down_pair = xmalloc((size_t)total_pairs * out_dim * sizeof(down_pair[0]));
+    moe_down_tile_ctx down_ctx = {
+        .down_pair = down_pair,
+        .tiles = tiles,
+        .down = down,
+        .row_bytes = down_row_bytes,
+        .out_dim = out_dim,
+        .nb = nb_mid,
+        .n_row_blocks = (uint32_t)((out_dim + DS4_MOE_ROW_BLOCK - 1) / DS4_MOE_ROW_BLOCK),
+    };
+    ds4_parallel_for_min_rows((uint64_t)n_tiles * down_ctx.n_row_blocks, moe_down_tile_worker, &down_ctx, 1);
+    free(midq);
+    free(tile_bs);
+    free(tile_d);
+    free(tile_q);
+    free(tiles);
+
+    sum_down_pairs_ctx sum_ctx = { .moe = moe, .down_pair = down_pair, .n_tok = n_tok, .out_dim = out_dim };
+    ds4_parallel_for((uint64_t)n_tok * out_dim, sum_down_pairs_worker, &sum_ctx);
+    free(down_pair);
 }
 
 /* =========================================================================
@@ -12216,146 +12440,6 @@ static void matvec_q5_q6_k_experts_accum_prequant(
     ds4_parallel_for(out_dim0, matvec_q5_q6_k_accum_worker, &ctx);
 }
 
-/* Q4_K batch mid worker: same structure as IQ2_XXS batch but uses Q4_K dot. */
-typedef struct {
-    float *mid;
-    const uint8_t *gate_base[DS4_MAX_EXPERT];
-    const uint8_t *up_base[DS4_MAX_EXPERT];
-    const block_q8_K *xq;
-    const ds4_expert_pair *pairs;
-    const uint32_t *pair_ids;
-    const uint32_t *expert_offset;
-    const uint32_t *active_expert;
-    const float *pair_weight;
-    float clamp;
-    uint64_t in_dim;
-    uint64_t out_dim;
-    uint64_t gate_row_bytes[DS4_MAX_EXPERT];
-    uint64_t up_row_bytes[DS4_MAX_EXPERT];
-    uint64_t xq_blocks;
-} matvec_q4_k_batch_mid_ctx;
-
-static void matvec_q4_k_batch_mid_worker(void *vctx, uint64_t task0, uint64_t task1) {
-    matvec_q4_k_batch_mid_ctx *ctx = vctx;
-
-    for (uint64_t task = task0; task < task1; task++) {
-        const uint32_t active_idx = (uint32_t)(task / ctx->out_dim);
-        const uint64_t row = task - (uint64_t)active_idx * ctx->out_dim;
-        const uint32_t expert = ctx->active_expert[active_idx];
-        const uint32_t begin = ctx->expert_offset[expert];
-        const uint32_t end = ctx->expert_offset[expert + 1];
-
-        const block_q4_K *gate_row = (const block_q4_K *)(ctx->gate_base[expert] + row * ctx->gate_row_bytes[expert]);
-        const block_q4_K *up_row = (const block_q4_K *)(ctx->up_base[expert] + row * ctx->up_row_bytes[expert]);
-
-        for (uint32_t i = begin; i < end; i++) {
-            const uint32_t pair_id = ctx->pair_ids[i];
-            const ds4_expert_pair pair = ctx->pairs[pair_id];
-            const block_q8_K *xq = ctx->xq + (uint64_t)pair.token * ctx->xq_blocks;
-            float gate = 0.0f;
-            float up = 0.0f;
-
-            ds4_vec_dot_q4_K_q8_K((int)ctx->in_dim, &gate, gate_row, xq);
-            ds4_vec_dot_q4_K_q8_K((int)ctx->in_dim, &up, up_row, xq);
-
-            if (ctx->clamp > 1.0e-6f) {
-                if (gate > ctx->clamp) gate = ctx->clamp;
-                if (up > ctx->clamp) up = ctx->clamp;
-                if (up < -ctx->clamp) up = -ctx->clamp;
-            }
-
-            ctx->mid[(uint64_t)pair_id * ctx->out_dim + row] = silu(gate) * up * ctx->pair_weight[pair_id];
-        }
-    }
-}
-
-/* Q4_K batch down accum worker: same structure as Q2_K batch but uses Q4_K dot. */
-typedef struct {
-    float *moe;
-    const uint8_t *base[DS4_MAX_EXPERT];
-    const block_q8_K *midq;
-    const ds4_expert_pair *pairs;
-    const uint32_t *pair_ids;
-    const uint32_t *expert_offset;
-    const uint32_t *active_expert;
-    uint32_t n_active;
-    uint32_t n_tok;
-    uint64_t in_dim;
-    uint64_t out_dim;
-    uint64_t row_bytes[DS4_MAX_EXPERT];
-    uint64_t midq_blocks;
-} matvec_q4_k_batch_accum_rows_ctx;
-
-static void matvec_q4_k_batch_accum_rows_worker(void *vctx, uint64_t row0, uint64_t row1) {
-    matvec_q4_k_batch_accum_rows_ctx *ctx = vctx;
-
-    for (uint64_t row = row0; row < row1; row++) {
-        for (uint32_t t = 0; t < ctx->n_tok; t++) {
-            ctx->moe[(uint64_t)t * ctx->out_dim + row] = 0.0f;
-        }
-
-        for (uint32_t ai = 0; ai < ctx->n_active; ai++) {
-            const uint32_t expert = ctx->active_expert[ai];
-            const uint32_t begin = ctx->expert_offset[expert];
-            const uint32_t end = ctx->expert_offset[expert + 1];
-            const block_q4_K *br = (const block_q4_K *)(ctx->base[expert] + row * ctx->row_bytes[expert]);
-
-            for (uint32_t i = begin; i < end; i++) {
-                const uint32_t pair_id = ctx->pair_ids[i];
-                const ds4_expert_pair pair = ctx->pairs[pair_id];
-                const block_q8_K *xq = ctx->midq + (uint64_t)pair_id * ctx->midq_blocks;
-                float v = 0.0f;
-
-                ds4_vec_dot_q4_K_q8_K((int)ctx->in_dim, &v, br, xq);
-                ctx->moe[(uint64_t)pair.token * ctx->out_dim + row] += v;
-            }
-        }
-    }
-}
-
-typedef struct {
-    float *moe;
-    const uint8_t *base[DS4_MAX_EXPERT];
-    const iq2xxs_q8 *midq;
-    const ds4_expert_pair *pairs;
-    const uint32_t *pair_ids;
-    const uint32_t *expert_offset;
-    const uint32_t *active_expert;
-    uint32_t n_active;
-    uint32_t n_tok;
-    uint64_t in_dim;
-    uint64_t out_dim;
-    uint64_t row_bytes[DS4_MAX_EXPERT];
-    uint64_t midq_blocks;
-} matvec_iq2_xxs_batch_accum_rows_ctx;
-
-static void matvec_iq2_xxs_batch_accum_rows_worker(void *vctx, uint64_t row0, uint64_t row1) {
-    matvec_iq2_xxs_batch_accum_rows_ctx *ctx = vctx;
-
-    for (uint64_t row = row0; row < row1; row++) {
-        for (uint32_t t = 0; t < ctx->n_tok; t++) {
-            ctx->moe[(uint64_t)t * ctx->out_dim + row] = 0.0f;
-        }
-
-        for (uint32_t ai = 0; ai < ctx->n_active; ai++) {
-            const uint32_t expert = ctx->active_expert[ai];
-            const uint32_t begin = ctx->expert_offset[expert];
-            const uint32_t end = ctx->expert_offset[expert + 1];
-            const block_iq2_xxs *br = (const block_iq2_xxs *)(ctx->base[expert] + row * ctx->row_bytes[expert]);
-
-            for (uint32_t i = begin; i < end; i++) {
-                const uint32_t pair_id = ctx->pair_ids[i];
-                const ds4_expert_pair pair = ctx->pairs[pair_id];
-                const iq2xxs_q8 *xq = ctx->midq + (uint64_t)pair_id * ctx->midq_blocks;
-                float v = 0.0f;
-
-                ds4_vec_dot_iq2_xxs_q8_K((int)ctx->in_dim, &v, br, xq);
-                ctx->moe[(uint64_t)pair.token * ctx->out_dim + row] += v;
-            }
-        }
-    }
-}
-
 /* Dispatch: call the right gate/up mid builder based on tensor type. */
 static void matvec_experts_mid_prequant(
         float            *mid,
@@ -12504,113 +12588,6 @@ static void matvec_expert_down(
         matvec_q5_q6_k_expert(out, m, w, x, expert);
     } else {
         ds4_die("unsupported down expert tensor type");
-    }
-}
-
-typedef struct {
-    float *moe;
-    const uint8_t *base[DS4_MAX_EXPERT];
-    const block_q8_K *midq;
-    const ds4_expert_pair *pairs;
-    const uint32_t *pair_ids;
-    const uint32_t *expert_offset;
-    const uint32_t *active_expert;
-    uint32_t n_active;
-    uint32_t n_tok;
-    uint64_t in_dim;
-    uint64_t out_dim;
-    uint64_t row_bytes[DS4_MAX_EXPERT];
-    uint64_t midq_blocks;
-} matvec_q8_k_batch_accum_rows_ctx;
-
-static void matvec_q8_k_batch_accum_rows_worker(void *vctx, uint64_t row0, uint64_t row1) {
-    matvec_q8_k_batch_accum_rows_ctx *ctx = vctx;
-
-    for (uint64_t row = row0; row < row1; row++) {
-        for (uint32_t t = 0; t < ctx->n_tok; t++) {
-            ctx->moe[(uint64_t)t * ctx->out_dim + row] = 0.0f;
-        }
-
-        for (uint32_t ai = 0; ai < ctx->n_active; ai++) {
-            const uint32_t expert = ctx->active_expert[ai];
-            const uint32_t begin = ctx->expert_offset[expert];
-            const uint32_t end = ctx->expert_offset[expert + 1];
-            const block_q8_K *br = (const block_q8_K *)(ctx->base[expert] + row * ctx->row_bytes[expert]);
-
-            for (uint32_t i = begin; i < end; i++) {
-                const uint32_t pair_id = ctx->pair_ids[i];
-                const ds4_expert_pair pair = ctx->pairs[pair_id];
-                const block_q8_K *xq = ctx->midq + (uint64_t)pair_id * ctx->midq_blocks;
-                float v = 0.0f;
-
-                ds4_vec_dot_q8_K_q8_K((int)ctx->in_dim, &v, br, xq);
-                ctx->moe[(uint64_t)pair.token * ctx->out_dim + row] += v;
-            }
-        }
-    }
-}
-
-typedef struct {
-    float *moe;
-    const uint8_t *base[DS4_MAX_EXPERT];
-    const int8_t *midq;
-    const float *midscale;
-    const ds4_expert_pair *pairs;
-    const uint32_t *pair_ids;
-    const uint32_t *expert_offset;
-    const uint32_t *active_expert;
-    uint32_t n_active;
-    uint32_t n_tok;
-    uint64_t in_dim;
-    uint64_t out_dim;
-    uint64_t row_bytes[DS4_MAX_EXPERT];
-    uint64_t blocks;
-} matvec_q8_0_batch_accum_rows_ctx;
-
-static void matvec_q8_0_batch_accum_rows_worker(void *vctx, uint64_t row0, uint64_t row1) {
-    matvec_q8_0_batch_accum_rows_ctx *ctx = vctx;
-
-    for (uint64_t row = row0; row < row1; row++) {
-        for (uint32_t t = 0; t < ctx->n_tok; t++) {
-            ctx->moe[(uint64_t)t * ctx->out_dim + row] = 0.0f;
-        }
-
-        for (uint32_t ai = 0; ai < ctx->n_active; ai++) {
-            const uint32_t expert = ctx->active_expert[ai];
-            const uint32_t begin = ctx->expert_offset[expert];
-            const uint32_t end = ctx->expert_offset[expert + 1];
-            const uint8_t *br = ctx->base[expert] + row * ctx->row_bytes[expert];
-
-            for (uint32_t i = begin; i < end; i++) {
-                const uint32_t pair_id = ctx->pair_ids[i];
-                const ds4_expert_pair pair = ctx->pairs[pair_id];
-                const int8_t *xq = ctx->midq + (uint64_t)pair_id * ctx->blocks * 32u;
-                const float *xscale = ctx->midscale + (uint64_t)pair_id * ctx->blocks;
-                const float v = dot_q8_0_row(br, xq, xscale, ctx->in_dim, ctx->blocks);
-                ctx->moe[(uint64_t)pair.token * ctx->out_dim + row] += v;
-            }
-        }
-    }
-}
-
-typedef struct {
-    float *moe;
-    const float *down_pair;
-    uint32_t n_tok;
-    uint64_t out_dim;
-} sum_down_pairs_ctx;
-
-static DS4_MAYBE_UNUSED void sum_down_pairs_worker(void *vctx, uint64_t row0, uint64_t row1) {
-    sum_down_pairs_ctx *ctx = vctx;
-    for (uint64_t idx = row0; idx < row1; idx++) {
-        const uint32_t token = (uint32_t)(idx / ctx->out_dim);
-        const uint64_t row = idx - (uint64_t)token * ctx->out_dim;
-        float acc = 0.0f;
-        for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
-            const uint64_t pair_id = (uint64_t)token * DS4_N_EXPERT_USED + slot;
-            acc += ctx->down_pair[pair_id * ctx->out_dim + row];
-        }
-        ctx->moe[idx] = acc;
     }
 }
 
@@ -14011,8 +13988,39 @@ static void layer_routed_moe_one_prealloc(
     (void)il;
 }
 
-/* Prefill MoE groups token/expert pairs by expert so each active expert's
- * rows are scanned once for the whole token batch. */
+typedef struct {
+    int *selected;
+    float *pair_weight;
+    const ds4_model *model;
+    const ds4_layer_weights *layer;
+    const float *norm;
+    const int *token_ids;
+} moe_route_ctx;
+
+/* Per-token routing; the router matvec runs serially inside the worker. */
+static void moe_route_worker(void *vctx, uint64_t t0, uint64_t t1) {
+    moe_route_ctx *ctx = vctx;
+
+    for (uint64_t t = t0; t < t1; t++) {
+        int sel[DS4_MAX_EXPERT_USED];
+        float weights[DS4_MAX_EXPERT_USED];
+        const float *x = ctx->norm + t * DS4_N_EMBD;
+        if (ctx->layer->ffn_gate_tid2eid) {
+            layer_hash_selected_experts(sel, ctx->model, ctx->layer, ctx->token_ids[t]);
+            layer_hash_router_weights_one(weights, ctx->model, ctx->layer, x, sel);
+        } else {
+            layer_topk_selected_experts(sel, weights, ctx->model, ctx->layer, x);
+        }
+        for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
+            ctx->selected[t * DS4_N_EXPERT_USED + slot] = sel[slot];
+            ctx->pair_weight[t * DS4_N_EXPERT_USED + slot] = weights[slot];
+        }
+    }
+}
+
+/* Prefill routed MoE for IQ2_XXS gate/up and Q2_K down experts (the caller
+ * checks the types): route the tokens in parallel, then run the
+ * expert-grouped FFN.  Same outputs as layer_routed_moe_one_prealloc. */
 static void layer_routed_moe_batch(
         float             * moe,
         const ds4_model   * model,
@@ -14020,469 +14028,41 @@ static void layer_routed_moe_batch(
         const float       * norm,
         const int         * token_ids,
         uint32_t            n_tok,
-        uint32_t            il,
         float               clamp) {
-    const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
-    const uint64_t expert_out_dim = layer->ffn_gate_exps->dim[1];
-    const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
-    const uint64_t down_out_dim = layer->ffn_down_exps->dim[1];
-    const bool routed_q8_0 =
-        layer->ffn_gate_exps->type == DS4_TENSOR_Q8_0 &&
-        layer->ffn_up_exps->type == DS4_TENSOR_Q8_0 &&
-        layer->ffn_down_exps->type == DS4_TENSOR_Q8_0;
-    const bool routed_q8_k =
-        layer->ffn_gate_exps->type == DS4_TENSOR_Q8_K &&
-        layer->ffn_up_exps->type == DS4_TENSOR_Q8_K &&
-        layer->ffn_down_exps->type == DS4_TENSOR_Q8_K;
-    if (routed_q8_0) {
-        if ((expert_in_dim % 32u) != 0 || (down_in_dim % 32u) != 0) {
-            ds4_die("Q8_0 routed expert input is not QK8_0 aligned");
-        }
-    } else {
-        if (expert_in_dim % QK_K != 0) ds4_die("routed expert input is not QK_K aligned");
-        if (down_in_dim % QK_K != 0) ds4_die("routed expert down input is not QK_K aligned");
-    }
-    if (expert_out_dim != down_in_dim || down_out_dim != DS4_N_EMBD) {
+    uint64_t in_dim, mid_dim, up_in_dim, up_out_dim, down_in_dim, out_dim;
+    uint64_t gate_row_bytes, up_row_bytes, down_row_bytes;
+    const uint8_t *gate = tensor_expert_bytes(model, layer->ffn_gate_exps, 0, &in_dim, &mid_dim, &gate_row_bytes);
+    const uint8_t *up = tensor_expert_bytes(model, layer->ffn_up_exps, 0, &up_in_dim, &up_out_dim, &up_row_bytes);
+    const uint8_t *down = tensor_expert_bytes(model, layer->ffn_down_exps, 0, &down_in_dim, &out_dim, &down_row_bytes);
+    if (in_dim != DS4_N_EMBD || up_in_dim != in_dim || up_out_dim != mid_dim ||
+        down_in_dim != mid_dim || out_dim != DS4_N_EMBD) {
         ds4_die("routed expert tensor layout is unexpected");
     }
 
     const uint32_t total_pairs = n_tok * DS4_N_EXPERT_USED;
-    uint32_t counts[DS4_MAX_EXPERT + 1] = {0};
-    uint32_t cursor[DS4_MAX_EXPERT] = {0};
-    uint32_t active_expert[DS4_MAX_EXPERT];
-    uint32_t n_active = 0;
-
     int *selected = xmalloc((size_t)total_pairs * sizeof(selected[0]));
     float *pair_weight = xmalloc((size_t)total_pairs * sizeof(pair_weight[0]));
-    ds4_expert_pair *pairs = xmalloc((size_t)total_pairs * sizeof(pairs[0]));
-
-    for (uint32_t t = 0; t < n_tok; t++) {
-        int sel[DS4_MAX_EXPERT_USED];
-        float weights[DS4_MAX_EXPERT_USED];
-        if (layer->ffn_gate_tid2eid) {
-            layer_hash_selected_experts(sel, model, layer, token_ids[t]);
-            layer_hash_router_weights_one(weights, model, layer, norm + (uint64_t)t * expert_in_dim, sel);
-        } else {
-            layer_topk_selected_experts(sel, weights, model, layer, norm + (uint64_t)t * expert_in_dim);
-        }
-
-        for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
-            const uint32_t pair_id = t * DS4_N_EXPERT_USED + slot;
-            selected[pair_id] = sel[slot];
-            pair_weight[pair_id] = weights[slot];
-            pairs[pair_id] = (ds4_expert_pair){ .token = t, .slot = slot };
-            if (sel[slot] < 0 || (uint32_t)sel[slot] >= DS4_N_EXPERT) ds4_die("selected expert is outside range");
-            counts[(uint32_t)sel[slot] + 1]++;
-        }
-    }
-
-    for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
-        counts[e + 1] += counts[e];
-        cursor[e] = counts[e];
-        if (counts[e + 1] != counts[e]) active_expert[n_active++] = e;
-    }
-
-    uint32_t *pair_ids = xmalloc((size_t)total_pairs * sizeof(pair_ids[0]));
-    for (uint32_t p = 0; p < total_pairs; p++) {
-        const uint32_t e = (uint32_t)selected[p];
-        pair_ids[cursor[e]++] = p;
-    }
-
-    if (routed_q8_0) {
-        const uint64_t x_blocks = expert_in_dim / 32u;
-        int8_t *xq8 = xmalloc((size_t)n_tok * x_blocks * 32u);
-        float *xscale8 = xmalloc((size_t)n_tok * x_blocks * sizeof(float));
-        for (uint32_t t = 0; t < n_tok; t++) {
-            quantize_q8_0_activation(norm + (uint64_t)t * expert_in_dim,
-                                     xq8 + (uint64_t)t * x_blocks * 32u,
-                                     xscale8 + (uint64_t)t * x_blocks,
-                                     expert_in_dim);
-        }
-
-        float *mid = xmalloc((size_t)total_pairs * expert_out_dim * sizeof(mid[0]));
-        matvec_q8_0_batch_mid_ctx mid_ctx = {
-            .mid = mid,
-            .xq = xq8,
-            .xscale = xscale8,
-            .pairs = pairs,
-            .pair_ids = pair_ids,
-            .expert_offset = counts,
-            .active_expert = active_expert,
-            .pair_weight = pair_weight,
-            .clamp = clamp,
-            .in_dim = expert_in_dim,
-            .out_dim = expert_out_dim,
-            .blocks = x_blocks,
-        };
-        for (uint32_t ai = 0; ai < n_active; ai++) {
-            const uint32_t e = active_expert[ai];
-            uint64_t gate_in_dim, gate_out_dim;
-            uint64_t up_in_dim, up_out_dim;
-            mid_ctx.gate_base[e] = tensor_expert_bytes(model, layer->ffn_gate_exps, e,
-                                                       &gate_in_dim, &gate_out_dim, &mid_ctx.gate_row_bytes[e]);
-            mid_ctx.up_base[e] = tensor_expert_bytes(model, layer->ffn_up_exps, e,
-                                                     &up_in_dim, &up_out_dim, &mid_ctx.up_row_bytes[e]);
-            if (gate_in_dim != expert_in_dim || up_in_dim != expert_in_dim ||
-                gate_out_dim != expert_out_dim || up_out_dim != expert_out_dim) {
-                ds4_die("Q8_0 batch expert tensor layout mismatch");
-            }
-        }
-        ds4_parallel_for((uint64_t)n_active * expert_out_dim, matvec_q8_0_batch_mid_worker, &mid_ctx);
-
-        const uint64_t mid_blocks = down_in_dim / 32u;
-        int8_t *midq8 = xmalloc((size_t)total_pairs * mid_blocks * 32u);
-        float *midscale8 = xmalloc((size_t)total_pairs * mid_blocks * sizeof(float));
-        for (uint32_t p = 0; p < total_pairs; p++) {
-            quantize_q8_0_activation(mid + (uint64_t)p * down_in_dim,
-                                     midq8 + (uint64_t)p * mid_blocks * 32u,
-                                     midscale8 + (uint64_t)p * mid_blocks,
-                                     down_in_dim);
-        }
-        free(mid);
-
-        matvec_q8_0_batch_accum_rows_ctx down_ctx = {
-            .moe = moe,
-            .midq = midq8,
-            .midscale = midscale8,
-            .pairs = pairs,
-            .pair_ids = pair_ids,
-            .expert_offset = counts,
-            .active_expert = active_expert,
-            .n_active = n_active,
-            .n_tok = n_tok,
-            .in_dim = down_in_dim,
-            .out_dim = down_out_dim,
-            .blocks = mid_blocks,
-        };
-        for (uint32_t ai = 0; ai < n_active; ai++) {
-            const uint32_t e = active_expert[ai];
-            uint64_t in_dim, out_dim;
-            down_ctx.base[e] = tensor_expert_bytes(model, layer->ffn_down_exps, e,
-                                                   &in_dim, &out_dim, &down_ctx.row_bytes[e]);
-            if (in_dim != down_in_dim || out_dim != down_out_dim) {
-                ds4_die("Q8_0 batch down expert tensor layout mismatch");
-            }
-        }
-        ds4_parallel_for(down_out_dim, matvec_q8_0_batch_accum_rows_worker, &down_ctx);
-
-        free(midscale8);
-        free(midq8);
-        free(xscale8);
-        free(xq8);
-        free(pair_ids);
-        free(pairs);
-        free(pair_weight);
-        free(selected);
-        (void)il;
-        return;
-    }
-
-    if (routed_q8_k) {
-        const uint64_t xq_blocks = expert_in_dim / QK_K;
-        block_q8_K *xq = xmalloc((size_t)n_tok * xq_blocks * sizeof(xq[0]));
-        for (uint32_t t = 0; t < n_tok; t++) {
-            ds4_quantize_row_q8_K(norm + (uint64_t)t * expert_in_dim,
-                                  xq + (uint64_t)t * xq_blocks,
-                                  (int64_t)expert_in_dim);
-        }
-
-        float *mid = xmalloc((size_t)total_pairs * expert_out_dim * sizeof(mid[0]));
-
-        matvec_q8_k_batch_mid_ctx mid_ctx = {
-            .mid = mid,
-            .xq = xq,
-            .pairs = pairs,
-            .pair_ids = pair_ids,
-            .expert_offset = counts,
-            .active_expert = active_expert,
-            .pair_weight = pair_weight,
-            .clamp = clamp,
-            .in_dim = expert_in_dim,
-            .out_dim = expert_out_dim,
-            .xq_blocks = xq_blocks,
-        };
-
-        for (uint32_t ai = 0; ai < n_active; ai++) {
-            const uint32_t e = active_expert[ai];
-            uint64_t gate_in_dim, gate_out_dim;
-            uint64_t up_in_dim, up_out_dim;
-            mid_ctx.gate_base[e] = tensor_expert_bytes(model, layer->ffn_gate_exps, e,
-                                                       &gate_in_dim, &gate_out_dim, &mid_ctx.gate_row_bytes[e]);
-            mid_ctx.up_base[e] = tensor_expert_bytes(model, layer->ffn_up_exps, e,
-                                                     &up_in_dim, &up_out_dim, &mid_ctx.up_row_bytes[e]);
-            if (gate_in_dim != expert_in_dim || up_in_dim != expert_in_dim ||
-                gate_out_dim != expert_out_dim || up_out_dim != expert_out_dim) {
-                ds4_die("Q8_K batch expert tensor layout mismatch");
-            }
-        }
-
-        ds4_parallel_for((uint64_t)n_active * expert_out_dim, matvec_q8_k_batch_mid_worker, &mid_ctx);
-
-        const uint64_t midq_blocks = down_in_dim / QK_K;
-        block_q8_K *midq = xmalloc((size_t)total_pairs * midq_blocks * sizeof(midq[0]));
-        quantize_mid_pairs_ctx quant_ctx = {
-            .mid = mid,
-            .midq = midq,
-            .down_in_dim = down_in_dim,
-            .down_blocks = midq_blocks,
-        };
-        ds4_parallel_for(total_pairs, quantize_mid_pairs_worker, &quant_ctx);
-        free(mid);
-
-        matvec_q8_k_batch_accum_rows_ctx down_ctx = {
-            .moe = moe,
-            .midq = midq,
-            .pairs = pairs,
-            .pair_ids = pair_ids,
-            .expert_offset = counts,
-            .active_expert = active_expert,
-            .n_active = n_active,
-            .n_tok = n_tok,
-            .in_dim = down_in_dim,
-            .out_dim = down_out_dim,
-            .midq_blocks = midq_blocks,
-        };
-
-        for (uint32_t ai = 0; ai < n_active; ai++) {
-            const uint32_t e = active_expert[ai];
-            uint64_t in_dim, out_dim;
-            down_ctx.base[e] = tensor_expert_bytes(model, layer->ffn_down_exps, e,
-                                                   &in_dim, &out_dim, &down_ctx.row_bytes[e]);
-            if (in_dim != down_in_dim || out_dim != down_out_dim) {
-                ds4_die("Q8_K batch down expert tensor layout mismatch");
-            }
-        }
-
-        ds4_parallel_for(down_out_dim, matvec_q8_k_batch_accum_rows_worker, &down_ctx);
-
-        free(midq);
-        free(pair_ids);
-        free(xq);
-        free(pairs);
-        free(pair_weight);
-        free(selected);
-
-        (void)il;
-        return;
-    }
-
-    const uint64_t xq_blocks = expert_in_dim / QK_K;
-    block_q8_K *xq = xmalloc((size_t)n_tok * xq_blocks * sizeof(xq[0]));
-    for (uint32_t t = 0; t < n_tok; t++) {
-        ds4_quantize_row_q8_K(norm + (uint64_t)t * expert_in_dim,
-                              xq + (uint64_t)t * xq_blocks,
-                              (int64_t)expert_in_dim);
-    }
-
-    float *mid = xmalloc((size_t)total_pairs * expert_out_dim * sizeof(mid[0]));
-
-    const uint32_t gate_type = layer->ffn_gate_exps->type;
-
-    /* Build mid vectors: dispatch based on gate/up tensor type. */
-    if (gate_type == DS4_TENSOR_IQ2_XXS) {
-        iq2xxs_q8 *yq = xmalloc((size_t)n_tok * xq_blocks * sizeof(*yq));
-        iq2xxs_q8_prepare(yq, xq, (uint64_t)n_tok * xq_blocks);
-        matvec_iq2_xxs_batch_mid_ctx mid_ctx = {
-            .mid = mid,
-            .xq = yq,
-            .pairs = pairs,
-            .pair_ids = pair_ids,
-            .expert_offset = counts,
-            .active_expert = active_expert,
-            .pair_weight = pair_weight,
-            .clamp = clamp,
-            .in_dim = expert_in_dim,
-            .out_dim = expert_out_dim,
-            .xq_blocks = xq_blocks,
-        };
-
-        for (uint32_t ai = 0; ai < n_active; ai++) {
-            const uint32_t e = active_expert[ai];
-            uint64_t gate_in_dim, gate_out_dim;
-            uint64_t up_in_dim, up_out_dim;
-            mid_ctx.gate_base[e] = tensor_expert_bytes(model, layer->ffn_gate_exps, e,
-                                                       &gate_in_dim, &gate_out_dim, &mid_ctx.gate_row_bytes[e]);
-            mid_ctx.up_base[e] = tensor_expert_bytes(model, layer->ffn_up_exps, e,
-                                                     &up_in_dim, &up_out_dim, &mid_ctx.up_row_bytes[e]);
-            if (gate_in_dim != expert_in_dim || up_in_dim != expert_in_dim ||
-                gate_out_dim != expert_out_dim || up_out_dim != expert_out_dim) {
-                ds4_die("batch expert tensor layout mismatch");
-            }
-        }
-
-        ds4_parallel_for((uint64_t)n_active * expert_out_dim, matvec_iq2_xxs_batch_mid_worker, &mid_ctx);
-        free(yq);
-    } else if (gate_type == DS4_TENSOR_Q2_K) {
-        matvec_q2_k_batch_mid_ctx mid_ctx = {
-            .mid = mid,
-            .xq = xq,
-            .pairs = pairs,
-            .pair_ids = pair_ids,
-            .expert_offset = counts,
-            .active_expert = active_expert,
-            .pair_weight = pair_weight,
-            .clamp = clamp,
-            .in_dim = expert_in_dim,
-            .out_dim = expert_out_dim,
-            .xq_blocks = xq_blocks,
-        };
-
-        for (uint32_t ai = 0; ai < n_active; ai++) {
-            const uint32_t e = active_expert[ai];
-            uint64_t gate_in_dim, gate_out_dim;
-            uint64_t up_in_dim, up_out_dim;
-            mid_ctx.gate_base[e] = tensor_expert_bytes(model, layer->ffn_gate_exps, e,
-                                                       &gate_in_dim, &gate_out_dim, &mid_ctx.gate_row_bytes[e]);
-            mid_ctx.up_base[e] = tensor_expert_bytes(model, layer->ffn_up_exps, e,
-                                                     &up_in_dim, &up_out_dim, &mid_ctx.up_row_bytes[e]);
-            if (gate_in_dim != expert_in_dim || up_in_dim != expert_in_dim ||
-                gate_out_dim != expert_out_dim || up_out_dim != expert_out_dim) {
-                ds4_die("batch expert tensor layout mismatch");
-            }
-        }
-
-        ds4_parallel_for((uint64_t)n_active * expert_out_dim, matvec_q2_k_batch_mid_worker, &mid_ctx);
-    } else if (gate_type == DS4_TENSOR_Q4_K) {
-        matvec_q4_k_batch_mid_ctx mid_ctx = {
-            .mid = mid,
-            .xq = xq,
-            .pairs = pairs,
-            .pair_ids = pair_ids,
-            .expert_offset = counts,
-            .active_expert = active_expert,
-            .pair_weight = pair_weight,
-            .clamp = clamp,
-            .in_dim = expert_in_dim,
-            .out_dim = expert_out_dim,
-            .xq_blocks = xq_blocks,
-        };
-
-        for (uint32_t ai = 0; ai < n_active; ai++) {
-            const uint32_t e = active_expert[ai];
-            uint64_t gate_in_dim, gate_out_dim;
-            uint64_t up_in_dim, up_out_dim;
-            mid_ctx.gate_base[e] = tensor_expert_bytes(model, layer->ffn_gate_exps, e,
-                                                       &gate_in_dim, &gate_out_dim, &mid_ctx.gate_row_bytes[e]);
-            mid_ctx.up_base[e] = tensor_expert_bytes(model, layer->ffn_up_exps, e,
-                                                     &up_in_dim, &up_out_dim, &mid_ctx.up_row_bytes[e]);
-            if (gate_in_dim != expert_in_dim || up_in_dim != expert_in_dim ||
-                gate_out_dim != expert_out_dim || up_out_dim != expert_out_dim) {
-                ds4_die("batch expert tensor layout mismatch");
-            }
-        }
-
-        ds4_parallel_for((uint64_t)n_active * expert_out_dim, matvec_q4_k_batch_mid_worker, &mid_ctx);
-    } else {
-        ds4_die("unsupported gate/up expert tensor type for batch");
-    }
-
-    const uint64_t midq_blocks = down_in_dim / QK_K;
-    block_q8_K *midq = xmalloc((size_t)total_pairs * midq_blocks * sizeof(midq[0]));
-    quantize_mid_pairs_ctx quant_ctx = {
-        .mid = mid,
-        .midq = midq,
-        .down_in_dim = down_in_dim,
-        .down_blocks = midq_blocks,
+    moe_route_ctx route_ctx = {
+        .selected = selected,
+        .pair_weight = pair_weight,
+        .model = model,
+        .layer = layer,
+        .norm = norm,
+        .token_ids = token_ids,
     };
-    ds4_parallel_for(total_pairs, quantize_mid_pairs_worker, &quant_ctx);
-    free(mid);
+    ds4_parallel_for_min_rows(n_tok, moe_route_worker, &route_ctx, 1);
 
-    /* Down projection: dispatch based on down tensor type. */
-    const uint32_t down_type = layer->ffn_down_exps->type;
-
-    if (down_type == DS4_TENSOR_IQ2_XXS) {
-        iq2xxs_q8 *yq = xmalloc((size_t)total_pairs * midq_blocks * sizeof(*yq));
-        iq2xxs_q8_prepare(yq, midq, (uint64_t)total_pairs * midq_blocks);
-        matvec_iq2_xxs_batch_accum_rows_ctx down_ctx = {
-            .moe = moe,
-            .midq = yq,
-            .pairs = pairs,
-            .pair_ids = pair_ids,
-            .expert_offset = counts,
-            .active_expert = active_expert,
-            .n_active = n_active,
-            .n_tok = n_tok,
-            .in_dim = down_in_dim,
-            .out_dim = down_out_dim,
-            .midq_blocks = midq_blocks,
-        };
-
-        for (uint32_t ai = 0; ai < n_active; ai++) {
-            const uint32_t e = active_expert[ai];
-            uint64_t in_dim, out_dim;
-            down_ctx.base[e] = tensor_expert_bytes(model, layer->ffn_down_exps, e,
-                                                   &in_dim, &out_dim, &down_ctx.row_bytes[e]);
-            if (in_dim != down_in_dim || out_dim != down_out_dim) {
-                ds4_die("batch expert tensor layout mismatch");
-            }
-        }
-
-        ds4_parallel_for(down_out_dim, matvec_iq2_xxs_batch_accum_rows_worker, &down_ctx);
-        free(yq);
-    } else if (down_type == DS4_TENSOR_Q2_K) {
-        matvec_q2_k_batch_accum_rows_ctx down_ctx = {
-            .moe = moe,
-            .midq = midq,
-            .pairs = pairs,
-            .pair_ids = pair_ids,
-            .expert_offset = counts,
-            .active_expert = active_expert,
-            .n_active = n_active,
-            .n_tok = n_tok,
-            .in_dim = down_in_dim,
-            .out_dim = down_out_dim,
-            .midq_blocks = midq_blocks,
-        };
-
-        for (uint32_t ai = 0; ai < n_active; ai++) {
-            const uint32_t e = active_expert[ai];
-            uint64_t in_dim, out_dim;
-            down_ctx.base[e] = tensor_expert_bytes(model, layer->ffn_down_exps, e,
-                                                   &in_dim, &out_dim, &down_ctx.row_bytes[e]);
-            if (in_dim != down_in_dim || out_dim != down_out_dim) {
-                ds4_die("batch expert tensor layout mismatch");
-            }
-        }
-
-        ds4_parallel_for(down_out_dim, matvec_q2_k_batch_accum_rows_worker, &down_ctx);
-    } else if (down_type == DS4_TENSOR_Q4_K) {
-        matvec_q4_k_batch_accum_rows_ctx down_ctx = {
-            .moe = moe,
-            .midq = midq,
-            .pairs = pairs,
-            .pair_ids = pair_ids,
-            .expert_offset = counts,
-            .active_expert = active_expert,
-            .n_active = n_active,
-            .n_tok = n_tok,
-            .in_dim = down_in_dim,
-            .out_dim = down_out_dim,
-            .midq_blocks = midq_blocks,
-        };
-
-        for (uint32_t ai = 0; ai < n_active; ai++) {
-            const uint32_t e = active_expert[ai];
-            uint64_t in_dim, out_dim;
-            down_ctx.base[e] = tensor_expert_bytes(model, layer->ffn_down_exps, e,
-                                                   &in_dim, &out_dim, &down_ctx.row_bytes[e]);
-            if (in_dim != down_in_dim || out_dim != down_out_dim) {
-                ds4_die("batch expert tensor layout mismatch");
-            }
-        }
-
-        ds4_parallel_for(down_out_dim, matvec_q4_k_batch_accum_rows_worker, &down_ctx);
-    } else {
-        ds4_die("unsupported down expert tensor type for batch");
+    for (uint32_t tok0 = 0; tok0 < n_tok; tok0 += DS4_MOE_CHUNK_TOKENS) {
+        const uint32_t n = n_tok - tok0 < DS4_MOE_CHUNK_TOKENS ? n_tok - tok0 : DS4_MOE_CHUNK_TOKENS;
+        moe_grouped_ffn(moe + (uint64_t)tok0 * out_dim, gate, up, down,
+                        gate_row_bytes, up_row_bytes, down_row_bytes, in_dim, mid_dim, out_dim,
+                        norm + (uint64_t)tok0 * in_dim,
+                        selected + (uint64_t)tok0 * DS4_N_EXPERT_USED,
+                        pair_weight + (uint64_t)tok0 * DS4_N_EXPERT_USED, n, clamp);
     }
 
-    free(midq);
-    free(pair_ids);
-    free(xq);
-    free(pairs);
     free(pair_weight);
     free(selected);
-
-    (void)il;
 }
 
 static void print_vec_stats(const char *name, const float *x, uint64_t n);
@@ -14672,81 +14252,6 @@ static void layer_ffn_one_decode_scratch(
     }
 }
 
-static void layer_ffn_batch(
-        float             * out_hc,
-        const ds4_model   * model,
-        const ds4_layer_weights * layer,
-        const float       * inp_hc,
-        const int         * token_ids,
-        uint32_t            n_tok,
-        uint32_t            il,
-        const float       * steering_dirs,
-        float               steering_scale) {
-    if (n_tok == 0) return;
-    const uint32_t n_hc = DS4_N_HC;
-    const uint64_t hc_dim = (uint64_t)n_hc * DS4_N_EMBD;
-    float *ffn_cur = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(ffn_cur[0]));
-    float *norm = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(norm[0]));
-    float *moe = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(moe[0]));
-    float *shared = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(shared[0]));
-    float *post = xmalloc((size_t)n_tok * n_hc * sizeof(post[0]));
-    float *comb = xmalloc((size_t)n_tok * n_hc * n_hc * sizeof(comb[0]));
-    const float *ffn_norm = tensor_data(model, layer->ffn_norm);
-
-    for (uint32_t t = 0; t < n_tok; t++) {
-        hc_pre_from_state_one(model,
-                              layer->hc_ffn_fn,
-                              layer->hc_ffn_scale,
-                              layer->hc_ffn_base,
-                              inp_hc + (uint64_t)t * hc_dim,
-                              ffn_cur + (uint64_t)t * DS4_N_EMBD,
-                              post + (uint64_t)t * n_hc,
-                              comb + (uint64_t)t * n_hc * n_hc);
-        rms_norm_weight(norm + (uint64_t)t * DS4_N_EMBD,
-                        ffn_cur + (uint64_t)t * DS4_N_EMBD,
-                        ffn_norm,
-                        DS4_N_EMBD,
-                        DS4_RMS_EPS);
-    }
-
-    layer_routed_moe_batch(moe, model, layer, norm, token_ids, n_tok, il, DS4_SWIGLU_CLAMP_EXP);
-    layer_shared_ffn_batch(shared, model, layer, norm, n_tok);
-
-    if (cpu_directional_steering_enabled(steering_dirs, steering_scale)) {
-        float *ffn_out = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(ffn_out[0]));
-        for (uint64_t i = 0; i < (uint64_t)n_tok * DS4_N_EMBD; i++) {
-            ffn_out[i] = moe[i] + shared[i];
-        }
-        cpu_directional_steering_project_rows(ffn_out, steering_dirs, il, n_tok, steering_scale);
-        hc_post_batch(out_hc,
-                      ffn_out,
-                      inp_hc,
-                      post,
-                      comb,
-                      n_tok,
-                      DS4_N_EMBD,
-                      n_hc);
-        free(ffn_out);
-    } else {
-        hc_post_sum_batch(out_hc,
-                          moe,
-                          shared,
-                          inp_hc,
-                          post,
-                          comb,
-                          n_tok,
-                          DS4_N_EMBD,
-                          n_hc);
-    }
-
-    free(comb);
-    free(post);
-    free(shared);
-    free(moe);
-    free(norm);
-    free(ffn_cur);
-}
-
 typedef struct {
     float *moe;
     const ds4_model *model;
@@ -14834,8 +14339,11 @@ static void layer_routed_moe_tokens_parallel(
     ds4_parallel_for_min_rows(n_tok, routed_moe_tokens_worker, &ctx, 1);
 }
 
-/* Default prefill FFN path.  HC and shared expert are batched, while routed
- * experts can run either token-parallel or expert-grouped depending on size. */
+/* Default prefill FFN path.  HC and shared expert are batched; routed experts
+ * run expert-grouped for IQ2_XXS/Q2_K experts.  The other expert formats run
+ * token-parallel, which re-reads the experts per token and idles the threads
+ * beyond n_tok on short prompts: slower, but exact, for the non-default
+ * formats. */
 static void layer_ffn_shared_batch(
         float             * out_hc,
         const ds4_model   * model,
@@ -14859,34 +14367,10 @@ static void layer_ffn_shared_batch(
     float *shared = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(shared[0]));
     float *post = xmalloc((size_t)n_tok * n_hc * sizeof(post[0]));
     float *comb = xmalloc((size_t)n_tok * n_hc * n_hc * sizeof(comb[0]));
-    const uint64_t expert_in_dim = layer->ffn_gate_exps->dim[0];
-    const uint64_t down_in_dim = layer->ffn_down_exps->dim[0];
-    const bool routed_q8_0 =
-        layer->ffn_gate_exps->type == DS4_TENSOR_Q8_0 &&
-        layer->ffn_up_exps->type == DS4_TENSOR_Q8_0 &&
-        layer->ffn_down_exps->type == DS4_TENSOR_Q8_0;
-    const bool routed_q8_k =
-        layer->ffn_gate_exps->type == DS4_TENSOR_Q8_K &&
-        layer->ffn_up_exps->type == DS4_TENSOR_Q8_K &&
-        layer->ffn_down_exps->type == DS4_TENSOR_Q8_K;
-    if (routed_q8_k) {
-        if (expert_in_dim % QK_K != 0) ds4_die("Q8_K expert input is not QK_K aligned");
-        if (down_in_dim != DS4_N_FF_EXP || down_in_dim % QK_K != 0) {
-            ds4_die("Q8_K expert input has an unexpected layout");
-        }
-    }
-    const uint64_t routed_q8_x_blocks = expert_in_dim / 32u;
-    const uint64_t routed_q8_mid_blocks = down_in_dim / 32u;
-    const bool routed_token_parallel =
-        getenv("DS4_ROUTED_TOKEN_PARALLEL") != NULL ||
-        (getenv("DS4_NO_ROUTED_TOKEN_PARALLEL") == NULL && n_tok >= 64);
-    float *routed_mid = routed_token_parallel ? NULL : xmalloc((size_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(routed_mid[0]));
-    block_q8_K *routed_xq = (routed_token_parallel || routed_q8_0) ? NULL : xmalloc((size_t)(expert_in_dim / QK_K) * sizeof(routed_xq[0]));
-    block_q8_K *routed_midq = (routed_token_parallel || routed_q8_0) ? NULL : xmalloc((size_t)DS4_N_EXPERT_USED * (down_in_dim / QK_K) * sizeof(routed_midq[0]));
-    int8_t *routed_q8_xq = (!routed_token_parallel && routed_q8_0) ? xmalloc((size_t)routed_q8_x_blocks * 32u) : NULL;
-    float *routed_q8_xscale = (!routed_token_parallel && routed_q8_0) ? xmalloc((size_t)routed_q8_x_blocks * sizeof(routed_q8_xscale[0])) : NULL;
-    int8_t *routed_q8_midq = (!routed_token_parallel && routed_q8_0) ? xmalloc((size_t)DS4_N_EXPERT_USED * routed_q8_mid_blocks * 32u) : NULL;
-    float *routed_q8_midscale = (!routed_token_parallel && routed_q8_0) ? xmalloc((size_t)DS4_N_EXPERT_USED * routed_q8_mid_blocks * sizeof(routed_q8_midscale[0])) : NULL;
+    const bool routed_grouped =
+        layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+        layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
+        layer->ffn_down_exps->type == DS4_TENSOR_Q2_K;
 
     double t0 = profile ? now_sec() : 0.0;
     hc_pre_norm_batch(model,
@@ -14904,25 +14388,10 @@ static void layer_ffn_shared_batch(
     if (profile) t_hc_norm = now_sec() - t0;
 
     t0 = profile ? now_sec() : 0.0;
-    if (routed_token_parallel) {
-        layer_routed_moe_tokens_parallel(moe, model, layer, norm, token_ids, n_tok, il);
+    if (routed_grouped) {
+        layer_routed_moe_batch(moe, model, layer, norm, token_ids, n_tok, DS4_SWIGLU_CLAMP_EXP);
     } else {
-        for (uint32_t t = 0; t < n_tok; t++) {
-            layer_routed_moe_one_prealloc(moe + (uint64_t)t * DS4_N_EMBD,
-                                          model,
-                                          layer,
-                                          norm + (uint64_t)t * DS4_N_EMBD,
-                                          il,
-                                          token_ids[t],
-                                          DS4_SWIGLU_CLAMP_EXP,
-                                          routed_mid,
-                                          routed_xq,
-                                          routed_midq,
-                                          routed_q8_xq,
-                                          routed_q8_xscale,
-                                          routed_q8_midq,
-                                          routed_q8_midscale);
-        }
+        layer_routed_moe_tokens_parallel(moe, model, layer, norm, token_ids, n_tok, il);
     }
     if (profile) t_routed = now_sec() - t0;
 
@@ -14967,13 +14436,6 @@ static void layer_ffn_shared_batch(
 
     free(comb);
     free(post);
-    free(routed_q8_midscale);
-    free(routed_q8_midq);
-    free(routed_q8_xscale);
-    free(routed_q8_xq);
-    free(routed_midq);
-    free(routed_xq);
-    free(routed_mid);
     free(shared);
     free(moe);
     free(norm);
@@ -16325,117 +15787,6 @@ static bool *indexer_allowed_decode_one_decode_scratch(
     return allowed;
 }
 
-/* Single-token attention sublayer with raw SWA cache and DS4 compression. */
-static void layer_attention_raw_swa_one(
-        float                   * after_attn_hc,
-        const ds4_model         * model,
-        const ds4_layer_weights * layer,
-        ds4_layer_cache         * cache,
-        const float             * inp_hc,
-        uint32_t                  il,
-        uint32_t                  pos,
-        const float             * steering_dirs,
-        float                     steering_scale) {
-    const uint32_t n_hc = DS4_N_HC;
-    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
-
-    float *attn_cur = xmalloc((size_t)DS4_N_EMBD * sizeof(attn_cur[0]));
-    float *attn_norm = xmalloc((size_t)DS4_N_EMBD * sizeof(attn_norm[0]));
-    float *attn_residual = xmalloc((size_t)n_hc * DS4_N_EMBD * sizeof(attn_residual[0]));
-    float *q = xmalloc((size_t)q_dim * sizeof(q[0]));
-    float *qr_norm = xmalloc((size_t)DS4_N_LORA_Q * sizeof(qr_norm[0]));
-    float *kv = xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(kv[0]));
-    float *heads = xmalloc((size_t)q_dim * sizeof(heads[0]));
-    float *attn_out = xmalloc((size_t)DS4_N_EMBD * sizeof(attn_out[0]));
-    bool *comp_allowed = NULL;
-    float post[4];
-    float comb[16];
-
-    memcpy(attn_residual, inp_hc, (size_t)n_hc * DS4_N_EMBD * sizeof(inp_hc[0]));
-    hc_pre_from_state_one(model,
-                          layer->hc_attn_fn,
-                          layer->hc_attn_scale,
-                          layer->hc_attn_base,
-                          attn_residual, attn_cur, post, comb);
-
-    layer_attn_norm_one(attn_norm, model, layer, attn_cur);
-    layer_q_projection_with_lora_one(model, layer, attn_norm, q, qr_norm);
-    layer_kv_projection_normed_one(model, layer, attn_norm, kv);
-
-    rope_tail_layer_inplace(q, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, false);
-    rope_tail_layer_inplace(kv, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, false);
-    dsv4_fp8_kv_quantize_row_inplace_cpu(kv, DS4_N_HEAD_DIM, DS4_N_ROT);
-
-    kv_cache_push_raw(cache, kv);
-
-    const uint32_t ratio = cache->compress_ratio;
-    if (ratio != 0) {
-        float *comp = xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(comp[0]));
-        if (compressor_decode_one(comp, model,
-                                  layer->attn_compressor_kv,
-                                  layer->attn_compressor_gate,
-                                  layer->attn_compressor_ape,
-                                  layer->attn_compressor_norm,
-                                  attn_norm,
-                                  cache->attn_state_kv,
-                                  cache->attn_state_score,
-                                  DS4_N_HEAD_DIM,
-                                  ratio,
-                                  il,
-                                  pos)) {
-            kv_cache_push_comp(cache->attn_comp_kv, &cache->n_comp, cache->comp_cap, DS4_N_HEAD_DIM, comp);
-        }
-        free(comp);
-
-        if (ratio == 4) {
-            float *index_comp = xmalloc((size_t)DS4_N_INDEXER_HEAD_DIM * sizeof(index_comp[0]));
-            if (compressor_decode_one(index_comp, model,
-                                      layer->indexer_compressor_kv,
-                                      layer->indexer_compressor_gate,
-                                      layer->indexer_compressor_ape,
-                                      layer->indexer_compressor_norm,
-                                      attn_norm,
-                                      cache->index_state_kv,
-                                      cache->index_state_score,
-                                      DS4_N_INDEXER_HEAD_DIM,
-                                      ratio,
-                                      il,
-                                      pos)) {
-                kv_cache_push_comp(cache->index_comp_kv, &cache->n_index_comp, cache->comp_cap, DS4_N_INDEXER_HEAD_DIM, index_comp);
-            }
-            free(index_comp);
-
-            comp_allowed = indexer_allowed_decode_one(model, layer,
-                                                      attn_norm, qr_norm,
-                                                      cache->index_comp_kv,
-                                                      cache->n_index_comp,
-                                                      il, pos);
-        }
-
-        layer_attention_mixed_one(heads, model, layer, q,
-                                  cache->raw_kv, cache->n_raw,
-                                  cache->attn_comp_kv, cache->n_comp,
-                                  comp_allowed);
-    } else {
-        layer_attention_rows_one(heads, model, layer, q, cache->raw_kv, cache->n_raw);
-    }
-
-    rope_tail_layer_inplace(heads, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, true);
-    layer_grouped_out_one(attn_out, model, layer, heads);
-    cpu_directional_steering_project_rows(attn_out, steering_dirs, il, 1, steering_scale);
-    hc_post_one(after_attn_hc, attn_out, attn_residual, post, comb, DS4_N_EMBD, n_hc);
-
-    free(comp_allowed);
-    free(attn_out);
-    free(heads);
-    free(kv);
-    free(qr_norm);
-    free(q);
-    free(attn_residual);
-    free(attn_norm);
-    free(attn_cur);
-}
-
 /* Batched prefill attention for a fresh prompt.  It projects Q/KV for all
  * tokens, streams them through the same raw/compressed cache updates decode
  * performs, then runs every token's attention in parallel.  Continued prefill
@@ -16954,18 +16305,11 @@ static void prefill_layer_major_cpu(
     float *next = xmalloc((size_t)n_tok * hc_dim * sizeof(next[0]));
     float *attn = xmalloc((size_t)n_tok * hc_dim * sizeof(attn[0]));
     float *plain = xmalloc((size_t)DS4_N_EMBD * sizeof(plain[0]));
-    uint32_t ffn_batch = 128;
     const bool batched_attn = getenv("DS4_NO_BATCHED_ATTN") == NULL;
-    const bool batched_ffn = getenv("DS4_BATCHED_FFN") != NULL;
     const bool parallel_ffn = getenv("DS4_PARALLEL_FFN") != NULL;
     const bool shared_batch_ffn = getenv("DS4_NO_SHARED_BATCH_FFN") == NULL;
-    const char *batch_env = getenv("DS4_PREFILL_BATCH");
     ds4_cpu_decode_scratch decode_scratch;
     bool decode_scratch_ready = false;
-    if (batch_env && batch_env[0]) {
-        long v = strtol(batch_env, NULL, 10);
-        if (v > 0 && v < 4096) ffn_batch = (uint32_t)v;
-    }
 
     for (uint64_t t = 0; t < n_tok; t++) {
         embed_token_f16(model, weights, prompt->v[t], plain);
@@ -16989,20 +16333,7 @@ static void prefill_layer_major_cpu(
                                           steering_dirs,
                                           steering_attn_scale);
 
-            if (batched_ffn) {
-                for (uint64_t t = 0; t < n_tok; t += ffn_batch) {
-                    uint32_t nb = (uint32_t)((n_tok - t) < ffn_batch ? (n_tok - t) : ffn_batch);
-                    layer_ffn_batch(next + t * hc_dim,
-                                    model,
-                                    &weights->layer[il],
-                                    attn + t * hc_dim,
-                                    prompt->v + t,
-                                    nb,
-                                    il,
-                                    steering_dirs,
-                                    steering_ffn_scale);
-                }
-            } else if (shared_batch_ffn) {
+            if (shared_batch_ffn) {
                 layer_ffn_shared_batch(next,
                                        model,
                                        &weights->layer[il],
@@ -17034,31 +16365,6 @@ static void prefill_layer_major_cpu(
                                   steering_ffn_scale,
                                   false);
                 }
-            }
-        } else if (batched_ffn) {
-            for (uint64_t t = 0; t < n_tok; t++) {
-                layer_attention_raw_swa_one(attn + t * hc_dim,
-                                            model,
-                                            &weights->layer[il],
-                                            &cache->layer[il],
-                                            cur + t * hc_dim,
-                                            il,
-                                            (uint32_t)t,
-                                            steering_dirs,
-                                            steering_attn_scale);
-            }
-
-            for (uint64_t t = 0; t < n_tok; t += ffn_batch) {
-                uint32_t nb = (uint32_t)((n_tok - t) < ffn_batch ? (n_tok - t) : ffn_batch);
-                layer_ffn_batch(next + t * hc_dim,
-                                model,
-                                &weights->layer[il],
-                                attn + t * hc_dim,
-                                prompt->v + t,
-                                nb,
-                                il,
-                                steering_dirs,
-                                steering_ffn_scale);
             }
         } else {
             if (!decode_scratch_ready) {

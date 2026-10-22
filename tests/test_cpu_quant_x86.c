@@ -1412,6 +1412,236 @@ static void check_prefix_attention(void) {
     check_prefix_attention_shape(64, 512);
 }
 
+/* Fill a Q8_K row either from random floats through the real quantizer or
+ * with adversarial bytes (pattern < 6) and consistent block sums. */
+static void fill_q8_k_row(block_q8_K *y, unsigned blocks, unsigned pattern) {
+    if (pattern >= 6) {
+        float *x = malloc(blocks * QK_K * sizeof(float));
+        CHECK(x != NULL);
+        for (unsigned j = 0; j < blocks * QK_K; j++) {
+            x[j] = ((float)(quant_random() % 20001) - 10000.0f) * (pattern & 1 ? 1e-3f : 3.7f);
+        }
+        ds4_quantize_row_q8_K(x, y, (int64_t)(blocks * QK_K));
+        free(x);
+        return;
+    }
+    const float scales[] = {0.0f, -0.0f, 0x1p-20f, -0.00173f, 0.375f, -1.13f, 17.3f, -1024.0f};
+    for (unsigned b = 0; b < blocks; b++) {
+        y[b].d = scales[(pattern + b) % 8];
+        for (unsigned j = 0; j < QK_K; j++) y[b].qs[j] = quant_byte(pattern, j + b);
+        for (unsigned group = 0; group < 16; group++) {
+            int sum = 0;
+            for (unsigned j = 0; j < 16; j++) sum += y[b].qs[group * 16 + j];
+            y[b].bsums[group] = (int16_t)sum;
+        }
+    }
+}
+
+/* IQ2_XXS rows: random, or a sweep that walks every grid index, every sign
+ * pattern and every sub-block scale across the row. */
+static void fill_iq2_row(block_iq2_xxs *x, unsigned blocks, bool sweep, unsigned *counter) {
+    const uint16_t half[] = {0, 0x8000, 1, 0x8001, 0x03ff, 0x8400,
+                            0x1801, 0x9a17, 0x3555, 0xba31, 0x7bff, 0xfbff};
+    for (unsigned b = 0; b < blocks; b++) {
+        x[b].d = half[(*counter + b) % 12];
+        for (unsigned ib = 0; ib < 8; ib++) {
+            uint32_t aux[2];
+            if (sweep) {
+                uint8_t grid[4];
+                for (unsigned l = 0; l < 4; l++) grid[l] = (uint8_t)((*counter)++);
+                memcpy(&aux[0], grid, 4);
+                aux[1] = 0;
+                for (unsigned l = 0; l < 4; l++) aux[1] |= (uint32_t)((*counter + 37u * l) & 127u) << (7 * l);
+                aux[1] |= (uint32_t)(*counter & 15u) << 28;
+            } else {
+                aux[0] = quant_random();
+                aux[1] = quant_random();
+            }
+            memcpy(x[b].qs + 4 * ib, aux, 8);
+        }
+    }
+}
+
+static void fill_q2_row(block_q2_K *x, unsigned blocks, unsigned *counter) {
+    const uint16_t half[] = {0, 0x8000, 1, 0x8001, 0x03ff, 0x8400,
+                            0x1801, 0x9a17, 0x3555, 0xba31, 0x7bff, 0xfbff};
+    for (unsigned b = 0; b < blocks; b++) {
+        x[b].d = half[(*counter + 3 * b) % 12];
+        x[b].dmin = half[(*counter + 5 * b + 7) % 12];
+        for (unsigned j = 0; j < sizeof(x[b].qs); j++) x[b].qs[j] = (uint8_t)quant_random();
+        /* Every scale byte value appears over the sweep. */
+        for (unsigned j = 0; j < 16; j++) x[b].scales[j] = (uint8_t)((*counter)++);
+    }
+}
+
+/* The x16 tile kernels against the single-row reference dots, lane by lane,
+ * on dense tiles (vector path) and sparse tiles (per-row path), including
+ * padding lanes, odd block counts and adversarial activations. */
+static void check_x16_kernels(void) {
+    const unsigned counts[] = {1, 2, 3, 5, 8, 16};
+    const unsigned lanes[] = {16, 15, 7, DS4_MOE_X16_MIN_LANES, DS4_MOE_X16_MIN_LANES - 1, 1};
+    unsigned counter = 0;
+    for (unsigned c = 0; c < sizeof(counts) / sizeof(*counts); c++) {
+        const unsigned nb = counts[c];
+        quant_buffer ib0 = quant_alloc(nb * sizeof(block_iq2_xxs)), ib1 = quant_alloc(nb * sizeof(block_iq2_xxs));
+        quant_buffer qb0 = quant_alloc(nb * sizeof(block_q2_K)), qb1 = quant_alloc(nb * sizeof(block_q2_K));
+        quant_buffer yb = quant_alloc(DS4_MOE_TILE * nb * sizeof(block_q8_K));
+        block_iq2_xxs *iq0 = (block_iq2_xxs *)ib0.data, *iq1 = (block_iq2_xxs *)ib1.data;
+        block_q2_K *q20 = (block_q2_K *)qb0.data, *q21 = (block_q2_K *)qb1.data;
+        block_q8_K *acts = (block_q8_K *)yb.data;
+        iq2xxs_q8 *acts_iq2 = malloc((size_t)DS4_MOE_TILE * nb * sizeof(*acts_iq2));
+        CHECK(acts_iq2);
+        ds4_moe_tile tile;
+        tile.q = malloc((size_t)nb * DS4_MOE_TILE_Q_STRIDE);
+        tile.d = malloc((size_t)nb * DS4_MOE_TILE * sizeof(float));
+        tile.bsums = malloc((size_t)nb * DS4_MOE_TILE_BS_STRIDE * sizeof(int16_t));
+        CHECK(tile.q && tile.d && tile.bsums);
+        for (unsigned p = 0; p < 24; p++) {
+            for (unsigned lane = 0; lane < DS4_MOE_TILE; lane++) {
+                fill_q8_k_row(acts + lane * nb, nb, (p + lane) % 8);
+            }
+            iq2xxs_q8_prepare(acts_iq2, acts, (uint64_t)DS4_MOE_TILE * nb);
+            fill_iq2_row(iq0, nb, p & 1, &counter);
+            fill_iq2_row(iq1, nb, (p & 2) != 0, &counter);
+            fill_q2_row(q20, nb, &counter);
+            fill_q2_row(q21, nb, &counter);
+            for (unsigned l = 0; l < sizeof(lanes) / sizeof(*lanes); l++) {
+                tile.n = lanes[l];
+                tile.expert = 0;
+                for (unsigned lane = 0; lane < DS4_MOE_TILE; lane++) tile.pair[lane] = lane;
+                moe_tiles_load_ctx load = { .tiles = &tile, .rows = acts, .iq2_rows = acts_iq2, .nb = nb, .pairs_per_row = 1 };
+                moe_tiles_load_worker(&load, 0, 1);
+
+                float out0[DS4_MOE_TILE], out1[DS4_MOE_TILE];
+                moe_iq2_xxs_x16(iq0, iq1, &tile, nb, out0, out1);
+                for (unsigned lane = 0; lane < DS4_MOE_TILE; lane++) {
+                    float ref0 = 0.0f, ref1 = 0.0f;
+                    if (lane < tile.n) {
+                        ds4_vec_dot_iq2_xxs_q8_K((int)(nb * QK_K), &ref0, iq0, acts_iq2 + lane * nb);
+                        ds4_vec_dot_iq2_xxs_q8_K((int)(nb * QK_K), &ref1, iq1, acts_iq2 + lane * nb);
+                    }
+                    quant_equal("IQ2_XXS x16 row0", ref0, out0[lane], nb, p * 100 + lane);
+                    quant_equal("IQ2_XXS x16 row1", ref1, out1[lane], nb, p * 100 + lane);
+                }
+                moe_q2_k_x16(q20, q21, &tile, nb, out0, out1);
+                for (unsigned lane = 0; lane < DS4_MOE_TILE; lane++) {
+                    float ref0 = 0.0f, ref1 = 0.0f;
+                    if (lane < tile.n) {
+                        ds4_vec_dot_q2_K_q8_K((int)(nb * QK_K), &ref0, q20, acts + lane * nb);
+                        ds4_vec_dot_q2_K_q8_K((int)(nb * QK_K), &ref1, q21, acts + lane * nb);
+                    }
+                    quant_equal("Q2_K x16 row0", ref0, out0[lane], nb, p * 100 + lane);
+                    quant_equal("Q2_K x16 row1", ref1, out1[lane], nb, p * 100 + lane);
+                }
+            }
+        }
+        free(acts_iq2); free(tile.bsums); free(tile.d); free(tile.q);
+        quant_free(yb); quant_free(qb1); quant_free(qb0); quant_free(ib1); quant_free(ib0);
+    }
+}
+
+/* The grouped routed FFN against a per-token re-implementation of the decode
+ * path (matvec_iq2_xxs_mid_worker + matvec_q2_k_accum_worker): gate/up dots,
+ * clamp, SwiGLU, router weight, Q8_K requantization, down dots and the
+ * slot-ordered accumulation, bitwise.  The expert tensors and activations end
+ * at a guard page; the routing is skewed so tile sizes span one lane to full. */
+static void check_grouped_ffn(uint64_t in_dim, uint64_t mid_dim, uint64_t out_dim) {
+    const uint32_t saved_n_expert = g_ds4_shape.n_expert;
+    const uint32_t saved_n_used = g_ds4_shape.n_expert_used;
+    const uint32_t n_expert = 8, n_used = 3, n_tok = 61;
+    const unsigned nb_in = (unsigned)(in_dim / QK_K), nb_mid = (unsigned)(mid_dim / QK_K);
+    g_ds4_shape.n_expert = n_expert;
+    g_ds4_shape.n_expert_used = n_used;
+
+    const uint64_t gate_row_bytes = nb_in * sizeof(block_iq2_xxs);
+    const uint64_t down_row_bytes = nb_mid * sizeof(block_q2_K);
+    quant_buffer gb = quant_alloc((size_t)n_expert * mid_dim * gate_row_bytes);
+    quant_buffer ub = quant_alloc((size_t)n_expert * mid_dim * gate_row_bytes);
+    quant_buffer db = quant_alloc((size_t)n_expert * out_dim * down_row_bytes);
+    quant_buffer xb = quant_alloc((size_t)n_tok * in_dim * sizeof(float));
+    block_iq2_xxs *gate = (block_iq2_xxs *)gb.data, *up = (block_iq2_xxs *)ub.data;
+    block_q2_K *down = (block_q2_K *)db.data;
+    float *norm = (float *)xb.data;
+    int *selected = malloc((size_t)n_tok * n_used * sizeof(int));
+    float *pair_weight = malloc((size_t)n_tok * n_used * sizeof(float));
+    float *moe = malloc((size_t)n_tok * out_dim * sizeof(float));
+    float *mid = malloc(mid_dim * sizeof(float));
+    float *acc = malloc(out_dim * sizeof(float));
+    block_q8_K *xq = malloc(nb_in * sizeof(block_q8_K));
+    iq2xxs_q8 *xq_iq2 = malloc(nb_in * sizeof(iq2xxs_q8));
+    block_q8_K *midq = malloc(nb_mid * sizeof(block_q8_K));
+    CHECK(selected && pair_weight && moe && mid && acc && xq && xq_iq2 && midq);
+
+    unsigned counter = 0;
+    for (uint64_t r = 0; r < (uint64_t)n_expert * mid_dim; r++) {
+        fill_iq2_row(gate + r * nb_in, nb_in, false, &counter);
+        fill_iq2_row(up + r * nb_in, nb_in, false, &counter);
+    }
+    for (uint64_t r = 0; r < (uint64_t)n_expert * out_dim; r++) fill_q2_row(down + r * nb_mid, nb_mid, &counter);
+    for (uint64_t j = 0; j < (uint64_t)n_tok * in_dim; j++) {
+        norm[j] = ((float)(quant_random() % 20001) - 10000.0f) * 1e-4f;
+    }
+    /* Distinct experts per token, expert e >= 1 drawn with weight e. */
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t slot = 0; slot < n_used; slot++) {
+            int e;
+            bool dup;
+            do {
+                uint32_t r = quant_random() % (n_expert * (n_expert - 1) / 2);
+                for (e = 1; r >= (uint32_t)e; e++) r -= (uint32_t)e;
+                dup = false;
+                for (uint32_t s = 0; s < slot; s++) dup = dup || selected[t * n_used + s] == e;
+            } while (dup);
+            selected[t * n_used + slot] = e;
+            pair_weight[t * n_used + slot] = (float)(quant_random() % 1000 + 1) * 1e-3f;
+        }
+    }
+    selected[0] = 0; /* expert 0 gets a single-lane tile */
+
+    for (unsigned pass = 0; pass < 2; pass++) {
+        const float clamp = pass ? 7.0f : 0.0f;
+        moe_grouped_ffn(moe, (const uint8_t *)gate, (const uint8_t *)up, (const uint8_t *)down,
+                        gate_row_bytes, gate_row_bytes, down_row_bytes, in_dim, mid_dim, out_dim,
+                        norm, selected, pair_weight, n_tok, clamp);
+
+        for (uint32_t t = 0; t < n_tok; t++) {
+            for (uint64_t row = 0; row < out_dim; row++) acc[row] = 0.0f;
+            ds4_quantize_row_q8_K(norm + t * in_dim, xq, (int64_t)in_dim);
+            iq2xxs_q8_prepare(xq_iq2, xq, nb_in);
+            for (uint32_t slot = 0; slot < n_used; slot++) {
+                const uint32_t e = (uint32_t)selected[t * n_used + slot];
+                const float weight = pair_weight[t * n_used + slot];
+                for (uint64_t row = 0; row < mid_dim; row++) {
+                    float g = 0.0f, u = 0.0f;
+                    ds4_vec_dot_iq2_xxs_pair_q8_K((int)in_dim, &g, &u,
+                                                  gate + (e * mid_dim + row) * nb_in,
+                                                  up + (e * mid_dim + row) * nb_in, xq_iq2);
+                    if (clamp > 1.0e-6f) {
+                        if (g > clamp) g = clamp;
+                        if (u > clamp) u = clamp;
+                        if (u < -clamp) u = -clamp;
+                    }
+                    mid[row] = silu(g) * u * weight;
+                }
+                ds4_quantize_row_q8_K(mid, midq, (int64_t)mid_dim);
+                for (uint64_t row = 0; row < out_dim; row++) {
+                    float v = 0.0f;
+                    ds4_vec_dot_q2_K_q8_K((int)mid_dim, &v, down + (e * out_dim + row) * nb_mid, midq);
+                    acc[row] += v;
+                }
+            }
+            for (uint64_t row = 0; row < out_dim; row++) {
+                quant_equal("grouped routed FFN", acc[row], moe[t * out_dim + row], (unsigned)row, t * 10 + pass);
+            }
+        }
+    }
+
+    g_ds4_shape.n_expert = saved_n_expert;
+    g_ds4_shape.n_expert_used = saved_n_used;
+    free(midq); free(xq_iq2); free(xq); free(acc); free(mid); free(moe); free(pair_weight); free(selected);
+    quant_free(xb); quant_free(db); quant_free(ub); quant_free(gb);
+}
+
 int main(void) {
     check_thread_pool();
     check_f16_round_trip();
@@ -1454,6 +1684,10 @@ int main(void) {
     check_f16_conversion();
     puts("CPU F16C conversion and F16 row-group matvec bitwise oracles PASS");
 #endif
+    check_x16_kernels();
+#if DS4_MOE_X16
+    puts("CPU AVX-512 VNNI x16 expert kernels bitwise PASS");
+#endif
 #if defined(DS4_NO_GPU) && defined(__AVX512BW__)
     puts("CPU AVX-512 IQ2_XXS/Q2_K integer and bitwise block oracles PASS");
 #elif defined(DS4_NO_GPU) && defined(__AVX2__)
@@ -1466,5 +1700,9 @@ int main(void) {
 #endif
     check_decode_glue();
     puts("CPU decode glue (RoPE, HC, head RMS, E4M3) bitwise oracles PASS");
+    /* nb_in > nb_mid with a partial last row block, then nb_in < nb_mid. */
+    check_grouped_ffn(2 * QK_K, QK_K, 2 * DS4_MOE_ROW_BLOCK + 6);
+    check_grouped_ffn(QK_K, 2 * QK_K, 2 * DS4_MOE_ROW_BLOCK);
+    puts("CPU grouped routed FFN bitwise with the per-token decode path PASS");
     return 0;
 }
