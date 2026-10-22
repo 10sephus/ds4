@@ -133,9 +133,9 @@ typedef struct {
  * rest from node-1 threads, so a half placed on its node streams from local
  * memory. */
 typedef enum {
-    DS4_NUMA_PLACE_DENSE = 0,   /* the dense weights read every token */
+    DS4_NUMA_PLACE_ALL = 0,     /* dense weights and routed experts */
+    DS4_NUMA_PLACE_DENSE,       /* the dense weights read every token */
     DS4_NUMA_PLACE_NONE,        /* touch only */
-    DS4_NUMA_PLACE_ALL,         /* dense weights and routed experts */
 } ds4_numa_place;
 
 typedef struct {
