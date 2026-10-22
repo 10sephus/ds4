@@ -14899,16 +14899,10 @@ static void ffn_graph_routed_midq(void *vctx) {
 
 /* The graph covers the V4 Flash layout; anything else takes the plain path. */
 static bool ffn_graph_supported(const ds4_layer_weights *layer) {
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char *env = getenv("DS4_FFN_GRAPH");
-        enabled = !(env && !strcmp(env, "0"));
-    }
     const ds4_tensor *r = layer->ffn_gate_inp;
     const ds4_tensor *g = layer->ffn_gate_shexp, *u = layer->ffn_up_shexp, *d = layer->ffn_down_shexp;
     const ds4_tensor *h = layer->hc_ffn_fn;
-    return enabled &&
-           h && h->type == DS4_TENSOR_F16 && h->ndim == 2 &&
+    return h && h->type == DS4_TENSOR_F16 && h->ndim == 2 &&
            h->dim[0] == (uint64_t)DS4_N_HC * DS4_N_EMBD &&
            h->dim[1] == (uint64_t)DS4_N_HC * (2 + DS4_N_HC) && h->dim[1] <= 24 &&
            r && r->type == DS4_TENSOR_F16 && r->ndim == 2 &&
