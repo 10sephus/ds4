@@ -234,48 +234,75 @@ static void ds41_cpu_iq2xxs_pair16(__m512 out[2], const uint8_t *rows0, uint64_t
     out[1] = sum1;
 }
 
-/* q2_k_value_f32 per lane: (d * (sc & 15)) * q - dmin * (sc >> 4), then
- * one product and one addition per element in row order. */
-static __m512 ds41_cpu_q2k_rows16(const uint8_t *rows, const float *x,
-                                 uint64_t in_dim, uint64_t row_bytes) {
-    const __m512i offsets = ds41_cpu_row_offsets(row_bytes);
-    const __m512i low4 = _mm512_set1_epi32(15), low2 = _mm512_set1_epi32(3);
-    __m512 sum = _mm512_setzero_ps();
+/* q2_k_value_f32 per lane: (d * (sc & 15)) * q - dmin * (sc >> 4), then one
+ * product and one addition per element in row order, for 16 rows of two
+ * matrices with their own inputs, such as two experts' down rows: two
+ * independent sums.  The 32 quant bytes of half a block hold the 2-bit values
+ * of its eight groups at four shifts, so they are gathered once into eight
+ * registers rather than once per group, and a scale dword serves four groups. */
+static void ds41_cpu_q2k_pair16(__m512 out[2],
+                               const uint8_t *rows0, uint64_t row_bytes0, const float *x0,
+                               const uint8_t *rows1, uint64_t row_bytes1, const float *x1,
+                               uint64_t in_dim) {
+    const __m512i off0 = ds41_cpu_row_offsets(row_bytes0);
+    const __m512i off1 = ds41_cpu_row_offsets(row_bytes1);
+    const __m512i low4 = _mm512_set1_epi32(15), byte = _mm512_set1_epi32(255);
+    /* (float)q by VPERMPS of the 2-bit value in index bits 0-1. */
+    const __m512 qf = _mm512_setr_ps(0.0f, 1.0f, 2.0f, 3.0f, 0.0f, 1.0f, 2.0f, 3.0f,
+                                     0.0f, 1.0f, 2.0f, 3.0f, 0.0f, 1.0f, 2.0f, 3.0f);
+    __m512 sum0 = _mm512_setzero_ps(), sum1 = _mm512_setzero_ps();
     for (uint64_t b = 0; b < in_dim / QK_K; b++) {
-        const uint8_t *block = rows + b * sizeof(block_q2_K);
-        const __m512i halves = _mm512_i32gather_epi32(
-            offsets, block + offsetof(block_q2_K, d), 1);
-        const __m512 d = ds41_cpu_half16(halves);
-        const __m512 dmin = ds41_cpu_half16(_mm512_srli_epi32(halves, 16));
-        for (unsigned g = 0; g < QK_K / 16; g++) {
-            const __m512i sc = _mm512_and_si512(_mm512_srli_epi32(
-                _mm512_i32gather_epi32(offsets, block + (g & ~3u), 1),
-                8 * (g & 3u)), _mm512_set1_epi32(255));
-            const __m512 scale = _mm512_mul_ps(d, _mm512_cvtepi32_ps(
-                _mm512_and_si512(sc, low4)));
-            const __m512 minv = _mm512_mul_ps(dmin, _mm512_cvtepi32_ps(
-                _mm512_srli_epi32(sc, 4)));
-            const unsigned q_base = 32u * (g / 8u) + 16u * (g & 1u);
-            const __m512i shift = _mm512_set1_epi32((int)(((g / 2u) & 3u) * 2u));
-            const float *xg = x + b * QK_K + g * 16u;
-            for (unsigned l = 0; l < 16; l += 4) {
-                const __m512i packed = _mm512_srlv_epi32(_mm512_i32gather_epi32(
-                    offsets, block + offsetof(block_q2_K, qs) + q_base + l, 1), shift);
+        const uint8_t *block0 = rows0 + b * sizeof(block_q2_K);
+        const uint8_t *block1 = rows1 + b * sizeof(block_q2_K);
+        const __m512i halves0 = _mm512_i32gather_epi32(off0, block0 + offsetof(block_q2_K, d), 1);
+        const __m512i halves1 = _mm512_i32gather_epi32(off1, block1 + offsetof(block_q2_K, d), 1);
+        const __m512 d0 = ds41_cpu_half16(halves0), dmin0 = ds41_cpu_half16(_mm512_srli_epi32(halves0, 16));
+        const __m512 d1 = ds41_cpu_half16(halves1), dmin1 = ds41_cpu_half16(_mm512_srli_epi32(halves1, 16));
+        for (unsigned c = 0; c < 2; c++) {
+            __m512i q0[8], q1[8];
+            for (unsigned k = 0; k < 8; k++) {
+                q0[k] = _mm512_i32gather_epi32(off0, block0 + offsetof(block_q2_K, qs) + 32u * c + 4u * k, 1);
+                q1[k] = _mm512_i32gather_epi32(off1, block1 + offsetof(block_q2_K, qs) + 32u * c + 4u * k, 1);
+            }
+            __m512i sc_word0 = _mm512_setzero_si512(), sc_word1 = _mm512_setzero_si512();
+            for (unsigned gq = 0; gq < 8; gq++) {
+                const unsigned g = 8u * c + gq;
+                if ((gq & 3u) == 0) {
+                    sc_word0 = _mm512_i32gather_epi32(off0, block0 + g, 1);
+                    sc_word1 = _mm512_i32gather_epi32(off1, block1 + g, 1);
+                }
+                const __m512i sc_shift = _mm512_set1_epi32((int)(8u * (gq & 3u)));
+                const __m512i sc0 = _mm512_and_si512(_mm512_srlv_epi32(sc_word0, sc_shift), byte);
+                const __m512i sc1 = _mm512_and_si512(_mm512_srlv_epi32(sc_word1, sc_shift), byte);
+                const __m512 scale0 = _mm512_mul_ps(d0, _mm512_cvtepi32_ps(_mm512_and_si512(sc0, low4)));
+                const __m512 minv0 = _mm512_mul_ps(dmin0, _mm512_cvtepi32_ps(_mm512_srli_epi32(sc0, 4)));
+                const __m512 scale1 = _mm512_mul_ps(d1, _mm512_cvtepi32_ps(_mm512_and_si512(sc1, low4)));
+                const __m512 minv1 = _mm512_mul_ps(dmin1, _mm512_cvtepi32_ps(_mm512_srli_epi32(sc1, 4)));
+                const __m512i shift = _mm512_set1_epi32((int)(((g / 2u) & 3u) * 2u));
+                const __m512i *qg0 = q0 + 4u * (g & 1u), *qg1 = q1 + 4u * (g & 1u);
+                const float *xg0 = x0 + b * QK_K + g * 16u, *xg1 = x1 + b * QK_K + g * 16u;
+                for (unsigned l = 0; l < 16; l += 4) {
+                    const __m512i packed0 = _mm512_srlv_epi32(qg0[l / 4u], shift);
+                    const __m512i packed1 = _mm512_srlv_epi32(qg1[l / 4u], shift);
 #define DS41_Q2K_TERM(J) do { \
-    const __m512 q = _mm512_cvtepi32_ps(_mm512_and_si512( \
-        _mm512_srli_epi32(packed, 8 * (J)), low2)); \
-    const __m512 value = _mm512_sub_ps(_mm512_mul_ps(scale, q), minv); \
-    sum = _mm512_add_ps(sum, _mm512_mul_ps(value, _mm512_set1_ps(xg[l + (J)]))); \
+    const __m512 v0 = _mm512_sub_ps(_mm512_mul_ps(scale0, _mm512_permutexvar_ps( \
+        (J) ? _mm512_srli_epi32(packed0, 8 * (J)) : packed0, qf)), minv0); \
+    const __m512 v1 = _mm512_sub_ps(_mm512_mul_ps(scale1, _mm512_permutexvar_ps( \
+        (J) ? _mm512_srli_epi32(packed1, 8 * (J)) : packed1, qf)), minv1); \
+    sum0 = _mm512_add_ps(sum0, _mm512_mul_ps(v0, _mm512_set1_ps(xg0[l + (J)]))); \
+    sum1 = _mm512_add_ps(sum1, _mm512_mul_ps(v1, _mm512_set1_ps(xg1[l + (J)]))); \
 } while (0)
-                DS41_Q2K_TERM(0);
-                DS41_Q2K_TERM(1);
-                DS41_Q2K_TERM(2);
-                DS41_Q2K_TERM(3);
+                    DS41_Q2K_TERM(0);
+                    DS41_Q2K_TERM(1);
+                    DS41_Q2K_TERM(2);
+                    DS41_Q2K_TERM(3);
 #undef DS41_Q2K_TERM
+                }
             }
         }
     }
-    return sum;
+    out[0] = sum0;
+    out[1] = sum1;
 }
 
 /* Rows [g * group_rows, (g + 1) * group_rows) read ref.x + g * group_in. */
@@ -365,13 +392,26 @@ static void ds41_cpu_down_worker(void *vctx, uint64_t first, uint64_t last) {
             glm_routed_moe_f32_down_worker(ctx, row, ctx->out_dim);
             continue;
         }
+        /* Experts are added in slot order; Q2_K experts are computed in pairs. */
         __m512 sum = _mm512_setzero_ps();
-        for (uint32_t slot = 0; slot < ctx->n_expert; slot++) {
+        for (uint32_t slot = 0; slot < ctx->n_expert; ) {
             const uint8_t *rows = ctx->down_base[slot] + row * ctx->down_row_bytes[slot];
             const float *mid = ctx->mid + (uint64_t)slot * ctx->in_dim;
-            sum = _mm512_add_ps(sum, ctx->down_type == DS4_TENSOR_Q2_K ?
-                ds41_cpu_q2k_rows16(rows, mid, ctx->in_dim, ctx->down_row_bytes[slot]) :
-                ds41_cpu_q4_rows16(rows, mid, ctx->in_dim, ctx->down_row_bytes[slot]));
+            if (ctx->down_type == DS4_TENSOR_Q2_K) {
+                const uint32_t next = slot + 1 < ctx->n_expert ? slot + 1 : slot;
+                __m512 sums[2];
+                ds41_cpu_q2k_pair16(sums, rows, ctx->down_row_bytes[slot], mid,
+                                    ctx->down_base[next] + row * ctx->down_row_bytes[next],
+                                    ctx->down_row_bytes[next],
+                                    ctx->mid + (uint64_t)next * ctx->in_dim, ctx->in_dim);
+                sum = _mm512_add_ps(sum, sums[0]);
+                if (next != slot) sum = _mm512_add_ps(sum, sums[1]);
+                slot = next + 1;
+            } else {
+                sum = _mm512_add_ps(sum, ds41_cpu_q4_rows16(rows, mid, ctx->in_dim,
+                                                            ctx->down_row_bytes[slot]));
+                slot++;
+            }
         }
         _mm512_storeu_ps(ctx->out + row, sum);
     }

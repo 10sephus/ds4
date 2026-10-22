@@ -207,6 +207,39 @@ static void check_iq2xxs_pair(void) {
     test_free(xb); test_free(u); test_free(g);
 }
 
+/* The Q2_K pair kernel against the scalar dot, row by row, two matrices
+ * with their own inputs: random quants and scale bytes, edge-case F16 d and
+ * dmin, signed zero activations. */
+static void check_q2k_pair(void) {
+    const uint64_t k = 2304, rows = 48, stride = k / QK_K * sizeof(block_q2_K);
+    test_buffer w0 = test_alloc(rows * stride), w1 = test_alloc(rows * stride);
+    test_buffer xb = test_alloc(2 * k * sizeof(float));
+    float *x = (float *)xb.data;
+    for (uint64_t i = 0; i < 2 * k; i++) {
+        x[i] = test_float();
+        if (test_random() % 61 == 0) x[i] = (test_random() & 1) ? -0.0f : 0.0f;
+    }
+    test_fill_quants(w0.data, rows * stride, DS4_TENSOR_Q2_K);
+    test_fill_quants(w1.data, rows * stride, DS4_TENSOR_Q2_K);
+    for (uint64_t row = 0; row < rows; row += 16) {
+        __m512 sums[2];
+        float a[2][16], b[2][16];
+        ds41_cpu_q2k_pair16(sums, w0.data + row * stride, stride, x,
+                            w1.data + row * stride, stride, x + k, k);
+        _mm512_storeu_ps(b[0], sums[0]);
+        _mm512_storeu_ps(b[1], sums[1]);
+        for (unsigned lane = 0; lane < 16; lane++) {
+            a[0][lane] = ds4_vec_dot_q2_K_f32((int)k,
+                (const block_q2_K *)(w0.data + (row + lane) * stride), x);
+            a[1][lane] = ds4_vec_dot_q2_K_f32((int)k,
+                (const block_q2_K *)(w1.data + (row + lane) * stride), x + k);
+        }
+        test_equal("Q2_K pair 0", a[0], b[0], 16);
+        test_equal("Q2_K pair 1", a[1], b[1], 16);
+    }
+    test_free(xb); test_free(w1); test_free(w0);
+}
+
 /* Full MoE layouts require multiples of 256. Exercise worker row tails
  * directly as well, including a worker range split at an expert boundary. */
 static void check_q4_tails(void) {
@@ -254,6 +287,19 @@ static void check_q4_tails(void) {
             dc.out = b;
             ds41_cpu_down_worker(&dc, 0, (n + 15) / 16);
             test_equal("Q2_K down tails", a, b, n);
+            test_buffer w5 = test_alloc(n * stride2), m3 = test_alloc(3 * k * sizeof(float));
+            test_fill_quants(w5.data, n * stride2, DS4_TENSOR_Q2_K);
+            for (uint64_t i = 0; i < 3 * k; i++) ((float *)m3.data)[i] = test_float();
+            dc.out = a;
+            dc.mid = (const float *)m3.data;
+            dc.down_base[2] = w5.data;
+            dc.down_row_bytes[2] = stride2;
+            dc.n_expert = 3;
+            glm_routed_moe_f32_down_worker(&dc, 0, n);
+            dc.out = b;
+            ds41_cpu_down_worker(&dc, 0, (n + 15) / 16);
+            test_equal("Q2_K down tails, 3 experts", a, b, n);
+            test_free(m3); test_free(w5);
             const uint64_t stride3 = k / QK_K * sizeof(block_iq2_xxs);
             test_buffer w3 = test_alloc(n * stride3), w4 = test_alloc(n * stride3);
             test_fill_quants(w3.data, n * stride3, DS4_TENSOR_IQ2_XXS);
@@ -281,6 +327,7 @@ int main(void) {
     CHECK(pthread_once(&ds41_iq2xxs_once, ds41_iq2xxs_tables_init) == 0);
     check_half();
     check_iq2xxs_pair();
+    check_q2k_pair();
     check_q4_tails();
 #endif
     /* Both pool layouts: NUMA halves per group (on a two-node host) and one cursor. */
