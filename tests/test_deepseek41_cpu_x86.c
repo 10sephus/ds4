@@ -178,9 +178,20 @@ static void check_q4_tails(void) {
             };
             glm_routed_moe_f32_down_worker(&dc, 0, n);
             dc.out = b;
-            ds41_cpu_q4_down_worker(&dc, 0, (n + 15) / 16);
+            ds41_cpu_down_worker(&dc, 0, (n + 15) / 16);
             test_equal("Q4 down tails", a, b, n);
-            test_free(xb); test_free(w);
+            const uint64_t stride2 = k / QK_K * sizeof(block_q2_K);
+            test_buffer w2 = test_alloc(n * stride2);
+            test_fill_quants(w2.data, n * stride2, DS4_TENSOR_Q2_K);
+            dc.out = a;
+            dc.down_base[0] = dc.down_base[1] = w2.data;
+            dc.down_row_bytes[0] = dc.down_row_bytes[1] = stride2;
+            dc.down_type = DS4_TENSOR_Q2_K;
+            glm_routed_moe_f32_down_worker(&dc, 0, n);
+            dc.out = b;
+            ds41_cpu_down_worker(&dc, 0, (n + 15) / 16);
+            test_equal("Q2_K down tails", a, b, n);
+            test_free(w2); test_free(xb); test_free(w);
         }
     }
 }

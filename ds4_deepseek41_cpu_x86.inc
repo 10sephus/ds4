@@ -106,6 +106,50 @@ static __m512 ds41_cpu_q4_rows16(const uint8_t *rows, const float *x,
     return sum;
 }
 
+/* q2_k_value_f32 per lane: (d * (sc & 15)) * q - dmin * (sc >> 4), then
+ * one product and one addition per element in row order. */
+static __m512 ds41_cpu_q2k_rows16(const uint8_t *rows, const float *x,
+                                 uint64_t in_dim, uint64_t row_bytes) {
+    const __m512i offsets = ds41_cpu_row_offsets(row_bytes);
+    const __m512i low4 = _mm512_set1_epi32(15), low2 = _mm512_set1_epi32(3);
+    __m512 sum = _mm512_setzero_ps();
+    for (uint64_t b = 0; b < in_dim / QK_K; b++) {
+        const uint8_t *block = rows + b * sizeof(block_q2_K);
+        const __m512i halves = _mm512_i32gather_epi32(
+            offsets, block + offsetof(block_q2_K, d), 1);
+        const __m512 d = ds41_cpu_half16(halves);
+        const __m512 dmin = ds41_cpu_half16(_mm512_srli_epi32(halves, 16));
+        for (unsigned g = 0; g < QK_K / 16; g++) {
+            const __m512i sc = _mm512_and_si512(_mm512_srli_epi32(
+                _mm512_i32gather_epi32(offsets, block + (g & ~3u), 1),
+                8 * (g & 3u)), _mm512_set1_epi32(255));
+            const __m512 scale = _mm512_mul_ps(d, _mm512_cvtepi32_ps(
+                _mm512_and_si512(sc, low4)));
+            const __m512 minv = _mm512_mul_ps(dmin, _mm512_cvtepi32_ps(
+                _mm512_srli_epi32(sc, 4)));
+            const unsigned q_base = 32u * (g / 8u) + 16u * (g & 1u);
+            const __m512i shift = _mm512_set1_epi32((int)(((g / 2u) & 3u) * 2u));
+            const float *xg = x + b * QK_K + g * 16u;
+            for (unsigned l = 0; l < 16; l += 4) {
+                const __m512i packed = _mm512_srlv_epi32(_mm512_i32gather_epi32(
+                    offsets, block + offsetof(block_q2_K, qs) + q_base + l, 1), shift);
+#define DS41_Q2K_TERM(J) do { \
+    const __m512 q = _mm512_cvtepi32_ps(_mm512_and_si512( \
+        _mm512_srli_epi32(packed, 8 * (J)), low2)); \
+    const __m512 value = _mm512_sub_ps(_mm512_mul_ps(scale, q), minv); \
+    sum = _mm512_add_ps(sum, _mm512_mul_ps(value, _mm512_set1_ps(xg[l + (J)]))); \
+} while (0)
+                DS41_Q2K_TERM(0);
+                DS41_Q2K_TERM(1);
+                DS41_Q2K_TERM(2);
+                DS41_Q2K_TERM(3);
+#undef DS41_Q2K_TERM
+            }
+        }
+    }
+    return sum;
+}
+
 typedef struct {
     matvec_q8_0_f32_ref_ctx ref;
     uint64_t rows;
@@ -156,7 +200,7 @@ static void ds41_cpu_q4_mid_worker(void *vctx, uint64_t first, uint64_t last) {
     }
 }
 
-static void ds41_cpu_q4_down_worker(void *vctx, uint64_t first, uint64_t last) {
+static void ds41_cpu_down_worker(void *vctx, uint64_t first, uint64_t last) {
     glm_routed_moe_f32_down_ctx *ctx = vctx;
     for (uint64_t tile = first; tile < last; tile++) {
         const uint64_t row = tile * 16;
@@ -166,10 +210,11 @@ static void ds41_cpu_q4_down_worker(void *vctx, uint64_t first, uint64_t last) {
         }
         __m512 sum = _mm512_setzero_ps();
         for (uint32_t slot = 0; slot < ctx->n_expert; slot++) {
-            sum = _mm512_add_ps(sum, ds41_cpu_q4_rows16(
-                ctx->down_base[slot] + row * ctx->down_row_bytes[slot],
-                ctx->mid + (uint64_t)slot * ctx->in_dim,
-                ctx->in_dim, ctx->down_row_bytes[slot]));
+            const uint8_t *rows = ctx->down_base[slot] + row * ctx->down_row_bytes[slot];
+            const float *mid = ctx->mid + (uint64_t)slot * ctx->in_dim;
+            sum = _mm512_add_ps(sum, ctx->down_type == DS4_TENSOR_Q2_K ?
+                ds41_cpu_q2k_rows16(rows, mid, ctx->in_dim, ctx->down_row_bytes[slot]) :
+                ds41_cpu_q4_rows16(rows, mid, ctx->in_dim, ctx->down_row_bytes[slot]));
         }
         _mm512_storeu_ps(ctx->out + row, sum);
     }
@@ -198,10 +243,16 @@ static void ds41_cpu_routed_moe(float *out, float *mid, const ds4_model *m,
                                const ds4_layer_weights *l, const float *x,
                                const int *selected, const float *weights) {
 #if defined(__AVX512F__) && defined(__AVX512BW__)
-    if (l->ffn_gate_exps && l->ffn_up_exps && l->ffn_down_exps &&
+    const bool q4 = l->ffn_gate_exps && l->ffn_up_exps && l->ffn_down_exps &&
         l->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
         l->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
-        l->ffn_down_exps->type == DS4_TENSOR_Q4_K &&
+        l->ffn_down_exps->type == DS4_TENSOR_Q4_K;
+    /* Q2 models keep the reference IQ2_XXS gate/up rows; Q2_K down rows
+     * dominate their scalar cost and take the lane-per-row kernel. */
+    const bool q2 = l->ffn_gate_exps && l->ffn_up_exps && l->ffn_down_exps &&
+        glm_graph_gate_pair_type_supported(l->ffn_gate_exps->type, l->ffn_up_exps->type) &&
+        l->ffn_down_exps->type == DS4_TENSOR_Q2_K;
+    if ((q4 || q2) &&
         DS4_N_EXPERT_USED > 0 && DS4_N_EXPERT_USED <= DS4_MAX_EXPERT_USED &&
         DS4_N_EMBD > 0 && DS4_N_FF_EXP > 0 &&
         DS4_N_EMBD % QK_K == 0 && DS4_N_FF_EXP % QK_K == 0 &&
@@ -209,12 +260,12 @@ static void ds41_cpu_routed_moe(float *out, float *mid, const ds4_model *m,
         DS4_N_FF_EXP / QK_K <= INT32_MAX / (15 * (int)sizeof(block_q4_K))) {
         glm_routed_moe_f32_mid_ctx mc = {
             .mid = mid, .x = x, .in_dim = DS4_N_EMBD, .out_dim = DS4_N_FF_EXP,
-            .gate_type = DS4_TENSOR_Q4_K, .up_type = DS4_TENSOR_Q4_K,
+            .gate_type = l->ffn_gate_exps->type, .up_type = l->ffn_up_exps->type,
             .n_expert = DS4_N_EXPERT_USED, .clamp = DS4_SWIGLU_CLAMP_EXP,
         };
         glm_routed_moe_f32_down_ctx dc = {
             .out = out, .mid = mid, .in_dim = DS4_N_FF_EXP, .out_dim = DS4_N_EMBD,
-            .down_type = DS4_TENSOR_Q4_K, .n_expert = DS4_N_EXPERT_USED,
+            .down_type = l->ffn_down_exps->type, .n_expert = DS4_N_EXPERT_USED,
         };
         for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
             uint64_t gi, go, ui, uo, di, dout;
@@ -231,9 +282,11 @@ static void ds41_cpu_routed_moe(float *out, float *mid, const ds4_model *m,
                 ds4_die("V4.1 CPU routed-MoE found unexpected expert dimensions");
             mc.expert_weight[slot] = weights[slot];
         }
-        ds4_parallel_for_min_rows((uint64_t)mc.n_expert * ((mc.out_dim + 15) / 16),
-                                  ds41_cpu_q4_mid_worker, &mc, 32);
-        ds4_parallel_for_min_rows((dc.out_dim + 15) / 16, ds41_cpu_q4_down_worker, &dc, 32);
+        if (q4) ds4_parallel_for_min_rows((uint64_t)mc.n_expert * ((mc.out_dim + 15) / 16),
+                                          ds41_cpu_q4_mid_worker, &mc, 32);
+        else ds4_parallel_for((uint64_t)mc.n_expert * mc.out_dim,
+                              glm_routed_moe_f32_mid_worker, &mc);
+        ds4_parallel_for_min_rows((dc.out_dim + 15) / 16, ds41_cpu_down_worker, &dc, 32);
         return;
     }
 #endif
