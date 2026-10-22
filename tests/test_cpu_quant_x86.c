@@ -1418,16 +1418,17 @@ static void check_attention_lanes(void) {
                         const uint32_t cap = n_raw + n_comp + pad;
                         quant_buffer scb = quant_alloc((size_t)nh * cap * sizeof(float));
                         quant_buffer rwb = quant_alloc((size_t)cap * sizeof(float *));
+                        quant_buffer cmb = quant_alloc((size_t)nh * ((cap + 15) / 16) * sizeof(float));
                         ds4_cpu_decode_scratch s = {
                             .attn_score_cap = cap, .attn_score = (float *)scb.data,
                             .attn_qt = (float *)qtb.data, .attn_rows = (const float **)rwb.data,
-                            .attn_inv = (float *)ib.data,
+                            .attn_cmax = (float *)cmb.data, .attn_inv = (float *)ib.data,
                         };
                         memset(out, 0xff, nh * d * sizeof(out[0]));
                         layer_attention_mixed_one_decode_scratch(out, &m, &l, q, raw, n_raw,
                                                                  comp, n_comp, allow, &s);
                         CHECK(!memcmp(out, expected, nh * d * sizeof(out[0])));
-                        quant_free(rwb); quant_free(scb);
+                        quant_free(cmb); quant_free(rwb); quant_free(scb);
                     }
                     if (n_comp == 0) {
                         layer_attention_rows_one(expected, &m, &l, q, raw, n_raw);

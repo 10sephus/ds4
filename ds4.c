@@ -1117,6 +1117,9 @@ typedef struct {
     uint32_t index;
 } indexer_candidate;
 
+/* Rows per item of the lane-wise decode attention stages. */
+#define ATTN_LANES_ROWS_PER_ITEM 16
+
 typedef struct {
     uint32_t ctx_size;
     uint32_t comp_cap;
@@ -1141,6 +1144,7 @@ typedef struct {
     float *attn_score;
     float *attn_qt;
     const float **attn_rows;
+    float *attn_cmax;
     float *attn_inv;
 
     float *comp;
@@ -15695,6 +15699,9 @@ static void cpu_decode_scratch_init(ds4_cpu_decode_scratch *scratch, uint32_t ct
     scratch->attn_score = xmalloc((size_t)16u * ((DS4_N_HEAD + 15u) / 16u) * attn_score_cap * sizeof(float));
     scratch->attn_qt = xmalloc((size_t)q_dim * sizeof(float));
     scratch->attn_rows = xmalloc((size_t)attn_score_cap * sizeof(float *));
+    scratch->attn_cmax = xmalloc((size_t)((DS4_N_HEAD + 15u) / 16u) *
+                                 ((attn_score_cap + ATTN_LANES_ROWS_PER_ITEM - 1) / ATTN_LANES_ROWS_PER_ITEM) *
+                                 16u * sizeof(float));
     scratch->attn_inv = xmalloc((size_t)DS4_N_HEAD * sizeof(float));
 
     scratch->comp = xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(float));
@@ -15776,6 +15783,7 @@ static void cpu_decode_scratch_free(ds4_cpu_decode_scratch *scratch) {
     free(scratch->index_comp);
     free(scratch->comp);
     free(scratch->attn_inv);
+    free(scratch->attn_cmax);
     free(scratch->attn_rows);
     free(scratch->attn_qt);
     free(scratch->attn_score);
@@ -16539,25 +16547,32 @@ static void layer_attention_mixed_one(
 }
 
 /* Sink-aware attention over raw SWA rows plus optional compressed rows, in
- * three pooled passes that reproduce the serial per-head arithmetic bitwise.
+ * four pooled stages of one dispatch that reproduce the serial per-head
+ * arithmetic bitwise.
  *
  * The rows a token attends to (raw rows, then the compressed rows the indexer
- * allows) are listed once in attention order, so no pass tests the mask and
+ * allows) are listed once in attention order, so no stage tests the mask and
  * every per-head sequence runs over exactly the rows the serial code used.
  *
- * Pass A scores (row, head) pairs sixteen heads per vector: lane h walks
+ * Stage A scores (row, head) pairs sixteen heads per vector: lane h walks
  * i = 0..head_dim-1 adding q[h][i]*k[r][i] to its accumulator from +0.0f with
  * separate multiply and add, the exact x86 dot_f32 sequence.  Items are
- * (head group, row chunk).  Pass B1 is one item per head: the running max,
- * the expf chain and the denominator in row order, scalar as before, with
- * the weights replacing the scores.  Pass B2 items are (head group, 16-wide
- * dim chunk): every output element is still its own ((0 + w0*x0) + w1*x1)
- * + ... chain, vectorised across dims and kept in a register, and each row
- * line is loaded once for the sixteen heads.
+ * (head group, row chunk), and each keeps the running maximum of its rows
+ * per lane.  Stage B items are the same pairs: the head's maximum is the
+ * sink followed by the chunk maxima in order, which lands on the value the
+ * serial scan over the rows found (every comparison is a strict '>', so the
+ * first of equal values wins in both), then the expf of every score replaces
+ * it; the chunk is sixteen rows of sixteen lanes, so no two items write the
+ * same cache line.  Stage C, one item per head group, adds the weights to
+ * the sink's in row order, the serial denominator chain, lane-wise.  Stage D
+ * items are (head group, 16-wide dim chunk): every output element is still
+ * its own ((0 + w0*x0) + w1*x1) + ... chain, vectorised across dims and kept
+ * in a register, and each row line is loaded once for the sixteen heads.
  *
  * qt is the transposed query, [n_head/16][head_dim][16]; score holds
- * [n_head/16][score_stride][16] floats, row-major within a head group. */
-#define ATTN_LANES_ROWS_PER_ITEM 16
+ * [n_head/16][score_stride][16] floats, row-major within a head group; cmax
+ * holds [n_head/16][n_chunks][16] chunk maxima (the V4.1 path, with its own
+ * weight pass, passes none). */
 #define ATTN_LANES_BLOCK 8
 #define ATTN_LANES_PREFETCH 4
 
@@ -16568,6 +16583,8 @@ typedef struct {
     const float         * qt;
     const float * const * rows;     /* live KV rows in attention order */
     float               * score;    /* scores, then softmax weights */
+    float               * cmax;     /* per-lane maximum of each (group, chunk); NULL
+                                       when the caller runs its own weight pass */
     float               * inv;      /* 1 / denominator per head */
     uint32_t              n_head;
     uint32_t              score_stride;
@@ -16645,38 +16662,75 @@ static void attn_lanes_score_worker(void *vctx, uint64_t item0, uint64_t item1) 
         const uint32_t r0 = (uint32_t)(item % ctx->n_chunks) * ATTN_LANES_ROWS_PER_ITEM;
         const uint32_t h1 = h0 + 16 < ctx->n_head ? h0 + 16 : ctx->n_head;
         const uint32_t r1 = r0 + ATTN_LANES_ROWS_PER_ITEM < ctx->n_rows ? r0 + ATTN_LANES_ROWS_PER_ITEM : ctx->n_rows;
+        float *cmax = ctx->cmax ? ctx->cmax + item * 16 : NULL;
         uint32_t h = h0;
 #if defined(DS4_NO_GPU) && defined(__AVX512F__)
         if (h1 == h0 + 16) {
             for (uint32_t r = r0; r < r1; r += ATTN_LANES_BLOCK) {
                 attn_lanes_score_block(ctx, h0, r, r1 - r < ATTN_LANES_BLOCK ? r1 - r : ATTN_LANES_BLOCK, kq_scale);
             }
+            __m512 m = _mm512_set1_ps(-INFINITY);
+            for (uint32_t r = r0; r < r1; r++) {
+                const __m512 v = _mm512_loadu_ps(attn_lanes_score(ctx, h0, r));
+                m = _mm512_mask_blend_ps(_mm512_cmp_ps_mask(v, m, _CMP_GT_OQ), m, v);
+            }
+            if (ctx->cmax) _mm512_storeu_ps(cmax, m);
             h = h1;
         }
 #endif
         for (; h < h1; h++) {
             const float *qh = ctx->q + (uint64_t)h * DS4_N_HEAD_DIM;
+            float m = -INFINITY;
             for (uint32_t r = r0; r < r1; r++) {
-                *attn_lanes_score(ctx, h, r) = dot_f32(qh, ctx->rows[r], DS4_N_HEAD_DIM) * kq_scale;
+                const float v = dot_f32(qh, ctx->rows[r], DS4_N_HEAD_DIM) * kq_scale;
+                *attn_lanes_score(ctx, h, r) = v;
+                if (v > m) m = v;
             }
+            if (ctx->cmax) cmax[h - h0] = m;
         }
     }
 }
 
-static void attn_lanes_weight_worker(void *vctx, uint64_t h0, uint64_t h1) {
+/* The maximum of each head of group g: its sink, then the chunk maxima. */
+static void attn_lanes_head_max(const layer_attention_lanes_ctx *ctx, uint32_t g, float *max) {
+    const uint32_t n = g * 16 + 16 < ctx->n_head ? 16 : ctx->n_head - g * 16;
+    for (uint32_t l = 0; l < n; l++) max[l] = ctx->sinks[g * 16 + l];
+    for (uint32_t c = 0; c < ctx->n_chunks; c++) {
+        const float *cmax = ctx->cmax + ((uint64_t)g * ctx->n_chunks + c) * 16;
+        for (uint32_t l = 0; l < n; l++) {
+            if (cmax[l] > max[l]) max[l] = cmax[l];
+        }
+    }
+}
+
+static void attn_lanes_weight_worker(void *vctx, uint64_t item0, uint64_t item1) {
     const layer_attention_lanes_ctx *ctx = vctx;
-    for (uint64_t h = h0; h < h1; h++) {
-        float *score = attn_lanes_score(ctx, (uint32_t)h, 0);
-        float max_score = ctx->sinks[h];
-        for (uint32_t r = 0; r < ctx->n_rows; r++) {
-            if (score[(uint64_t)r * 16] > max_score) max_score = score[(uint64_t)r * 16];
+    for (uint64_t item = item0; item < item1; item++) {
+        const uint32_t g = (uint32_t)(item / ctx->n_chunks);
+        const uint32_t r0 = (uint32_t)(item % ctx->n_chunks) * ATTN_LANES_ROWS_PER_ITEM;
+        const uint32_t r1 = r0 + ATTN_LANES_ROWS_PER_ITEM < ctx->n_rows ? r0 + ATTN_LANES_ROWS_PER_ITEM : ctx->n_rows;
+        const uint32_t n = g * 16 + 16 < ctx->n_head ? 16 : ctx->n_head - g * 16;
+        float max[16];
+        attn_lanes_head_max(ctx, g, max);
+        for (uint32_t r = r0; r < r1; r++) {
+            float *w = attn_lanes_score(ctx, g * 16, r);
+            for (uint32_t l = 0; l < n; l++) w[l] = expf(w[l] - max[l]);
         }
-        float denom = expf(ctx->sinks[h] - max_score);
+    }
+}
+
+static void attn_lanes_denom_worker(void *vctx, uint64_t g0, uint64_t g1) {
+    const layer_attention_lanes_ctx *ctx = vctx;
+    for (uint64_t g = g0; g < g1; g++) {
+        const uint32_t n = g * 16 + 16 < ctx->n_head ? 16 : ctx->n_head - (uint32_t)g * 16;
+        float max[16], denom[16];
+        attn_lanes_head_max(ctx, (uint32_t)g, max);
+        for (uint32_t l = 0; l < n; l++) denom[l] = expf(ctx->sinks[g * 16 + l] - max[l]);
         for (uint32_t r = 0; r < ctx->n_rows; r++) {
-            score[(uint64_t)r * 16] = expf(score[(uint64_t)r * 16] - max_score);
-            denom += score[(uint64_t)r * 16];
+            const float *w = attn_lanes_score(ctx, (uint32_t)g * 16, r);
+            for (uint32_t l = 0; l < n; l++) denom[l] += w[l];
         }
-        ctx->inv[h] = 1.0f / denom;
+        for (uint32_t l = 0; l < n; l++) ctx->inv[g * 16 + l] = 1.0f / denom[l];
     }
 }
 
@@ -16742,7 +16796,8 @@ static void attn_lanes_transpose_q(float *qt, const float *q, uint32_t n_head, u
 
 /* Caller scratch: qt n_head * head_dim floats, rows n_raw + n_comp pointers,
  * score 16 * ceil(n_head / 16) * score_stride floats with score_stride >=
- * n_raw + n_comp, inv n_head floats. */
+ * n_raw + n_comp, cmax 16 * ceil(n_head / 16) * ceil(score_stride / 16)
+ * floats, inv n_head floats. */
 static void layer_attention_lanes(
         float               * out_heads,
         const float         * sinks,
@@ -16755,6 +16810,7 @@ static void layer_attention_lanes(
         float               * qt,
         const float        ** rows,
         float               * score,
+        float               * cmax,
         float               * inv,
         uint32_t              score_stride) {
     const uint32_t n_head = DS4_N_HEAD, head_dim = DS4_N_HEAD_DIM;
@@ -16772,6 +16828,7 @@ static void layer_attention_lanes(
         .qt = qt,
         .rows = rows,
         .score = score,
+        .cmax = cmax,
         .inv = inv,
         .n_head = n_head,
         .score_stride = score_stride,
@@ -16780,11 +16837,19 @@ static void layer_attention_lanes(
         .n_dim_chunks = (head_dim + 15) / 16,
     };
     const uint32_t n_groups = (n_head + 15) / 16;
-    if (n_rows > 0) {
-        ds4_parallel_for_min_rows((uint64_t)n_groups * ctx.n_chunks, attn_lanes_score_worker, &ctx, 1);
-    }
-    ds4_parallel_for_min_rows(n_head, attn_lanes_weight_worker, &ctx, 1);
-    ds4_parallel_for_min_rows((uint64_t)n_groups * ctx.n_dim_chunks, attn_lanes_sum_worker, &ctx, 1);
+    const uint64_t n_items = (uint64_t)n_groups * ctx.n_chunks;
+    const uint64_t n_sums = (uint64_t)n_groups * ctx.n_dim_chunks;
+    ds4_pool_stage stages[4] = {
+        { .fn = attn_lanes_score_worker, .ctx = &ctx,
+          .n_rows = n_items, .group_rows = n_items ? n_items : 1, .min_chunk = 1 },
+        { .fn = attn_lanes_weight_worker, .ctx = &ctx,
+          .n_rows = n_items, .group_rows = n_items ? n_items : 1, .min_chunk = 1, .deps = 1u << 0 },
+        { .fn = attn_lanes_denom_worker, .ctx = &ctx,
+          .n_rows = n_groups, .group_rows = n_groups, .min_chunk = 1, .deps = 1u << 1 },
+        { .fn = attn_lanes_sum_worker, .ctx = &ctx,
+          .n_rows = n_sums, .group_rows = n_sums, .min_chunk = 1, .deps = 1u << 2 },
+    };
+    ds4_pool_run_stages(stages, 4);
 }
 
 static void layer_attention_mixed_one_decode_scratch(
@@ -16801,8 +16866,8 @@ static void layer_attention_mixed_one_decode_scratch(
     if (n_raw + n_comp > scratch->attn_score_cap) ds4_die("CPU decode attention score scratch buffer is too small");
     layer_attention_lanes(out_heads, tensor_data(model, layer->attn_sinks), q,
                           raw_kv, n_raw, comp_kv, n_comp, comp_allowed,
-                          scratch->attn_qt, scratch->attn_rows, scratch->attn_score, scratch->attn_inv,
-                          scratch->attn_score_cap);
+                          scratch->attn_qt, scratch->attn_rows, scratch->attn_score, scratch->attn_cmax,
+                          scratch->attn_inv, scratch->attn_score_cap);
 }
 
 typedef struct {
@@ -16833,7 +16898,7 @@ static inline bool attention_prefix_comp_allowed(
 
 /* One item is a head group of the tokens p and n_tok-1-p: a token's window
  * grows with its position, so pairing the ends hands a static split about
- * the same number of rows per thread.  Each token runs the three lane passes
+ * the same number of rows per thread.  Each token runs the four lane stages
  * on the worker's own scratch, the same sequence per (token, head) as the
  * decode kernel, so the rows match the per-token attention bitwise. */
 static void layer_attention_prefix_batch_worker(void *vctx, uint64_t i0, uint64_t i1) {
@@ -16843,14 +16908,17 @@ static void layer_attention_prefix_batch_worker(void *vctx, uint64_t i0, uint64_
     const uint32_t n_groups = (n_head + 15) / 16;
     const uint32_t max_comp = ctx->comp_counts ? ctx->comp_counts[ctx->n_tok - 1] : 0;
     const uint32_t max_total = ctx->raw_cap + max_comp;
+    const uint32_t max_chunks = (max_total + ATTN_LANES_ROWS_PER_ITEM - 1) / ATTN_LANES_ROWS_PER_ITEM;
     const float **rows = xmalloc((size_t)max_total * sizeof(rows[0]));
     float *qt = xmalloc((size_t)16 * head_dim * sizeof(qt[0]));
     float *score = xmalloc((size_t)16 * max_total * sizeof(score[0]));
+    float *cmax = xmalloc((size_t)16 * (max_chunks ? max_chunks : 1) * sizeof(cmax[0]));
     float inv[16];
     layer_attention_lanes_ctx lanes = {
         .qt = qt,
         .rows = rows,
         .score = score,
+        .cmax = cmax,
         .inv = inv,
         .score_stride = max_total,
         .n_dim_chunks = (head_dim + 15) / 16,
@@ -16881,11 +16949,13 @@ static void layer_attention_prefix_batch_worker(void *vctx, uint64_t i0, uint64_
             lanes.n_chunks = (n_rows + ATTN_LANES_ROWS_PER_ITEM - 1) / ATTN_LANES_ROWS_PER_ITEM;
             attn_lanes_transpose_q(qt, lanes.q, lanes.n_head, head_dim);
             attn_lanes_score_worker(&lanes, 0, lanes.n_chunks);
-            attn_lanes_weight_worker(&lanes, 0, lanes.n_head);
+            attn_lanes_weight_worker(&lanes, 0, lanes.n_chunks);
+            attn_lanes_denom_worker(&lanes, 0, 1);
             attn_lanes_sum_worker(&lanes, 0, lanes.n_dim_chunks);
         }
     }
 
+    free(cmax);
     free(score);
     free(qt);
     free(rows);
@@ -17471,10 +17541,10 @@ static void layer_attention_raw_swa_batch(
  * Staged decode attention sublayer.
  * =========================================================================
  *
- * The plain decode attention side of a layer is eleven pool dispatches with
+ * The plain decode attention side of a layer is nine pool dispatches with
  * serial glue between them (the HC mix, the fused q_a/kv/compressor
- * projection, q_b, the three lane passes, the grouped output projection a
- * and b, plus three indexer dispatches on ratio-4 layers past the top-k
+ * projection, q_b, the staged lane attention, the grouped output projection
+ * a and b, plus three indexer dispatches on ratio-4 layers past the top-k
  * window).  Here the whole sublayer is one staged dispatch
  * (ds4_pool_run_stages), each stage waiting only on the stages it reads:
  *
@@ -17489,13 +17559,15 @@ static void layer_attention_raw_swa_batch(
  *   5  indexer head weights (F16)   after 0 (ratio-4 layers past top-k only)
  *   6  indexer query (F16)          after 1, then RoPE, QAT and transpose
  *   7  indexer scores               after 2, 5, 6, then top-k and the row list
- *   8  attention scores             after 2, 4, 7
- *   9  softmax weights              after 8
- *  10  weighted sums                after 9
- *  11  output tail (head groups)    after 10: inverse RoPE and quantization
- *  12  output projection a          after 11, then the low-rank quantization
- *  13  output projection b          after 12
- *  14  HC post                      after 13 (without steering)
+ *   8  attention scores             after 2, 4, 7, with the chunk maxima
+ *   9  softmax weights              after 8 (the head maxima from the chunk
+ *                                   maxima, as layer_attention_lanes() does)
+ *  10  softmax denominators         after 9
+ *  11  weighted sums                after 10
+ *  12  output tail (head groups)    after 11: inverse RoPE and quantization
+ *  13  output projection a          after 12, then the low-rank quantization
+ *  14  output projection b          after 13
+ *  15  HC post                      after 14 (without steering)
  *
  * Every row of every stage runs the kernel the plain dispatch runs on the
  * same inputs, the serial steps are the same functions on the same data, and
@@ -17847,6 +17919,7 @@ static void layer_attention_graph(
         .qt = scratch->attn_qt,
         .rows = scratch->attn_rows,
         .score = scratch->attn_score,
+        .cmax = scratch->attn_cmax,
         .inv = scratch->attn_inv,
         .n_head = n_head,
         .score_stride = scratch->attn_score_cap,
@@ -17880,7 +17953,7 @@ static void layer_attention_graph(
     const uint64_t n_score = (uint64_t)head_groups * g.lanes.n_chunks;
     const uint64_t n_sum = (uint64_t)head_groups * g.lanes.n_dim_chunks;
     void (*mark)(void *) = g.profile ? attn_graph_mark : NULL;
-    ds4_pool_stage stages[15] = {
+    ds4_pool_stage stages[16] = {
         { .fn = matvec_f16_group_worker, .ctx = &g.hc_mix,
           .n_rows = n_mix_groups, .group_rows = n_mix_groups,
           .finish = attn_graph_hc_pre, .finish_ctx = &g },
@@ -17907,23 +17980,25 @@ static void layer_attention_graph(
         { .fn = attn_lanes_score_worker, .ctx = &g.lanes,
           .n_rows = n_score, .group_rows = n_score, .deps = (1u << 2) | (1u << 4) | (1u << 7) },
         { .fn = attn_lanes_weight_worker, .ctx = &g.lanes,
-          .n_rows = n_head, .group_rows = n_head, .deps = 1u << 8 },
+          .n_rows = n_score, .group_rows = n_score, .deps = 1u << 8 },
+        { .fn = attn_lanes_denom_worker, .ctx = &g.lanes,
+          .n_rows = head_groups, .group_rows = head_groups, .deps = 1u << 9 },
         { .fn = attn_lanes_sum_worker, .ctx = &g.lanes,
           .n_rows = n_sum, .group_rows = n_sum,
-          .deps = 1u << 9, .finish = mark, .finish_ctx = &g.mark[3] },
+          .deps = 1u << 10, .finish = mark, .finish_ctx = &g.mark[3] },
         { .fn = attn_graph_out_tail_worker, .ctx = &g,
-          .n_rows = DS4_N_OUT_GROUP, .group_rows = DS4_N_OUT_GROUP, .deps = 1u << 10 },
+          .n_rows = DS4_N_OUT_GROUP, .group_rows = DS4_N_OUT_GROUP, .deps = 1u << 11 },
         { .fn = matvec_q8_0_grouped_worker, .ctx = &g.out_a,
           .n_rows = low_dim, .group_rows = low_dim,
-          .deps = 1u << 11, .finish = attn_graph_out_low, .finish_ctx = &g },
+          .deps = 1u << 12, .finish = attn_graph_out_low, .finish_ctx = &g },
         { .fn = matvec_q8_0_worker, .ctx = &g.out_b,
           .n_rows = DS4_N_EMBD, .group_rows = DS4_N_EMBD,
-          .deps = 1u << 12, .finish = mark, .finish_ctx = &g.mark[4] },
+          .deps = 1u << 13, .finish = mark, .finish_ctx = &g.mark[4] },
         /* Light elementwise work: claims of 256 columns. */
         { .fn = attn_graph_post_worker, .ctx = &g,
-          .n_rows = DS4_N_EMBD, .group_rows = DS4_N_EMBD, .min_chunk = 256, .deps = 1u << 13 },
+          .n_rows = DS4_N_EMBD, .group_rows = DS4_N_EMBD, .min_chunk = 256, .deps = 1u << 14 },
     };
-    ds4_pool_run_stages(stages, fold_post ? 15 : 14);
+    ds4_pool_run_stages(stages, fold_post ? 16 : 15);
     if (!fold_post) {
         cpu_directional_steering_project_rows(scratch->attn_out, steering_dirs, il, 1, steering_attn_scale);
         hc_post_one(scratch->after_attn_hc, scratch->attn_out, inp_hc, g.post, g.comb, DS4_N_EMBD, DS4_N_HC);
