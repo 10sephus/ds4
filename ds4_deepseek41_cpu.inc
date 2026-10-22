@@ -154,6 +154,23 @@ static void ds41_cpu_hc_expand(float *out, const float *block,
     ds41_cpu_bf16_rows(out, 4u * 5120u);
 }
 
+/* The HC post after attention and the FFN input: after = the expanded HC
+ * state, x = its BF16 sum with the attention mixer's pre weights, norm = the
+ * FFN norm of x.  Staged, the first two run per column. */
+typedef struct {
+    const ds4_model *m;
+    const ds4_tensor *norm_weight;
+    const float *block, *residual, *split;
+    float *after, *x, *norm;
+} ds41_cpu_hc_post_job;
+
+static bool ds41_cpu_hc_post_run(const ds41_cpu_hc_post_job *j) {
+    ds41_cpu_hc_expand(j->after, j->block, j->residual, j->split);
+    ds41_cpu_hc_sum(j->x, j->after, j->split);
+    return ds41_cpu_norm(j->norm, j->x, j->m, j->norm_weight);
+}
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
 /* ds41_cpu_hc_expand() for the columns [d0, d1): per element the products
  * and sums of hc_post_one() in its order, then the BF16 rounding. */
 static void ds41_cpu_hc_expand_cols(float *out, const float *block,
@@ -171,22 +188,6 @@ static void ds41_cpu_hc_expand_cols(float *out, const float *block,
     }
 }
 
-/* The HC post after attention and the FFN input: after = the expanded HC
- * state, x = its BF16 sum with the attention mixer's pre weights, norm = the
- * FFN norm of x.  Staged, the first two run per column. */
-typedef struct {
-    const ds4_model *m;
-    const ds4_tensor *norm_weight;
-    const float *block, *residual, *split;
-    float *after, *x, *norm;
-} ds41_cpu_hc_post_job;
-
-static bool ds41_cpu_hc_post_run(const ds41_cpu_hc_post_job *j) {
-    ds41_cpu_hc_expand(j->after, j->block, j->residual, j->split);
-    ds41_cpu_hc_sum(j->x, j->after, j->split);
-    return ds41_cpu_norm(j->norm, j->x, j->m, j->norm_weight);
-}
-
 /* Per element hc_weighted_sum_one(): the streams in order from 0.0f. */
 static void ds41_cpu_hc_post_worker(void *vctx, uint64_t d0, uint64_t d1) {
     const ds41_cpu_hc_post_job *j = vctx;
@@ -202,6 +203,7 @@ static void ds41_cpu_hc_post_norm(void *vctx) {
     const ds41_cpu_hc_post_job *j = vctx;
     ds41_cpu_norm(j->norm, j->x, j->m, j->norm_weight);
 }
+#endif
 
 #include "ds4_deepseek41_cpu_attention.inc"
 
