@@ -39,6 +39,7 @@
 #endif
 #if defined(__linux__)
 #include <sched.h>
+#include <sys/syscall.h>
 #endif
 #include <stdarg.h>
 #include <time.h>
@@ -3829,8 +3830,178 @@ static const void *tensor_data(const ds4_model *m, const ds4_tensor *t) {
     return m->map + t->abs_offset;
 }
 
-/* Optional startup pass that touches tensor pages before timing generation. */
-static void model_warm_weights(const ds4_model *m) {
+#if defined(__linux__)
+#define DS4_MPOL_MF_MOVE 2   /* <numaif.h> is not always installed */
+
+typedef struct {
+    uint64_t start;   /* file byte range; a page belongs to the range that holds its first byte */
+    uint64_t end;
+    int node;         /* target NUMA node, or -1: touch only */
+} ds4_place_range;
+
+typedef struct {
+    const ds4_model *m;
+    const ds4_place_range *ranges;
+    uint64_t page;
+    uint64_t pages_ok;       /* on their node after the move */
+    uint64_t pages_eacces;   /* also mapped by another process: an unprivileged move is refused */
+    uint64_t pages_failed;
+} ds4_place_ctx;
+
+static int ds4_place_range_cmp(const void *va, const void *vb) {
+    const ds4_place_range *a = va, *b = vb;
+    if (a->start != b->start) return a->start < b->start ? -1 : 1;
+    return a->end < b->end ? -1 : a->end > b->end;
+}
+
+/* Fault the pages of each range in (a first touch from a node-pinned worker
+ * already lands them locally) and migrate the rest with move_pages(2), which
+ * moves page-cache pages of a private read-only mapping in place as long as
+ * no other process maps them; pages already on the node are a cheap no-op.
+ * Ranges come in pairs (node 0, node 1), so the grouped dispatch hands each
+ * node's workers their own halves. */
+static void ds4_place_worker(void *vctx, uint64_t i0, uint64_t i1) {
+    ds4_place_ctx *ctx = vctx;
+    const uint8_t *map = ctx->m->map;
+    const uint64_t page = ctx->page;
+    enum { BATCH = 8192 };   /* 32 MiB per syscall */
+    void **addrs = xmalloc(BATCH * sizeof(*addrs));
+    int *nodes = xmalloc(BATCH * sizeof(*nodes));
+    int *status = xmalloc(BATCH * sizeof(*status));
+    uint64_t ok = 0, eacces = 0, failed = 0;
+    volatile uint8_t sink = 0;
+    for (uint64_t i = i0; i < i1; i++) {
+        const ds4_place_range *r = &ctx->ranges[i];
+        const uint64_t p1 = (r->end + page - 1) / page;
+        for (uint64_t p0 = (r->start + page - 1) / page; p0 < p1; p0 += BATCH) {
+            const uint64_t n = p1 - p0 < BATCH ? p1 - p0 : BATCH;
+            for (uint64_t k = 0; k < n; k++) {
+                addrs[k] = (void *)(map + (p0 + k) * page);
+                sink += *(const uint8_t *)addrs[k];
+                nodes[k] = r->node;
+            }
+            if (r->node < 0) continue;
+            if (syscall(SYS_move_pages, 0, n, addrs, nodes, status, DS4_MPOL_MF_MOVE) < 0) {
+                failed += n;
+                continue;
+            }
+            for (uint64_t k = 0; k < n; k++) {
+                if (status[k] >= 0) ok++;
+                else if (status[k] == -EACCES) eacces++;
+                else failed++;
+            }
+        }
+    }
+    (void)sink;
+    __atomic_fetch_add(&ctx->pages_ok, ok, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&ctx->pages_eacces, eacces, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&ctx->pages_failed, failed, __ATOMIC_RELAXED);
+    free(addrs);
+    free(nodes);
+    free(status);
+}
+
+static uint64_t ds4_node_free_bytes(int node) {
+    char path[80], line[128];
+    snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/meminfo", node);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    unsigned long long kb = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (sscanf(line, "Node %*d MemFree: %llu kB", &kb) == 1) break;
+    }
+    fclose(f);
+    return kb * 1024;
+}
+
+/* Spread the weights between the two NUMA nodes the way the pool's cursors
+ * read them: rows [0, n/2) of every dense 2D tensor on node 0 and the rest
+ * on node 1, per expert for the 3D expert tensors when asked.  The pages
+ * are migrated inside the page cache, so the mapping stays the mmap'ed
+ * GGUF; everything else (token_embd, 1D tensors, unplaced experts) is only
+ * touched, as the plain warm pass does.  Placement only changes which
+ * memory controller serves a read: every row is still computed by one
+ * thread with the same kernel, so results cannot depend on it. */
+static void model_place_weights(const ds4_model *m, bool experts) {
+    const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+    uint64_t n = 0, expert_bytes = 0;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *t = &m->tensors[i];
+        if (t->bytes == 0 || t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) continue;
+        n += 2 * (t->ndim == 3 ? t->dim[2] : 1);
+        if (t->ndim == 3) expert_bytes += t->bytes;
+    }
+    if (n == 0) return;
+    for (int node = 0; experts && node < 2; node++) {
+        const uint64_t avail = ds4_node_free_bytes(node);
+        if (avail < expert_bytes / 2) {
+            fprintf(stderr, "ds4: NUMA: node %d has %.1f GiB free, the expert half needs %.1f GiB; "
+                            "placing the dense weights only\n",
+                    node, (double)avail / (1024.0 * 1024.0 * 1024.0),
+                    (double)(expert_bytes / 2) / (1024.0 * 1024.0 * 1024.0));
+            experts = false;
+        }
+    }
+
+    ds4_place_range *ranges = xmalloc(n * sizeof(*ranges));
+    uint64_t placed[2] = {0, 0};
+    n = 0;
+    for (uint64_t i = 0; i < m->n_tensors; i++) {
+        const ds4_tensor *t = &m->tensors[i];
+        if (t->bytes == 0 || t->abs_offset > m->size || t->bytes > m->size - t->abs_offset) continue;
+        const uint64_t slices = t->ndim == 3 ? t->dim[2] : 1;
+        const uint64_t slice_bytes = t->bytes / slices;
+        const bool place = t->ndim == 3 ? experts :
+                           t->ndim == 2 && !ds4_streq(t->name, "token_embd.weight");
+        const uint64_t half = place ? (t->dim[1] / 2) * (slice_bytes / t->dim[1]) : slice_bytes / 2;
+        for (uint64_t s = 0; s < slices; s++) {
+            const uint64_t start = t->abs_offset + s * slice_bytes;
+            ranges[n++] = (ds4_place_range){start, start + half, place ? 0 : -1};
+            ranges[n++] = (ds4_place_range){start + half, start + slice_bytes, place ? 1 : -1};
+            if (place) {
+                placed[0] += half;
+                placed[1] += slice_bytes - half;
+            }
+        }
+    }
+    /* Close the 32-byte alignment gaps so that every page from the first
+     * tensor to the end of the weights has exactly one owner. */
+    qsort(ranges, n, sizeof(*ranges), ds4_place_range_cmp);
+    for (uint64_t i = 0; i + 1 < n; i++) ranges[i].end = ranges[i + 1].start;
+    ranges[n - 1].end = m->size;
+    ranges[0].start = ranges[0].start / page * page;
+
+    fprintf(stderr, "ds4: NUMA: placing %.2f GiB on node 0 and %.2f GiB on node 1, touching %.2f GiB\n",
+            (double)placed[0] / (1024.0 * 1024.0 * 1024.0),
+            (double)placed[1] / (1024.0 * 1024.0 * 1024.0),
+            (double)(m->size - ranges[0].start - placed[0] - placed[1]) / (1024.0 * 1024.0 * 1024.0));
+    ds4_place_ctx ctx = { .m = m, .ranges = ranges, .page = page };
+    const double t0 = now_sec();
+    ds4_parallel_for_grouped(n, ds4_place_worker, &ctx, 2);
+    const double pages = (double)(ctx.pages_ok + ctx.pages_eacces + ctx.pages_failed);
+    fprintf(stderr, "ds4: NUMA: placed in %.3fs: %.1f%% of the pages on their node, "
+                    "%.1f%% EACCES (mapped by another process), %llu failed\n",
+            now_sec() - t0, 100.0 * (double)ctx.pages_ok / (pages > 0 ? pages : 1),
+            100.0 * (double)ctx.pages_eacces / (pages > 0 ? pages : 1),
+            (unsigned long long)ctx.pages_failed);
+    free(ranges);
+}
+#endif
+
+/* Optional startup pass that touches tensor pages before timing generation;
+ * on a two-node CPU host it also places them (see model_place_weights). */
+static void model_warm_weights(const ds4_model *m, ds4_numa_place place) {
+#if defined(__linux__)
+    if (place != DS4_NUMA_PLACE_NONE) {
+        ds4_threads_init();   /* probes the topology and pins the workers */
+        if (g_numa.on) {
+            model_place_weights(m, place == DS4_NUMA_PLACE_ALL);
+            return;
+        }
+    }
+#else
+    (void)place;
+#endif
     const uint64_t start = m->tensor_data_pos;
     const uint64_t end = m->size;
     if (start >= end) return;
@@ -61426,6 +61597,14 @@ const char *ds4_backend_name(ds4_backend backend) {
     return "unknown";
 }
 
+bool ds4_numa_place_parse(const char *name, ds4_numa_place *out) {
+    if (!strcmp(name, "dense")) *out = DS4_NUMA_PLACE_DENSE;
+    else if (!strcmp(name, "none")) *out = DS4_NUMA_PLACE_NONE;
+    else if (!strcmp(name, "all")) *out = DS4_NUMA_PLACE_ALL;
+    else return false;
+    return true;
+}
+
 static void ds4_linux_graph_backend_set_oom_score(ds4_backend backend) {
 #if defined(__linux__) && !defined(DS4_NO_GPU)
     static bool attempted = false;
@@ -72458,7 +72637,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
     }
     if (engine_warm_full_model(opt) &&
         (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41 || e->backend == DS4_BACKEND_CPU))
-        model_warm_weights(&e->model);
+        model_warm_weights(&e->model, e->backend == DS4_BACKEND_CPU ? opt->numa_place :
+                                                                       DS4_NUMA_PLACE_NONE);
     if (opt->vision_path && opt->vision_path[0]) {
         if (!ds4_model_is_glm53() && !g_ds4_flash_vision_exp && !ds4_model_is_qwen4() &&
             DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41) {
@@ -72655,7 +72835,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
-        if (engine_warm_full_model(opt)) model_warm_weights(&e->model);
+        if (engine_warm_full_model(opt)) model_warm_weights(&e->model, DS4_NUMA_PLACE_NONE);
     }
 #endif
     if (ds4_model_is_qwen4()) {

@@ -2200,6 +2200,11 @@ static cli_config parse_options(int argc, char **argv) {
             c.inspect = true;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
+        } else if (!strcmp(arg, "--numa-place")) {
+            if (!ds4_numa_place_parse(need_arg(&i, argc, argv, arg), &c.engine.numa_place)) {
+                fprintf(stderr, "ds4: --numa-place must be dense, none or all\n");
+                exit(2);
+            }
         } else if (!strcmp(arg, "--server")) {
             fprintf(stderr, "ds4: use ds4-server for the HTTP server\n");
             exit(2);

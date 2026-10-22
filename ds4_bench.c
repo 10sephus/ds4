@@ -64,6 +64,7 @@ typedef struct {
     ds4_dist_options dist;
     ds4_tp_options tp;
     bool warm_weights;
+    ds4_numa_place numa_place;
     bool quality;
     bool ssd_streaming;
     bool ssd_streaming_cold;
@@ -374,6 +375,11 @@ static bench_config parse_options(int argc, char **argv) {
             }
         } else if (!strcmp(arg, "--warm-weights")) {
             c.warm_weights = true;
+        } else if (!strcmp(arg, "--numa-place")) {
+            if (!ds4_numa_place_parse(need_arg(&i, argc, argv, arg), &c.numa_place)) {
+                fprintf(stderr, "ds4-bench: --numa-place must be dense, none or all\n");
+                exit(2);
+            }
         } else if (!strcmp(arg, "--show-output")) {
             c.show_output = true;
         } else if (!strcmp(arg, "--teacher-forced-decode")) {
@@ -697,6 +703,7 @@ int main(int argc, char **argv) {
         .simulate_used_memory_bytes = cfg.simulate_used_memory_bytes,
         .power_percent = cfg.power_percent,
         .warm_weights = cfg.warm_weights,
+        .numa_place = cfg.numa_place,
         .quality = cfg.quality,
         .dspark = cfg.dspark,
         .dspark_confidence_threshold = cfg.dspark_confidence_threshold,

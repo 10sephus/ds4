@@ -128,6 +128,16 @@ typedef struct {
     int debug_hash;             /* cross-check hidden state every N tokens */
 } ds4_tp_options;
 
+/* Where --warm-weights leaves the pages on a two-NUMA-node CPU host.  The
+ * CPU pool reads rows [0, n/2) of every matrix from node-0 threads and the
+ * rest from node-1 threads, so a half placed on its node streams from local
+ * memory. */
+typedef enum {
+    DS4_NUMA_PLACE_DENSE = 0,   /* the dense weights read every token */
+    DS4_NUMA_PLACE_NONE,        /* touch only */
+    DS4_NUMA_PLACE_ALL,         /* dense weights and routed experts */
+} ds4_numa_place;
+
 typedef struct {
     const char *model_path;
     const char *mtp_path;
@@ -150,6 +160,7 @@ typedef struct {
     uint32_t ssd_streaming_preload_experts;
     uint64_t simulate_used_memory_bytes;
     bool warm_weights;
+    ds4_numa_place numa_place;  /* with warm_weights on the CPU backend */
     bool quality;
     bool glm_mtp;
     bool glm_mtp_timing;
@@ -311,6 +322,7 @@ bool ds4_engine_is_qwen4(ds4_engine *e);
 /* Qwen3.8 reasoning-effort system instruction for a think mode (NULL when none) */
 const char *ds4_qwen4_reasoning_effort_text(ds4_think_mode mode);
 const char *ds4_backend_name(ds4_backend backend);
+bool ds4_numa_place_parse(const char *name, ds4_numa_place *out);
 bool ds4_think_mode_enabled(ds4_think_mode mode);
 int ds4_think_mode_level(ds4_think_mode mode);
 bool ds4_think_mode_parse_level(const char *text, ds4_think_mode *out);

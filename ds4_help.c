@@ -198,6 +198,7 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
         opt(fp, c, "--quality", "Prefer exact kernels where faster approximate paths exist.");
         opt(fp, c, "--warm-weights", "Touch resident weights at startup to reduce first-use stalls.");
         if (tool == DS4_HELP_DS4 || tool == DS4_HELP_BENCH) {
+            opt(fp, c, "--numa-place MODE", "With --warm-weights on a two-NUMA-node CPU host: migrate the dense weights (dense, default), also the routed experts (all), or only touch (none).");
             opt(fp, c, "--expert-profile FILE", "Metal-only: write routed expert locality/cache simulation JSON.");
         }
     }
