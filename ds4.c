@@ -1519,6 +1519,37 @@ static void *xmalloc_zeroed(size_t n, size_t size) {
     return p;
 }
 
+/* Batched CPU prefill runs the same buffer shapes layer after layer.  Its big
+ * buffers live in these slots for the whole prefill instead of being mapped
+ * and freed once per layer: a fresh mapping takes a page fault per 4 KB on
+ * first touch, which made the projections writing them about twice as slow.
+ * Only the main thread uses the slots (prefill runs one batch at a time), and
+ * no two live buffers share a slot.  Contents are not preserved on growth. */
+enum {
+    PF_ATTN_CUR, PF_ATTN_NORM, PF_ATTN_RESIDUAL, PF_QR, PF_QR_NORM, PF_Q,
+    PF_KV_RAW, PF_KV, PF_HEADS, PF_ATTN_OUT,
+    PF_FFN_CUR, PF_FFN_NORM, PF_MOE, PF_SHARED,
+    PF_SH_GATE, PF_SH_UP, PF_SH_MID,
+    PF_MOE_XQ, PF_MOE_XQ_IQ2, PF_MOE_MID, PF_MOE_MIDQ, PF_MOE_DOWN,
+    PF_BUF_COUNT
+};
+
+static struct { void *p; size_t n; } g_pf_buf[PF_BUF_COUNT];
+
+static void *pf_buf(unsigned slot, size_t bytes) {
+    if (g_pf_buf[slot].n < bytes) {
+        free(g_pf_buf[slot].p);
+        g_pf_buf[slot].p = xmalloc(bytes);
+        g_pf_buf[slot].n = bytes;
+    }
+    return g_pf_buf[slot].p;
+}
+
+static void pf_bufs_free(void) {
+    for (unsigned i = 0; i < PF_BUF_COUNT; i++) free(g_pf_buf[i].p);
+    memset(g_pf_buf, 0, sizeof(g_pf_buf));
+}
+
 static double now_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -12548,8 +12579,8 @@ static void moe_grouped_ffn(
 
     /* The x16 kernels read the interleaved tiles; the lanes they do not
      * serve go through the pair kernel, which wants its own row layout. */
-    block_q8_K *xq = xmalloc((size_t)n_tok * nb_in * sizeof(xq[0]));
-    iq2xxs_q8 *xq_iq2 = xmalloc((size_t)n_tok * nb_in * sizeof(xq_iq2[0]));
+    block_q8_K *xq = pf_buf(PF_MOE_XQ, (size_t)n_tok * nb_in * sizeof(xq[0]));
+    iq2xxs_q8 *xq_iq2 = pf_buf(PF_MOE_XQ_IQ2, (size_t)n_tok * nb_in * sizeof(xq_iq2[0]));
     quantize_q8_k_rows_ctx xq_ctx = { .x = norm, .xq = xq, .iq2 = xq_iq2, .dim = in_dim, .blocks = nb_in };
     ds4_parallel_for_min_rows(n_tok, quantize_q8_k_rows_worker, &xq_ctx, 1);
 
@@ -12596,7 +12627,7 @@ static void moe_grouped_ffn(
     moe_tiles_load_ctx load_ctx = { .tiles = tiles, .rows = xq, .iq2_rows = xq_iq2, .nb = nb_in, .pairs_per_row = n_used };
     ds4_parallel_for_min_rows(n_tiles, moe_tiles_load_worker, &load_ctx, 1);
 
-    float *mid = xmalloc((size_t)total_pairs * mid_dim * sizeof(mid[0]));
+    float *mid = pf_buf(PF_MOE_MID, (size_t)total_pairs * mid_dim * sizeof(mid[0]));
     moe_mid_tile_ctx mid_ctx = {
         .mid = mid,
         .tiles = tiles,
@@ -12611,19 +12642,16 @@ static void moe_grouped_ffn(
         .clamp = clamp,
     };
     ds4_parallel_for_min_rows((uint64_t)n_tiles * mid_ctx.n_row_blocks, moe_mid_tile_worker, &mid_ctx, 1);
-    free(xq_iq2);
-    free(xq);
 
     /* Down over the requantized mids, one Q8_K row per pair. */
-    block_q8_K *midq = xmalloc((size_t)total_pairs * nb_mid * sizeof(midq[0]));
+    block_q8_K *midq = pf_buf(PF_MOE_MIDQ, (size_t)total_pairs * nb_mid * sizeof(midq[0]));
     quantize_q8_k_rows_ctx midq_ctx = { .x = mid, .xq = midq, .dim = mid_dim, .blocks = nb_mid };
     ds4_parallel_for_min_rows(total_pairs, quantize_q8_k_rows_worker, &midq_ctx, 1);
-    free(mid);
 
     load_ctx = (moe_tiles_load_ctx){ .tiles = tiles, .rows = midq, .nb = nb_mid, .pairs_per_row = 1 };
     ds4_parallel_for_min_rows(n_tiles, moe_tiles_load_worker, &load_ctx, 1);
 
-    float *down_pair = xmalloc((size_t)total_pairs * out_dim * sizeof(down_pair[0]));
+    float *down_pair = pf_buf(PF_MOE_DOWN, (size_t)total_pairs * out_dim * sizeof(down_pair[0]));
     moe_down_tile_ctx down_ctx = {
         .down_pair = down_pair,
         .tiles = tiles,
@@ -12634,7 +12662,6 @@ static void moe_grouped_ffn(
         .n_row_blocks = (uint32_t)((out_dim + DS4_MOE_ROW_BLOCK - 1) / DS4_MOE_ROW_BLOCK),
     };
     ds4_parallel_for_min_rows((uint64_t)n_tiles * down_ctx.n_row_blocks, moe_down_tile_worker, &down_ctx, 1);
-    free(midq);
     free(tile_bs);
     free(tile_d);
     free(tile_q);
@@ -12642,7 +12669,6 @@ static void moe_grouped_ffn(
 
     sum_down_pairs_ctx sum_ctx = { .moe = moe, .down_pair = down_pair, .n_tok = n_tok, .out_dim = out_dim };
     ds4_parallel_for((uint64_t)n_tok * out_dim, sum_down_pairs_worker, &sum_ctx);
-    free(down_pair);
 }
 
 /* =========================================================================
@@ -14173,9 +14199,9 @@ static void layer_shared_ffn_batch(
         ds4_die("shared expert tensors do not share the expected Q8_0 layout");
     }
 
-    float *gate = xmalloc((size_t)n_tok * hidden * sizeof(gate[0]));
-    float *up = xmalloc((size_t)n_tok * hidden * sizeof(up[0]));
-    float *mid = xmalloc((size_t)n_tok * hidden * sizeof(mid[0]));
+    float *gate = pf_buf(PF_SH_GATE, (size_t)n_tok * hidden * sizeof(gate[0]));
+    float *up = pf_buf(PF_SH_UP, (size_t)n_tok * hidden * sizeof(up[0]));
+    float *mid = pf_buf(PF_SH_MID, (size_t)n_tok * hidden * sizeof(mid[0]));
 
     matmul_q8_0_pair_batch(gate, up, model,
                            layer->ffn_gate_shexp,
@@ -14193,10 +14219,6 @@ static void layer_shared_ffn_batch(
     ds4_parallel_for(n_tok, swiglu_batch_worker, &swiglu_ctx);
 
     matmul_q8_0_batch(out, model, layer->ffn_down_shexp, mid, n_tok);
-
-    free(mid);
-    free(up);
-    free(gate);
 }
 
 /* Early DS4 layers use token-id hash routing instead of top-k routing. */
@@ -15278,10 +15300,10 @@ static void layer_ffn_shared_batch(
     double t_shared = 0.0;
     double t_post = 0.0;
     const uint32_t n_hc = DS4_N_HC;
-    float *ffn_cur = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(ffn_cur[0]));
-    float *norm = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(norm[0]));
-    float *moe = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(moe[0]));
-    float *shared = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(shared[0]));
+    float *ffn_cur = pf_buf(PF_FFN_CUR, (size_t)n_tok * DS4_N_EMBD * sizeof(ffn_cur[0]));
+    float *norm = pf_buf(PF_FFN_NORM, (size_t)n_tok * DS4_N_EMBD * sizeof(norm[0]));
+    float *moe = pf_buf(PF_MOE, (size_t)n_tok * DS4_N_EMBD * sizeof(moe[0]));
+    float *shared = pf_buf(PF_SHARED, (size_t)n_tok * DS4_N_EMBD * sizeof(shared[0]));
     float *post = xmalloc((size_t)n_tok * n_hc * sizeof(post[0]));
     float *comb = xmalloc((size_t)n_tok * n_hc * n_hc * sizeof(comb[0]));
     const bool routed_grouped =
@@ -15353,10 +15375,6 @@ static void layer_ffn_shared_batch(
 
     free(comb);
     free(post);
-    free(shared);
-    free(moe);
-    free(norm);
-    free(ffn_cur);
 }
 
 typedef struct {
@@ -16895,17 +16913,17 @@ static void layer_attention_raw_swa_batch(
     const uint64_t hc_dim = (uint64_t)n_hc * DS4_N_EMBD;
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
 
-    float *attn_cur = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(attn_cur[0]));
-    float *attn_norm = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(attn_norm[0]));
-    float *attn_residual = xmalloc((size_t)n_tok * hc_dim * sizeof(attn_residual[0]));
+    float *attn_cur = pf_buf(PF_ATTN_CUR, (size_t)n_tok * DS4_N_EMBD * sizeof(attn_cur[0]));
+    float *attn_norm = pf_buf(PF_ATTN_NORM, (size_t)n_tok * DS4_N_EMBD * sizeof(attn_norm[0]));
+    float *attn_residual = pf_buf(PF_ATTN_RESIDUAL, (size_t)n_tok * hc_dim * sizeof(attn_residual[0]));
     const uint32_t q_rank = DS4_N_LORA_Q;
-    float *qr = xmalloc((size_t)n_tok * q_rank * sizeof(qr[0]));
-    float *qr_norm = xmalloc((size_t)n_tok * q_rank * sizeof(qr_norm[0]));
-    float *q = xmalloc((size_t)n_tok * q_dim * sizeof(q[0]));
-    float *kv_raw = xmalloc((size_t)n_tok * DS4_N_HEAD_DIM * sizeof(kv_raw[0]));
-    float *kv = xmalloc((size_t)n_tok * DS4_N_HEAD_DIM * sizeof(kv[0]));
-    float *heads = xmalloc((size_t)n_tok * q_dim * sizeof(heads[0]));
-    float *attn_out = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(attn_out[0]));
+    float *qr = pf_buf(PF_QR, (size_t)n_tok * q_rank * sizeof(qr[0]));
+    float *qr_norm = pf_buf(PF_QR_NORM, (size_t)n_tok * q_rank * sizeof(qr_norm[0]));
+    float *q = pf_buf(PF_Q, (size_t)n_tok * q_dim * sizeof(q[0]));
+    float *kv_raw = pf_buf(PF_KV_RAW, (size_t)n_tok * DS4_N_HEAD_DIM * sizeof(kv_raw[0]));
+    float *kv = pf_buf(PF_KV, (size_t)n_tok * DS4_N_HEAD_DIM * sizeof(kv[0]));
+    float *heads = pf_buf(PF_HEADS, (size_t)n_tok * q_dim * sizeof(heads[0]));
+    float *attn_out = pf_buf(PF_ATTN_OUT, (size_t)n_tok * DS4_N_EMBD * sizeof(attn_out[0]));
     float *post = xmalloc((size_t)n_tok * n_hc * sizeof(post[0]));
     float *comb = xmalloc((size_t)n_tok * n_hc * n_hc * sizeof(comb[0]));
 
@@ -17117,16 +17135,6 @@ static void layer_attention_raw_swa_batch(
     free(comp_counts);
     free(comb);
     free(post);
-    free(attn_out);
-    free(heads);
-    free(kv);
-    free(kv_raw);
-    free(q);
-    free(qr_norm);
-    free(qr);
-    free(attn_residual);
-    free(attn_norm);
-    free(attn_cur);
 }
 
 /* Full transformer layer for one decode token: attention sublayer followed by
@@ -17513,6 +17521,7 @@ static void prefill_layer_major_cpu(
     free(next);
     free(cur);
     free(attn);
+    pf_bufs_free();
 }
 
 /* Diagnostic first-token layer without cache history: the token attends only
