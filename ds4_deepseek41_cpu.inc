@@ -143,6 +143,66 @@ static bool ds41_cpu_f16_shape(const ds4_tensor *t, uint64_t in_dim, uint64_t ro
 }
 #endif
 
+static void ds41_cpu_hc_sum(float *out, const float *residual, const float *pre) {
+    hc_weighted_sum_one(out, residual, pre, 5120, 4);
+    ds41_cpu_bf16_rows(out, 5120);
+}
+
+static void ds41_cpu_hc_expand(float *out, const float *block,
+                              const float *residual, const float *split) {
+    hc_post_one(out, block, residual, split + 4, split + 8, 5120, 4);
+    ds41_cpu_bf16_rows(out, 4u * 5120u);
+}
+
+/* ds41_cpu_hc_expand() for the columns [d0, d1): per element the products
+ * and sums of hc_post_one() in its order, then the BF16 rounding. */
+static void ds41_cpu_hc_expand_cols(float *out, const float *block,
+                                   const float *residual, const float *split,
+                                   uint64_t d0, uint64_t d1) {
+    const float *post = split + 4, *comb = split + 8;
+    for (uint32_t dst = 0; dst < 4; dst++) {
+        float *o = out + (size_t)dst * 5120u;
+        for (uint64_t d = d0; d < d1; d++) {
+            float v = block[d] * post[dst];
+            for (uint32_t src = 0; src < 4; src++)
+                v += comb[dst + src * 4u] * residual[(size_t)src * 5120u + d];
+            o[d] = ds41_cpu_bf16(v);
+        }
+    }
+}
+
+/* The HC post after attention and the FFN input: after = the expanded HC
+ * state, x = its BF16 sum with the attention mixer's pre weights, norm = the
+ * FFN norm of x.  Staged, the first two run per column. */
+typedef struct {
+    const ds4_model *m;
+    const ds4_tensor *norm_weight;
+    const float *block, *residual, *split;
+    float *after, *x, *norm;
+} ds41_cpu_hc_post_job;
+
+static bool ds41_cpu_hc_post_run(const ds41_cpu_hc_post_job *j) {
+    ds41_cpu_hc_expand(j->after, j->block, j->residual, j->split);
+    ds41_cpu_hc_sum(j->x, j->after, j->split);
+    return ds41_cpu_norm(j->norm, j->x, j->m, j->norm_weight);
+}
+
+/* Per element hc_weighted_sum_one(): the streams in order from 0.0f. */
+static void ds41_cpu_hc_post_worker(void *vctx, uint64_t d0, uint64_t d1) {
+    const ds41_cpu_hc_post_job *j = vctx;
+    ds41_cpu_hc_expand_cols(j->after, j->block, j->residual, j->split, d0, d1);
+    for (uint64_t d = d0; d < d1; d++) {
+        float acc = 0.0f;
+        for (uint32_t h = 0; h < 4; h++) acc += j->after[(size_t)h * 5120u + d] * j->split[h];
+        j->x[d] = ds41_cpu_bf16(acc);
+    }
+}
+
+static void ds41_cpu_hc_post_norm(void *vctx) {
+    const ds41_cpu_hc_post_job *j = vctx;
+    ds41_cpu_norm(j->norm, j->x, j->m, j->norm_weight);
+}
+
 #include "ds4_deepseek41_cpu_attention.inc"
 
 typedef struct ds41_cpu_state {
@@ -300,17 +360,6 @@ static ds41_cpu_hc_job ds41_cpu_hc_mixer(ds41_cpu_state *s, const ds4_layer_weig
     };
 }
 
-static void ds41_cpu_hc_sum(float *out, const float *residual, const float *pre) {
-    hc_weighted_sum_one(out, residual, pre, 5120, 4);
-    ds41_cpu_bf16_rows(out, 5120);
-}
-
-static void ds41_cpu_hc_expand(float *out, const float *block,
-                              const float *residual, const float *split) {
-    hc_post_one(out, block, residual, split + 4, split + 8, 5120, 4);
-    ds41_cpu_bf16_rows(out, 4u * 5120u);
-}
-
 static bool ds41_cpu_moe(ds41_cpu_state *s, const ds4_layer_weights *l) {
     int selected[DS4_MAX_EXPERT_USED];
     float expert_weight[DS4_MAX_EXPERT_USED], probs[DS4_MAX_EXPERT];
@@ -352,23 +401,6 @@ static bool ds41_cpu_moe(ds41_cpu_state *s, const ds4_layer_weights *l) {
 }
 
 #if defined(__AVX512F__) && defined(__AVX512BW__)
-/* ds41_cpu_hc_expand() for the columns [d0, d1): per element the products
- * and sums of hc_post_one() in its order, then the BF16 rounding. */
-static void ds41_cpu_hc_expand_cols(float *out, const float *block,
-                                   const float *residual, const float *split,
-                                   uint64_t d0, uint64_t d1) {
-    const float *post = split + 4, *comb = split + 8;
-    for (uint32_t dst = 0; dst < 4; dst++) {
-        float *o = out + (size_t)dst * 5120u;
-        for (uint64_t d = d0; d < d1; d++) {
-            float v = block[d] * post[dst];
-            for (uint32_t src = 0; src < 4; src++)
-                v += comb[dst + src * 4u] * residual[(size_t)src * 5120u + d];
-            o[d] = ds41_cpu_bf16(v);
-        }
-    }
-}
-
 /* The V4.1 FFN as one staged dispatch, like V4's layer_ffn_graph(). The
  * FFN input comes from the attention mixer, so this layer's FFN mixer only
  * feeds the HC post and the next layer: its norm, projection and Sinkhorn
@@ -566,17 +598,21 @@ static bool ds41_cpu_forward(ds41_cpu_state *s, int token, float *logits,
          * Attention itself consumes the preceding layer's FFN preweights,
          * so the mixer runs inside the attention projections. */
         const ds41_cpu_hc_job hc = ds41_cpu_hc_mixer(s, l, false);
+        /* After attention: the HC post, then the FFN input in s->x and its
+         * norm in s->norm, which attention no longer reads by then. */
+        const ds41_cpu_hc_post_job post = {
+            .m = s->model, .norm_weight = l->ffn_norm, .block = s->block,
+            .residual = s->residual, .split = s->attn_split,
+            .after = s->after_attn, .x = s->x, .norm = s->norm,
+        };
         ds41_cpu_hc_sum(s->x, s->residual, s->pre);
         if (!ds41_cpu_norm(s->norm, s->x, s->model, l->attn_norm)) goto layer_fail;
         double phase = profile ? now_sec() : 0;
         if (!ds41_cpu_attention_forward(s->attention, s->model, l, il, s->pos, s->norm,
-                                        s->block, &hc))
+                                        s->block, &hc, &post))
             goto layer_fail;
         if (profile) attention_seconds += now_sec() - phase;
         ds41_prof(DS41_PROF_HC);
-        ds41_cpu_hc_expand(s->after_attn, s->block, s->residual, s->attn_split);
-        ds41_cpu_hc_sum(s->x, s->after_attn, s->attn_split);
-        if (!ds41_cpu_norm(s->norm, s->x, s->model, l->ffn_norm)) goto layer_fail;
         phase = profile ? now_sec() : 0;
         if (!ds41_cpu_ffn(s, l)) goto layer_fail;
         if (profile) moe_seconds += now_sec() - phase;

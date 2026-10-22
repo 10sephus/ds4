@@ -418,13 +418,14 @@ static void ds41_cpu_attention_weight_worker(void *vctx, uint64_t h0, uint64_t h
     }
 }
 
-/* Sink softmax of the 64 staged query heads over the first n_rows staged
- * rows into s->heads. */
-static void ds41_cpu_attention_heads(ds41_cpu_attention_state *s,
+/* The lane passes of the 64 staged query heads over the first n_rows
+ * staged rows into s->heads: the row list, the transposed query. */
+static void ds41_cpu_attention_lanes(ds41_cpu_attention_state *s,
+                                     layer_attention_lanes_ctx *ctx,
                                      const float *sinks, uint32_t n_rows) {
     for (uint32_t r = 0; r < n_rows; r++) s->rows[r] = s->attended_kv + (size_t)r * 512u;
     attn_lanes_transpose_q(s->qt, s->q, 64, 512);
-    layer_attention_lanes_ctx ctx = {
+    *ctx = (layer_attention_lanes_ctx){
         .out_heads = s->heads,
         .sinks = sinks,
         .q = s->q,
@@ -438,6 +439,14 @@ static void ds41_cpu_attention_heads(ds41_cpu_attention_state *s,
         .n_chunks = (n_rows + ATTN_LANES_ROWS_PER_ITEM - 1) / ATTN_LANES_ROWS_PER_ITEM,
         .n_dim_chunks = 512 / 16,
     };
+}
+
+/* Sink softmax of the 64 staged query heads over the first n_rows staged
+ * rows into s->heads. */
+static void ds41_cpu_attention_heads(ds41_cpu_attention_state *s,
+                                     const float *sinks, uint32_t n_rows) {
+    layer_attention_lanes_ctx ctx;
+    ds41_cpu_attention_lanes(s, &ctx, sinks, n_rows);
     if (n_rows) ds4_parallel_for_min_rows(4u * ctx.n_chunks, attn_lanes_score_worker, &ctx, 1);
     ds4_parallel_for_min_rows(64, ds41_cpu_attention_weight_worker, &ctx, 1);
     ds4_parallel_for_min_rows(4u * ctx.n_dim_chunks, attn_lanes_sum_worker, &ctx, 1);
@@ -486,6 +495,70 @@ static void ds41_cpu_attention_stage(ds41_cpu_attention_state *s,
     ds41_cpu_f16_round(s->q, s->q, 64u * 512u);
 }
 
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+/* The heads, both output projections and the HC post into the FFN input as
+ * one staged dispatch:
+ *   0 head scores, 1 softmax weights <- 0, 2 weighted sums <- 1 -> BF16 and
+ *   inverse RoPE of the heads, 3 output a (eight groups) <- 2, 4 output b
+ *   <- 3, 5 HC post and FFN input sum per column <- 4 -> FFN norm.
+ * The lane passes, row kernels and serial steps are the plain path's, and
+ * the BF16 roundings of low and block are applied per claimed row. */
+typedef struct {
+    ds41_cpu_attention_state *s;
+    uint32_t pos;
+    bool compressed;
+    layer_attention_lanes_ctx lanes;
+    ds41_cpu_q8_ctx out_a, out_b;
+} ds41_cpu_out_graph;
+
+static void ds41_cpu_out_heads(void *vctx) {
+    ds41_cpu_out_graph *g = vctx;
+    ds41_cpu_bf16_rows(g->s->heads, 64u * 512u);
+    ds41_cpu_rope(g->s->heads, 512, 64, g->pos, g->compressed, true);
+}
+
+static bool ds41_cpu_out_graph_supported(const ds4_layer_weights *l,
+                                         const ds41_cpu_hc_post_job *post) {
+    const ds4_tensor *a = l->attn_output_a, *n = post->norm_weight;
+    return a && a->type == DS4_TENSOR_Q8_0 && a->dim[0] == 4096u &&
+        a->elements == 4096u * 8192u && ds41_cpu_q8_shape(l->attn_output_b, 8192, 5120) &&
+        n && n->type == DS4_TENSOR_F32 && n->dim[0] == 5120;
+}
+
+static void ds41_cpu_out_graph_run(ds41_cpu_attention_state *s, const ds4_model *m,
+                                   const ds4_layer_weights *l, uint32_t pos,
+                                   bool compressed, uint32_t n_rows, float *block,
+                                   const ds41_cpu_hc_post_job *post) {
+    ds41_cpu_out_graph g = {.s = s, .pos = pos, .compressed = compressed};
+    ds41_cpu_attention_lanes(s, &g.lanes, tensor_data(m, l->attn_sinks), n_rows);
+    g.out_a = (ds41_cpu_q8_ctx){
+        .ref = {.out = s->low, .data = tensor_data(m, l->attn_output_a), .x = s->heads,
+                .in_dim = 4096, .blocks = 4096 / 32},
+        .rows = 8192, .group_rows = 1024, .group_in = 4096,
+    };
+    const uint64_t scores = 4u * g.lanes.n_chunks, sums = 4u * g.lanes.n_dim_chunks;
+    ds4_pool_stage st[6] = {
+        { .fn = attn_lanes_score_worker, .ctx = &g.lanes,
+          .n_rows = n_rows ? scores : 0, .group_rows = scores ? scores : 1 },
+        { .fn = ds41_cpu_attention_weight_worker, .ctx = &g.lanes,
+          .n_rows = 64, .group_rows = 64, .deps = 1u << 0 },
+        { .fn = attn_lanes_sum_worker, .ctx = &g.lanes, .n_rows = sums, .group_rows = sums,
+          .deps = 1u << 1, .finish = ds41_cpu_out_heads, .finish_ctx = &g },
+        { .fn = ds41_cpu_q8_bf16_worker, .ctx = &g.out_a, .n_rows = 8192 / 16,
+          .group_rows = 8192 / 16, .deps = 1u << 2 },
+        ds41_cpu_q8_stage(&g.out_b, m, l->attn_output_b, block, s->low),
+        /* Light elementwise work: claims of 256 columns. */
+        { .fn = ds41_cpu_hc_post_worker, .ctx = (void *)post, .n_rows = 5120,
+          .group_rows = 5120, .min_chunk = 256, .deps = 1u << 4,
+          .finish = ds41_cpu_hc_post_norm, .finish_ctx = (void *)post },
+    };
+    st[4].deps = 1u << 3;
+    ds4_pool_run_stages(st, 6);
+    if (ds41_prof_on)
+        ds41_prof_bytes[DS41_PROF_OUT] += l->attn_output_a->bytes + l->attn_output_b->bytes;
+}
+#endif
+
 /* The plain projections: the HC mixer, then q, kv, the compressor and the
  * index selection, one dispatch per matrix. */
 static bool ds41_cpu_attention_project(ds41_cpu_attention_state *s, const ds4_model *m,
@@ -512,11 +585,13 @@ static bool ds41_cpu_attention_project(ds41_cpu_attention_state *s, const ds4_mo
 }
 
 /* Attention of the normalized input norm into block.  The HC mixer of the
- * layer runs alongside the projections. */
+ * layer runs alongside the projections, the HC post and the FFN input
+ * after the output projection. */
 static bool ds41_cpu_attention_forward(ds41_cpu_attention_state *s,
                                        const ds4_model *m, const ds4_layer_weights *l,
                                        uint32_t il, uint32_t pos, const float *norm,
-                                       float *block, const ds41_cpu_hc_job *hc) {
+                                       float *block, const ds41_cpu_hc_job *hc,
+                                       const ds41_cpu_hc_post_job *post) {
     if (!s || il >= 40 || pos >= s->ctx) return false;
     const uint32_t ratio = ds4_layer_compress_ratio(il);
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
@@ -538,6 +613,13 @@ static bool ds41_cpu_attention_forward(ds41_cpu_attention_state *s,
     const uint32_t attended = n_comp < 512u ? n_comp : 512u;
     const uint32_t n_raw = pos < 127u ? pos + 1u : 128u;
     ds41_cpu_attention_stage(s, il, pos, owner, n_raw, attended);
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    if (ds41_cpu_out_graph_supported(l, post)) {
+        ds41_prof(DS41_PROF_OUT);
+        ds41_cpu_out_graph_run(s, m, l, pos, ratio != 0, n_raw + attended, block, post);
+        return true;
+    }
+#endif
     ds41_prof(DS41_PROF_ATTN);
     ds41_cpu_attention_heads(s, tensor_data(m, l->attn_sinks), n_raw + attended);
     ds41_cpu_bf16_rows(s->heads, 64u * 512u);
@@ -566,5 +648,6 @@ static bool ds41_cpu_attention_forward(ds41_cpu_attention_state *s,
     }
     if (!ds41_cpu_matvec(block, m, l->attn_output_b, s->low, false)) return false;
     ds41_cpu_bf16_rows(block, 5120);
-    return true;
+    ds41_prof(DS41_PROF_HC);
+    return ds41_cpu_hc_post_run(post);
 }
