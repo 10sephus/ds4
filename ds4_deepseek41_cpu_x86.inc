@@ -106,6 +106,57 @@ static __m512 ds41_cpu_q4_rows16(const uint8_t *rows, const float *x,
     return sum;
 }
 
+/* ds4_vec_dot_iq2_xxs_f32 per lane: (0.125 * d) * (2 * s + 1) as the scale,
+ * then (scale * signed grid byte) * x added in row order. Sign bytes are
+ * ksigns_iq2xs[i] = i | parity(i) << 7, computed instead of gathered. */
+static __m512 ds41_cpu_iq2xxs_rows16(const uint8_t *rows, const float *x,
+                                    uint64_t in_dim, uint64_t row_bytes) {
+    const __m512i offsets = ds41_cpu_row_offsets(row_bytes);
+    const __m512i byte = _mm512_set1_epi32(255), zero = _mm512_setzero_si512();
+    const long long *grid = (const long long *)iq2xxs_grid;
+    __m512 sum = _mm512_setzero_ps();
+    for (uint64_t b = 0; b < in_dim / QK_K; b++) {
+        const uint8_t *block = rows + b * sizeof(block_iq2_xxs);
+        const __m512 d = _mm512_mul_ps(_mm512_set1_ps(0.125f),
+            ds41_cpu_half16(_mm512_i32gather_epi32(offsets, block, 1)));
+        for (unsigned ib = 0; ib < QK_K / 32; ib++) {
+            const uint8_t *q = block + offsetof(block_iq2_xxs, qs) + ib * 8u;
+            const __m512i aux0 = _mm512_i32gather_epi32(offsets, q, 1);
+            const __m512i aux1 = _mm512_i32gather_epi32(offsets, q + 4, 1);
+            const __m512 scale = _mm512_mul_ps(d, _mm512_cvtepi32_ps(_mm512_add_epi32(
+                _mm512_slli_epi32(_mm512_srli_epi32(aux1, 28), 1), _mm512_set1_epi32(1))));
+            const float *xb = x + b * QK_K + ib * 32u;
+            for (unsigned l = 0; l < 4; l++) {
+                const __m512i idx = _mm512_and_si512(_mm512_srli_epi32(aux0, 8 * l), byte);
+                const __m512i lo = _mm512_i32gather_epi64(_mm512_castsi512_si256(idx), grid, 8);
+                const __m512i hi = _mm512_i32gather_epi64(_mm512_extracti64x4_epi64(idx, 1), grid, 8);
+                const __m512i w0 = _mm512_inserti64x4(_mm512_castsi256_si512(
+                    _mm512_cvtepi64_epi32(lo)), _mm512_cvtepi64_epi32(hi), 1);
+                const __m512i w1 = _mm512_inserti64x4(_mm512_castsi256_si512(
+                    _mm512_cvtepi64_epi32(_mm512_srli_epi64(lo, 32))),
+                    _mm512_cvtepi64_epi32(_mm512_srli_epi64(hi, 32)), 1);
+                const __m512i s7 = _mm512_and_si512(_mm512_srli_epi32(aux1, 7 * l),
+                                                    _mm512_set1_epi32(127));
+                __m512i parity = _mm512_xor_si512(s7, _mm512_srli_epi32(s7, 4));
+                parity = _mm512_xor_si512(parity, _mm512_srli_epi32(parity, 2));
+                parity = _mm512_xor_si512(parity, _mm512_srli_epi32(parity, 1));
+                const __m512i signs = _mm512_or_si512(s7, _mm512_slli_epi32(
+                    _mm512_and_si512(parity, _mm512_set1_epi32(1)), 7));
+                for (unsigned j = 0; j < 8; j++) {
+                    const __m512i g = _mm512_and_si512(
+                        _mm512_srli_epi32(j < 4 ? w0 : w1, 8 * (j & 3u)), byte);
+                    const __mmask16 neg = _mm512_test_epi32_mask(signs, _mm512_set1_epi32(1 << j));
+                    const __m512 v = _mm512_cvtepi32_ps(
+                        _mm512_mask_sub_epi32(g, neg, zero, g));
+                    sum = _mm512_add_ps(sum, _mm512_mul_ps(_mm512_mul_ps(scale, v),
+                                                           _mm512_set1_ps(xb[l * 8u + j])));
+                }
+            }
+        }
+    }
+    return sum;
+}
+
 /* q2_k_value_f32 per lane: (d * (sc & 15)) * q - dmin * (sc >> 4), then
  * one product and one addition per element in row order. */
 static __m512 ds41_cpu_q2k_rows16(const uint8_t *rows, const float *x,
@@ -169,7 +220,7 @@ static void ds41_cpu_q8_worker(void *vctx, uint64_t first, uint64_t last) {
     }
 }
 
-static void ds41_cpu_q4_mid_worker(void *vctx, uint64_t first, uint64_t last) {
+static void ds41_cpu_mid_worker(void *vctx, uint64_t first, uint64_t last) {
     glm_routed_moe_f32_mid_ctx *ctx = vctx;
     const uint64_t tiles = (ctx->out_dim + 15) / 16;
     for (uint64_t tile = first; tile < last; tile++) {
@@ -182,10 +233,12 @@ static void ds41_cpu_q4_mid_worker(void *vctx, uint64_t first, uint64_t last) {
         }
         float gate[16] __attribute__((aligned(64)));
         float up[16] __attribute__((aligned(64)));
-        _mm512_storeu_ps(gate, ds41_cpu_q4_rows16(
+        __m512 (*rows16)(const uint8_t *, const float *, uint64_t, uint64_t) =
+            ctx->gate_type == DS4_TENSOR_IQ2_XXS ? ds41_cpu_iq2xxs_rows16 : ds41_cpu_q4_rows16;
+        _mm512_storeu_ps(gate, rows16(
             ctx->gate_base[slot] + row * ctx->gate_row_bytes[slot], ctx->x,
             ctx->in_dim, ctx->gate_row_bytes[slot]));
-        _mm512_storeu_ps(up, ds41_cpu_q4_rows16(
+        _mm512_storeu_ps(up, rows16(
             ctx->up_base[slot] + row * ctx->up_row_bytes[slot], ctx->x,
             ctx->in_dim, ctx->up_row_bytes[slot]));
         for (unsigned lane = 0; lane < 16; lane++) {
@@ -247,10 +300,10 @@ static void ds41_cpu_routed_moe(float *out, float *mid, const ds4_model *m,
         l->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
         l->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
         l->ffn_down_exps->type == DS4_TENSOR_Q4_K;
-    /* Q2 models keep the reference IQ2_XXS gate/up rows; Q2_K down rows
-     * dominate their scalar cost and take the lane-per-row kernel. */
+    /* Q2 models: IQ2_XXS gate/up and Q2_K down, also one row per lane. */
     const bool q2 = l->ffn_gate_exps && l->ffn_up_exps && l->ffn_down_exps &&
-        glm_graph_gate_pair_type_supported(l->ffn_gate_exps->type, l->ffn_up_exps->type) &&
+        l->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+        l->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
         l->ffn_down_exps->type == DS4_TENSOR_Q2_K;
     if ((q4 || q2) &&
         DS4_N_EXPERT_USED > 0 && DS4_N_EXPERT_USED <= DS4_MAX_EXPERT_USED &&
@@ -282,10 +335,8 @@ static void ds41_cpu_routed_moe(float *out, float *mid, const ds4_model *m,
                 ds4_die("V4.1 CPU routed-MoE found unexpected expert dimensions");
             mc.expert_weight[slot] = weights[slot];
         }
-        if (q4) ds4_parallel_for_min_rows((uint64_t)mc.n_expert * ((mc.out_dim + 15) / 16),
-                                          ds41_cpu_q4_mid_worker, &mc, 32);
-        else ds4_parallel_for((uint64_t)mc.n_expert * mc.out_dim,
-                              glm_routed_moe_f32_mid_worker, &mc);
+        ds4_parallel_for_min_rows((uint64_t)mc.n_expert * ((mc.out_dim + 15) / 16),
+                                  ds41_cpu_mid_worker, &mc, 32);
         ds4_parallel_for_min_rows((dc.out_dim + 15) / 16, ds41_cpu_down_worker, &dc, 32);
         return;
     }

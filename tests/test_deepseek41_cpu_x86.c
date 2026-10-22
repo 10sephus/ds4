@@ -66,6 +66,11 @@ static void test_fill_quants(uint8_t *data, size_t bytes, uint32_t type) {
             const uint16_t h[] = {test_half(), test_half()};
             memcpy(data + i, h, sizeof(h));
         }
+    } else if (type == DS4_TENSOR_IQ2_XXS) {
+        for (size_t i = 0; i < bytes; i += sizeof(block_iq2_xxs)) {
+            const uint16_t h = test_half();
+            memcpy(data + i, &h, sizeof(h));
+        }
     } else {
         CHECK(type == DS4_TENSOR_Q2_K);
         for (size_t i = 0; i < bytes; i += sizeof(block_q2_K)) {
@@ -168,8 +173,8 @@ static void check_q4_tails(void) {
             glm_routed_moe_f32_mid_worker(&mc, 0, 2 * n);
             mc.mid = b;
             const uint64_t tiles = 2 * ((n + 15) / 16);
-            ds41_cpu_q4_mid_worker(&mc, 0, 1);
-            ds41_cpu_q4_mid_worker(&mc, 1, tiles);
+            ds41_cpu_mid_worker(&mc, 0, 1);
+            ds41_cpu_mid_worker(&mc, 1, tiles);
             test_equal("Q4 mid tails", a, b, 2 * n);
             glm_routed_moe_f32_down_ctx dc = {
                 .out = a, .mid = x, .down_base = {w.data, w.data},
@@ -191,7 +196,20 @@ static void check_q4_tails(void) {
             dc.out = b;
             ds41_cpu_down_worker(&dc, 0, (n + 15) / 16);
             test_equal("Q2_K down tails", a, b, n);
-            test_free(w2); test_free(xb); test_free(w);
+            const uint64_t stride3 = k / QK_K * sizeof(block_iq2_xxs);
+            test_buffer w3 = test_alloc(n * stride3);
+            test_fill_quants(w3.data, n * stride3, DS4_TENSOR_IQ2_XXS);
+            mc.mid = a;
+            mc.gate_base[0] = mc.gate_base[1] = mc.up_base[0] = mc.up_base[1] = w3.data;
+            mc.gate_row_bytes[0] = mc.gate_row_bytes[1] = stride3;
+            mc.up_row_bytes[0] = mc.up_row_bytes[1] = stride3;
+            mc.gate_type = mc.up_type = DS4_TENSOR_IQ2_XXS;
+            glm_routed_moe_f32_mid_worker(&mc, 0, 2 * n);
+            mc.mid = b;
+            ds41_cpu_mid_worker(&mc, 0, 1);
+            ds41_cpu_mid_worker(&mc, 1, tiles);
+            test_equal("IQ2_XXS mid tails", a, b, 2 * n);
+            test_free(w3); test_free(w2); test_free(xb); test_free(w);
         }
     }
 }
