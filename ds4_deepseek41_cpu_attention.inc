@@ -133,17 +133,14 @@ static bool ds41_cpu_attention_pool2(float *out, float *previous_kv,
     return true;
 }
 
+/* Pool the compressor projections in pool_kv and pool_score of a KV source
+ * layer and, when a row completes, publish it with its index key. */
 static bool ds41_cpu_attention_publish(ds41_cpu_attention_state *s,
                                        const ds4_model *m, const ds4_layer_weights *l,
-                                       uint32_t il, uint32_t pos, const float *norm) {
-    if (!ds41_kv_source(il)) return true;
+                                       uint32_t il, uint32_t pos) {
     const uint32_t ratio = ds4_layer_compress_ratio(il);
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
-    if (!ds41_cpu_matvec(s->pool_kv, m, l->attn_compressor_kv, norm, ratio == 1u))
-        return false;
     if (ratio == 2u) {
-        if (!ds41_cpu_matvec(s->pool_score, m, l->attn_compressor_gate, norm, false))
-            return false;
         if (!ds41_cpu_attention_pool2(s->latent, s->previous_kv[owner],
                 s->previous_score[owner], s->pool_kv, s->pool_score, pos)) return true;
     } else memcpy(s->latent, s->pool_kv, sizeof(s->latent));
@@ -203,20 +200,10 @@ static void ds41_cpu_attention_candidates(ds41_cpu_attention_state *s,
     }
 }
 
-static bool ds41_cpu_attention_select(ds41_cpu_attention_state *s,
-                                      const ds4_model *m, const ds4_layer_weights *l,
-                                      uint32_t il, uint32_t pos, const float *norm) {
-    ds41_prof(DS41_PROF_COMP);
-    if (!ds41_cpu_attention_publish(s, m, l, il, pos, norm)) return false;
-    ds41_prof(DS41_PROF_INDEX);
-    const uint32_t ratio = ds4_layer_compress_ratio(il);
-    const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0;
-    if (!n_comp || !ds41_index_source(il)) return true;
-    const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
-    if (!ds41_cpu_matvec(s->index_q, m, l->indexer_attn_q_b, s->qr, true) ||
-        !ds41_cpu_matvec(s->index_weights, m, l->indexer_proj, norm, true)) return false;
-    ds41_cpu_rope(s->index_q, 128, 32, pos, true, false);
-    ds41_cpu_quantize(s->index_q, 128, 32, DS41_CPU_FP4_E8M0);
+/* Score the cached index keys of owner with the quantized index query and
+ * the head weights, then select the attended compressed rows. */
+static void ds41_cpu_attention_rank(ds41_cpu_attention_state *s, uint32_t il,
+                                    uint32_t owner, uint32_t n_comp) {
     ds41_cpu_index_score_context c = {
         s->index_q, s->index_cache[owner], s->index_weights, s->index_scores
     };
@@ -226,8 +213,190 @@ static bool ds41_cpu_attention_select(ds41_cpu_attention_state *s,
     ds41_cpu_attention_candidates(s, il, n_comp);
     ds41_cpu_attention_topk(s->selected_comp, s->index_scores, n_comp,
                             n_comp < 512u ? n_comp : 512u, s->heap);
+}
+
+static void ds41_cpu_attention_index_q(ds41_cpu_attention_state *s, uint32_t pos) {
+    ds41_cpu_rope(s->index_q, 128, 32, pos, true, false);
+    ds41_cpu_quantize(s->index_q, 128, 32, DS41_CPU_FP4_E8M0);
+}
+
+static bool ds41_cpu_attention_select(ds41_cpu_attention_state *s,
+                                      const ds4_model *m, const ds4_layer_weights *l,
+                                      uint32_t il, uint32_t pos, const float *norm) {
+    ds41_prof(DS41_PROF_COMP);
+    const uint32_t ratio = ds4_layer_compress_ratio(il);
+    if (ds41_kv_source(il) &&
+        (!ds41_cpu_matvec(s->pool_kv, m, l->attn_compressor_kv, norm, ratio == 1u) ||
+         (ratio == 2u &&
+          !ds41_cpu_matvec(s->pool_score, m, l->attn_compressor_gate, norm, false)) ||
+         !ds41_cpu_attention_publish(s, m, l, il, pos))) return false;
+    ds41_prof(DS41_PROF_INDEX);
+    const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0;
+    if (!n_comp || !ds41_index_source(il)) return true;
+    const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
+    if (!ds41_cpu_matvec(s->index_q, m, l->indexer_attn_q_b, s->qr, true) ||
+        !ds41_cpu_matvec(s->index_weights, m, l->indexer_proj, norm, true)) return false;
+    ds41_cpu_attention_index_q(s, pos);
+    ds41_cpu_attention_rank(s, il, owner, n_comp);
     return true;
 }
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+/* Projection rows with ds41_cpu_matvec()'s BF16 rounding applied per claim:
+ * Q8_0 16-row tiles, and F16 row groups. */
+static void ds41_cpu_q8_bf16_worker(void *vctx, uint64_t first, uint64_t last) {
+    const ds41_cpu_q8_ctx *c = vctx;
+    ds41_cpu_q8_worker(vctx, first, last);
+    const uint64_t end = last * 16 < c->rows ? last * 16 : c->rows;
+    ds41_cpu_bf16_rows(c->ref.out + first * 16, (size_t)(end - first * 16));
+}
+
+static void ds41_cpu_f16_bf16_worker(void *vctx, uint64_t first, uint64_t last) {
+    const matvec_f16_ctx *c = vctx;
+    matvec_f16_group_worker(vctx, first, last);
+    const uint64_t end = last * DS4_F16_ROWS < c->out_dim ? last * DS4_F16_ROWS : c->out_dim;
+    ds41_cpu_bf16_rows(c->out + first * DS4_F16_ROWS, (size_t)(end - first * DS4_F16_ROWS));
+}
+
+static ds4_pool_stage ds41_cpu_q8_stage(ds41_cpu_q8_ctx *c, const ds4_model *m,
+                                        const ds4_tensor *t, float *out, const float *x) {
+    const uint64_t rows = t->dim[1], tiles = (rows + 15) / 16;
+    *c = (ds41_cpu_q8_ctx){
+        .ref = {.out = out, .data = tensor_data(m, t), .x = x,
+                .in_dim = t->dim[0], .blocks = (t->dim[0] + 31) / 32},
+        .rows = rows, .group_rows = rows,
+    };
+    return (ds4_pool_stage){.fn = ds41_cpu_q8_bf16_worker, .ctx = c,
+                            .n_rows = tiles, .group_rows = tiles};
+}
+
+static ds4_pool_stage ds41_cpu_f16_stage(matvec_f16_ctx *c, const ds4_model *m,
+                                         const ds4_tensor *t, float *out,
+                                         const float *x, bool round) {
+    const uint64_t groups = (t->dim[1] + DS4_F16_ROWS - 1) / DS4_F16_ROWS;
+    *c = (matvec_f16_ctx){.out = out, .data = tensor_data(m, t), .x = x,
+                          .in_dim = t->dim[0], .out_dim = t->dim[1]};
+    return (ds4_pool_stage){.fn = round ? ds41_cpu_f16_bf16_worker : matvec_f16_group_worker,
+                            .ctx = c, .n_rows = groups, .group_rows = groups};
+}
+
+/* Every projection of the attention input and of the Q low-rank vector,
+ * with the attention HC mixer, as one staged dispatch.  The stages run the
+ * row kernels of the plain path on the same inputs, round each row as it
+ * does, and its serial steps run as finish steps:
+ *   HC norm (one row), q_a -> qr norm, kv -> norm, RoPE, FP8, window,
+ *   HC mixer <- HC norm -> Sinkhorn, compressor kv and score (KV source
+ *   layers), index head weights, publish (one row) <- compressor,
+ *   index q <- q_a -> RoPE, FP4, q_b <- q_a.
+ * Independent stages come first: a thread waits at the first stage whose
+ * inputs are not ready. */
+typedef struct {
+    ds41_cpu_attention_state *s;
+    const ds4_model *m;
+    const ds4_layer_weights *l;
+    uint32_t il, pos;
+    bool published;
+    ds41_cpu_hc_job hc;
+    ds41_cpu_q8_ctx q_a, kv, q_b;
+    matvec_f16_ctx comp_kv, comp_score, index_q, index_weights;
+} ds41_cpu_proj_graph;
+
+static void ds41_cpu_proj_qr(void *vctx) {
+    ds41_cpu_proj_graph *g = vctx;
+    ds41_cpu_norm(g->s->qr, g->s->qr, g->m, g->l->attn_q_a_norm);
+}
+
+static void ds41_cpu_proj_kv(void *vctx) {
+    ds41_cpu_proj_graph *g = vctx;
+    ds41_cpu_attention_state *s = g->s;
+    ds41_cpu_norm(s->kv, s->kv, g->m, g->l->attn_kv_a_norm);
+    ds41_cpu_rope(s->kv, 512, 1, g->pos, ds4_layer_compress_ratio(g->il) != 0, false);
+    ds41_cpu_quantize(s->kv, 512, 1, DS41_CPU_FP8_E8M0);
+    memcpy(s->window[g->il] + (size_t)(g->pos % 128u) * 512u, s->kv, sizeof(s->kv));
+}
+
+static void ds41_cpu_proj_publish(void *vctx, uint64_t first, uint64_t end) {
+    ds41_cpu_proj_graph *g = vctx;
+    if (first < end) g->published = ds41_cpu_attention_publish(g->s, g->m, g->l, g->il, g->pos);
+}
+
+static void ds41_cpu_proj_index_q(void *vctx) {
+    ds41_cpu_proj_graph *g = vctx;
+    ds41_cpu_attention_index_q(g->s, g->pos);
+}
+
+static bool ds41_cpu_proj_graph_supported(const ds4_layer_weights *l, uint32_t il,
+                                          bool index, const ds41_cpu_hc_job *hc) {
+    const uint32_t ratio = ds4_layer_compress_ratio(il);
+    const ds4_tensor *qn = l->attn_q_a_norm, *kn = l->attn_kv_a_norm;
+    return ds41_cpu_hc_staged(hc) &&
+        ds41_cpu_q8_shape(l->attn_q_a, 5120, 1280) &&
+        ds41_cpu_q8_shape(l->attn_kv, 5120, 512) &&
+        ds41_cpu_q8_shape(l->attn_q_b, 1280, 64u * 512u) &&
+        qn && qn->type == DS4_TENSOR_F32 && qn->dim[0] == 1280 &&
+        kn && kn->type == DS4_TENSOR_F32 && kn->dim[0] == 512 &&
+        (!ds41_kv_source(il) ||
+         (ds41_cpu_f16_shape(l->attn_compressor_kv, 5120, 512) &&
+          (ratio != 2u || ds41_cpu_f16_shape(l->attn_compressor_gate, 5120, 512)))) &&
+        (!index ||
+         (ds41_cpu_f16_shape(l->indexer_attn_q_b, 1280, 32u * 128u) &&
+          ds41_cpu_f16_shape(l->indexer_proj, 5120, 32)));
+}
+
+static bool ds41_cpu_proj_graph_run(ds41_cpu_attention_state *s, const ds4_model *m,
+                                    const ds4_layer_weights *l, uint32_t il,
+                                    uint32_t pos, const float *norm, bool index,
+                                    const ds41_cpu_hc_job *hc) {
+    const uint32_t ratio = ds4_layer_compress_ratio(il);
+    const bool source = ds41_kv_source(il);
+    ds41_cpu_proj_graph g = {.s = s, .m = m, .l = l, .il = il, .pos = pos,
+                             .published = true, .hc = *hc};
+    ds4_pool_stage st[10];
+    uint32_t n = 0, comp = 0;
+    st[n++] = ds41_cpu_hc_norm_stage(&g.hc);                         /* 0 */
+    st[n] = ds41_cpu_q8_stage(&g.q_a, m, l->attn_q_a, s->qr, norm);  /* 1 */
+    st[n].finish = ds41_cpu_proj_qr;
+    st[n++].finish_ctx = &g;
+    st[n] = ds41_cpu_q8_stage(&g.kv, m, l->attn_kv, s->kv, norm);
+    st[n].finish = ds41_cpu_proj_kv;
+    st[n++].finish_ctx = &g;
+    st[n++] = ds41_cpu_hc_mix_stage(&g.hc, 0);
+    if (source) {
+        comp |= 1u << n;
+        st[n++] = ds41_cpu_f16_stage(&g.comp_kv, m, l->attn_compressor_kv,
+                                     s->pool_kv, norm, ratio == 1u);
+        if (ratio == 2u) {
+            comp |= 1u << n;
+            st[n++] = ds41_cpu_f16_stage(&g.comp_score, m, l->attn_compressor_gate,
+                                         s->pool_score, norm, false);
+        }
+    }
+    if (index)
+        st[n++] = ds41_cpu_f16_stage(&g.index_weights, m, l->indexer_proj,
+                                     s->index_weights, norm, true);
+    if (source)
+        st[n++] = (ds4_pool_stage){.fn = ds41_cpu_proj_publish, .ctx = &g,
+                                   .n_rows = 1, .group_rows = 1, .deps = comp};
+    if (index) {
+        st[n] = ds41_cpu_f16_stage(&g.index_q, m, l->indexer_attn_q_b, s->index_q, s->qr, true);
+        st[n].deps = 1u << 1;
+        st[n].finish = ds41_cpu_proj_index_q;
+        st[n++].finish_ctx = &g;
+    }
+    st[n] = ds41_cpu_q8_stage(&g.q_b, m, l->attn_q_b, s->q, s->qr);
+    st[n++].deps = 1u << 1;
+    ds4_pool_run_stages(st, n);
+    if (ds41_prof_on) {
+        uint64_t bytes = hc->fn->bytes + l->attn_q_a->bytes + l->attn_kv->bytes +
+                         l->attn_q_b->bytes;
+        if (source) bytes += l->attn_compressor_kv->bytes +
+                             (ratio == 2u ? l->attn_compressor_gate->bytes : 0);
+        if (index) bytes += l->indexer_proj->bytes + l->indexer_attn_q_b->bytes;
+        ds41_prof_bytes[DS41_PROF_PROJ] += bytes;
+    }
+    return g.published;
+}
+#endif
 
 /* Pass B1 of layer_attention_lanes with this path's running peak: fmaxf
  * from the sink, then the expf chain and the denominator in row order.  The
@@ -317,14 +486,15 @@ static void ds41_cpu_attention_stage(ds41_cpu_attention_state *s,
     ds41_cpu_f16_round(s->q, s->q, 64u * 512u);
 }
 
-static bool ds41_cpu_attention_forward(ds41_cpu_attention_state *s,
-                                       const ds4_model *m, const ds4_layer_weights *l,
-                                       uint32_t il, uint32_t pos, const float *norm,
-                                       float *block) {
-    if (!s || il >= 40 || pos >= s->ctx) return false;
+/* The plain projections: the HC mixer, then q, kv, the compressor and the
+ * index selection, one dispatch per matrix. */
+static bool ds41_cpu_attention_project(ds41_cpu_attention_state *s, const ds4_model *m,
+                                       const ds4_layer_weights *l, uint32_t il,
+                                       uint32_t pos, const float *norm,
+                                       const ds41_cpu_hc_job *hc) {
     const uint32_t ratio = ds4_layer_compress_ratio(il);
-    const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
-    const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
+    ds41_prof(DS41_PROF_HC);
+    if (!ds41_cpu_hc_run(hc)) return false;
     ds41_prof(DS41_PROF_Q);
     if (!ds41_cpu_matvec(s->qr, m, l->attn_q_a, norm, true) ||
         !ds41_cpu_norm(s->qr, s->qr, m, l->attn_q_a_norm) ||
@@ -338,7 +508,32 @@ static bool ds41_cpu_attention_forward(ds41_cpu_attention_state *s,
     ds41_cpu_rope(s->kv, 512, 1, pos, ratio != 0, false);
     ds41_cpu_quantize(s->kv, 512, 1, DS41_CPU_FP8_E8M0);
     memcpy(s->window[il] + (size_t)(pos % 128u) * 512u, s->kv, sizeof(s->kv));
-    if (!ds41_cpu_attention_select(s, m, l, il, pos, norm)) return false;
+    return ds41_cpu_attention_select(s, m, l, il, pos, norm);
+}
+
+/* Attention of the normalized input norm into block.  The HC mixer of the
+ * layer runs alongside the projections. */
+static bool ds41_cpu_attention_forward(ds41_cpu_attention_state *s,
+                                       const ds4_model *m, const ds4_layer_weights *l,
+                                       uint32_t il, uint32_t pos, const float *norm,
+                                       float *block, const ds41_cpu_hc_job *hc) {
+    if (!s || il >= 40 || pos >= s->ctx) return false;
+    const uint32_t ratio = ds4_layer_compress_ratio(il);
+    const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
+    const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    const bool index = n_comp && ds41_index_source(il);
+    if (ds41_cpu_proj_graph_supported(l, il, index, hc)) {
+        ds41_prof(DS41_PROF_PROJ);
+        if (!ds41_cpu_proj_graph_run(s, m, l, il, pos, norm, index, hc)) return false;
+        ds41_prof(DS41_PROF_Q);
+        ds41_cpu_rope(s->q, 512, 64, pos, ratio != 0, false);
+        ds41_prof(DS41_PROF_INDEX);
+        if (index) ds41_cpu_attention_rank(s, il, owner, n_comp);
+    } else if (!ds41_cpu_attention_project(s, m, l, il, pos, norm, hc)) return false;
+#else
+    if (!ds41_cpu_attention_project(s, m, l, il, pos, norm, hc)) return false;
+#endif
     ds41_prof(DS41_PROF_STAGE);
     const uint32_t attended = n_comp < 512u ? n_comp : 512u;
     const uint32_t n_raw = pos < 127u ? pos + 1u : 128u;

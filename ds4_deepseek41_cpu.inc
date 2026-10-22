@@ -19,12 +19,12 @@ enum {
     DS41_PROF_GLUE, DS41_PROF_EREAD, DS41_PROF_ENGRAM, DS41_PROF_HC,
     DS41_PROF_Q, DS41_PROF_KV, DS41_PROF_COMP, DS41_PROF_INDEX, DS41_PROF_STAGE,
     DS41_PROF_ATTN, DS41_PROF_OUT, DS41_PROF_ROUTER, DS41_PROF_SHARED,
-    DS41_PROF_ROUTED, DS41_PROF_FFN, DS41_PROF_HEAD, DS41_PROF_N
+    DS41_PROF_ROUTED, DS41_PROF_PROJ, DS41_PROF_FFN, DS41_PROF_HEAD, DS41_PROF_N
 };
 static const char *const ds41_prof_name[DS41_PROF_N] = {
     "glue", "engram_read", "engram", "hc", "attn_q", "attn_kv", "compress",
     "indexer", "stage", "attention", "attn_out", "router", "shared", "routed",
-    "ffn", "head"
+    "attn_proj", "ffn", "head"
 };
 static bool ds41_prof_on;
 static int ds41_prof_phase;
@@ -61,7 +61,8 @@ static bool ds41_cpu_matvec(float *out, const ds4_model *m,
     case DS4_TENSOR_Q8_0: ds41_cpu_matvec_q8(out, m, &matrix, in); break;
     default: return false;
     }
-    if (ds41_prof_on) ds41_prof_bytes[ds41_prof_phase] += matrix.bytes;
+    /* Inside a staged dispatch the caller counts the bytes. */
+    if (ds41_prof_on && !g_parallel_depth) ds41_prof_bytes[ds41_prof_phase] += matrix.bytes;
     if (round) ds41_cpu_bf16_rows(out, (size_t)matrix.dim[1]);
     return true;
 }
@@ -74,6 +75,73 @@ static bool ds41_cpu_norm(float *out, const float *in, const ds4_model *m,
     ds41_cpu_bf16_rows(out, (size_t)weight->dim[0]);
     return true;
 }
+
+/* One HC mixer: the RMS norm of the four streams in state, the F16
+ * projection into mix and the Sinkhorn split.  Only the HC post after the
+ * sublayer and the next sublayer's input read the split, so the staged
+ * dispatches run the mixer beside the sublayer's projections: the
+ * sequential norm as a one-row stage, then the projection rows. */
+typedef struct {
+    const ds4_model *m;
+    const ds4_tensor *fn, *scale, *base;
+    const float *state;
+    float *flat, *mix, *split;
+    matvec_f16_ctx rows;
+} ds41_cpu_hc_job;
+
+static bool ds41_cpu_hc_run(const ds41_cpu_hc_job *j) {
+    if (!j->scale || !j->base || j->scale->type != DS4_TENSOR_F32 ||
+        j->base->type != DS4_TENSOR_F32) return false;
+    rms_norm_no_weight(j->flat, j->state, 4u * 5120u, DS4_RMS_EPS);
+    if (!ds41_cpu_matvec(j->mix, j->m, j->fn, j->flat, false)) return false;
+    hc_split_sinkhorn_one(j->split, j->mix, tensor_data(j->m, j->scale),
+                         tensor_data(j->m, j->base), 4, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS);
+    return true;
+}
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+static bool ds41_cpu_hc_staged(const ds41_cpu_hc_job *j) {
+    return j->fn && j->fn->type == DS4_TENSOR_F16 && j->fn->ndim == 2 &&
+        j->fn->dim[0] == 4u * 5120u && j->fn->dim[1] == 24 &&
+        j->scale && j->scale->type == DS4_TENSOR_F32 &&
+        j->base && j->base->type == DS4_TENSOR_F32;
+}
+
+static void ds41_cpu_hc_norm_worker(void *vctx, uint64_t first, uint64_t end) {
+    const ds41_cpu_hc_job *j = vctx;
+    if (first < end) rms_norm_no_weight(j->flat, j->state, 4u * 5120u, DS4_RMS_EPS);
+}
+
+static void ds41_cpu_hc_split(void *vctx) {
+    const ds41_cpu_hc_job *j = vctx;
+    hc_split_sinkhorn_one(j->split, j->mix, tensor_data(j->m, j->scale),
+                         tensor_data(j->m, j->base), 4, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS);
+}
+
+static ds4_pool_stage ds41_cpu_hc_norm_stage(ds41_cpu_hc_job *j) {
+    return (ds4_pool_stage){.fn = ds41_cpu_hc_norm_worker, .ctx = j,
+                            .n_rows = 1, .group_rows = 1};
+}
+
+/* The 24 projection rows as three F16 row groups, after stage norm. */
+static ds4_pool_stage ds41_cpu_hc_mix_stage(ds41_cpu_hc_job *j, uint32_t norm) {
+    j->rows = (matvec_f16_ctx){.out = j->mix, .data = tensor_data(j->m, j->fn),
+                               .x = j->flat, .in_dim = 4u * 5120u, .out_dim = 24};
+    return (ds4_pool_stage){.fn = matvec_f16_group_worker, .ctx = &j->rows,
+                            .n_rows = 24 / DS4_F16_ROWS, .group_rows = 24 / DS4_F16_ROWS,
+                            .deps = 1u << norm, .finish = ds41_cpu_hc_split, .finish_ctx = j};
+}
+
+static bool ds41_cpu_q8_shape(const ds4_tensor *t, uint64_t in_dim, uint64_t rows) {
+    return t && t->type == DS4_TENSOR_Q8_0 && t->ndim == 2 &&
+        t->dim[0] == in_dim && t->dim[1] == rows;
+}
+
+static bool ds41_cpu_f16_shape(const ds4_tensor *t, uint64_t in_dim, uint64_t rows) {
+    return t && t->type == DS4_TENSOR_F16 && t->ndim == 2 &&
+        t->dim[0] == in_dim && t->dim[1] == rows;
+}
+#endif
 
 #include "ds4_deepseek41_cpu_attention.inc"
 
@@ -217,19 +285,19 @@ fail:
     return NULL;
 }
 
-static bool ds41_cpu_hc_mix(ds41_cpu_state *s, const ds4_layer_weights *l, bool ffn) {
-    const ds4_tensor *fn = ffn ? l->hc_ffn_fn : l->hc_attn_fn;
-    const ds4_tensor *scale = ffn ? l->hc_ffn_scale : l->hc_attn_scale;
-    const ds4_tensor *base = ffn ? l->hc_ffn_base : l->hc_attn_base;
-    if (!scale || !base || scale->type != DS4_TENSOR_F32 || base->type != DS4_TENSOR_F32)
-        return false;
-    rms_norm_no_weight(s->flat_norm, ffn ? s->after_attn : s->residual,
-                       4u * 5120u, DS4_RMS_EPS);
-    if (!ds41_cpu_matvec(s->mix, s->model, fn, s->flat_norm, false)) return false;
-    hc_split_sinkhorn_one(ffn ? s->ffn_split : s->attn_split, s->mix,
-                         tensor_data(s->model, scale), tensor_data(s->model, base),
-                         4, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS);
-    return true;
+/* The attention mixer reads the HC state, the FFN mixer the state after
+ * attention. */
+static ds41_cpu_hc_job ds41_cpu_hc_mixer(ds41_cpu_state *s, const ds4_layer_weights *l,
+                                        bool ffn) {
+    return (ds41_cpu_hc_job){
+        .m = s->model,
+        .fn = ffn ? l->hc_ffn_fn : l->hc_attn_fn,
+        .scale = ffn ? l->hc_ffn_scale : l->hc_attn_scale,
+        .base = ffn ? l->hc_ffn_base : l->hc_attn_base,
+        .state = ffn ? s->after_attn : s->residual,
+        .flat = s->flat_norm, .mix = s->mix,
+        .split = ffn ? s->ffn_split : s->attn_split,
+    };
 }
 
 static void ds41_cpu_hc_sum(float *out, const float *residual, const float *pre) {
@@ -301,18 +369,6 @@ static void ds41_cpu_hc_expand_cols(float *out, const float *block,
     }
 }
 
-/* rms_norm_no_weight() of the HC state as a one-row stage, so one thread
- * runs the sequential sum while the others stream weights. */
-typedef struct {
-    float *out;
-    const float *in;
-} ds41_cpu_flat_ctx;
-
-static void ds41_cpu_flat_worker(void *vctx, uint64_t first, uint64_t end) {
-    const ds41_cpu_flat_ctx *c = vctx;
-    if (first < end) rms_norm_no_weight(c->out, c->in, 4u * 5120u, DS4_RMS_EPS);
-}
-
 /* The V4.1 FFN as one staged dispatch, like V4's layer_ffn_graph(). The
  * FFN input comes from the attention mixer, so this layer's FFN mixer only
  * feeds the HC post and the next layer: its norm, projection and Sinkhorn
@@ -325,22 +381,13 @@ typedef struct {
     ds41_cpu_state *s;
     const ds4_layer_weights *l;
     float logits[DS4_MAX_EXPERT];
-    ds41_cpu_flat_ctx flat;
-    matvec_f16_ctx mix;
+    ds41_cpu_hc_job hc;
     matvec_f32_ctx router;
     ds41_cpu_q8_pair_ctx shared_gate_up;
     ds41_cpu_q8_ctx shared_down;
     glm_routed_moe_f32_mid_ctx mid;
     glm_routed_moe_f32_down_ctx down;
 } ds41_cpu_ffn_graph;
-
-static void ds41_cpu_ffn_split(void *vctx) {
-    ds41_cpu_ffn_graph *g = vctx;
-    hc_split_sinkhorn_one(g->s->ffn_split, g->s->mix,
-                         tensor_data(g->s->model, g->l->hc_ffn_scale),
-                         tensor_data(g->s->model, g->l->hc_ffn_base),
-                         4, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS);
-}
 
 static void ds41_cpu_ffn_route(void *vctx) {
     ds41_cpu_ffn_graph *g = vctx;
@@ -367,18 +414,10 @@ static void ds41_cpu_ffn_post_worker(void *vctx, uint64_t d0, uint64_t d1) {
     ds41_cpu_hc_expand_cols(s->residual, s->block, s->after_attn, s->ffn_split, d0, d1);
 }
 
-static bool ds41_cpu_q8_shape(const ds4_tensor *t, uint64_t in_dim, uint64_t rows) {
-    return t && t->type == DS4_TENSOR_Q8_0 && t->ndim == 2 &&
-        t->dim[0] == in_dim && t->dim[1] == rows;
-}
-
-static bool ds41_cpu_ffn_graph_supported(const ds4_layer_weights *l) {
-    const ds4_tensor *h = l->hc_ffn_fn, *r = l->ffn_gate_inp;
-    return h && h->type == DS4_TENSOR_F16 && h->ndim == 2 &&
-        h->dim[0] == 4u * 5120u && h->dim[1] == 24 &&
-        l->hc_ffn_scale && l->hc_ffn_scale->type == DS4_TENSOR_F32 &&
-        l->hc_ffn_base && l->hc_ffn_base->type == DS4_TENSOR_F32 &&
-        r && r->type == DS4_TENSOR_F32 && r->ndim == 2 &&
+static bool ds41_cpu_ffn_graph_supported(const ds4_layer_weights *l,
+                                         const ds41_cpu_hc_job *hc) {
+    const ds4_tensor *r = l->ffn_gate_inp;
+    return ds41_cpu_hc_staged(hc) && r && r->type == DS4_TENSOR_F32 && r->ndim == 2 &&
         r->dim[0] == 5120 && r->dim[1] == DS4_N_EXPERT &&
         l->ffn_exp_probs_b && ds41_cpu_routed_rows(l) &&
         ds41_cpu_q8_shape(l->ffn_gate_shexp, 5120, 2304) &&
@@ -388,13 +427,11 @@ static bool ds41_cpu_ffn_graph_supported(const ds4_layer_weights *l) {
 
 /* From the FFN norm in s->norm and the HC state in s->after_attn to
  * s->ffn_split and the new HC state in s->residual. */
-static void ds41_cpu_ffn_graph_run(ds41_cpu_state *s, const ds4_layer_weights *l) {
+static void ds41_cpu_ffn_graph_run(ds41_cpu_state *s, const ds4_layer_weights *l,
+                                   const ds41_cpu_hc_job *hc) {
     const ds4_model *m = s->model;
     const uint64_t mid_tiles = 2304 / 16, tiles = 5120 / 16;
-    ds41_cpu_ffn_graph g = {.s = s, .l = l};
-    g.flat = (ds41_cpu_flat_ctx){s->flat_norm, s->after_attn};
-    g.mix = (matvec_f16_ctx){.out = s->mix, .data = tensor_data(m, l->hc_ffn_fn),
-                             .x = s->flat_norm, .in_dim = 4u * 5120u, .out_dim = 24};
+    ds41_cpu_ffn_graph g = {.s = s, .l = l, .hc = *hc};
     g.router = (matvec_f32_ctx){.out = g.logits, .data = tensor_data(m, l->ffn_gate_inp),
                                 .x = s->norm, .in_dim = 5120};
     g.shared_gate_up.units = mid_tiles;
@@ -416,16 +453,14 @@ static void ds41_cpu_ffn_graph_run(ds41_cpu_state *s, const ds4_layer_weights *l
      * inputs are not ready.  The gate/up rows of each expert are their own
      * NUMA group, so each node reads the half of every expert placed on it. */
     ds4_pool_stage stages[8] = {
-        { .fn = ds41_cpu_flat_worker, .ctx = &g.flat, .n_rows = 1, .group_rows = 1 },
+        ds41_cpu_hc_norm_stage(&g.hc),
         { .fn = matvec_f32_worker, .ctx = &g.router, .n_rows = DS4_N_EXPERT,
           .group_rows = DS4_N_EXPERT, .finish = ds41_cpu_ffn_route, .finish_ctx = &g },
         { .fn = ds41_cpu_q8_pair_worker, .ctx = &g.shared_gate_up, .n_rows = 2 * mid_tiles,
           .group_rows = mid_tiles, .finish = ds41_cpu_ffn_shared_mid, .finish_ctx = s },
         { .fn = ds41_cpu_mid_worker, .ctx = &g.mid, .n_rows = DS4_N_EXPERT_USED * mid_tiles,
           .group_rows = mid_tiles, .deps = 1u << 1 },
-        { .fn = matvec_f16_group_worker, .ctx = &g.mix, .n_rows = 24 / DS4_F16_ROWS,
-          .group_rows = 24 / DS4_F16_ROWS, .deps = 1u << 0,
-          .finish = ds41_cpu_ffn_split, .finish_ctx = &g },
+        ds41_cpu_hc_mix_stage(&g.hc, 0),
         { .fn = ds41_cpu_q8_worker, .ctx = &g.shared_down, .n_rows = tiles,
           .group_rows = tiles, .deps = 1u << 2 },
         { .fn = ds41_cpu_down_worker, .ctx = &g.down, .n_rows = tiles,
@@ -446,15 +481,16 @@ static void ds41_cpu_ffn_graph_run(ds41_cpu_state *s, const ds4_layer_weights *l
 /* The FFN from s->after_attn (with the norm of its attention-mixed input in
  * s->norm) to s->ffn_split and the next HC state in s->residual. */
 static bool ds41_cpu_ffn(ds41_cpu_state *s, const ds4_layer_weights *l) {
+    const ds41_cpu_hc_job hc = ds41_cpu_hc_mixer(s, l, true);
 #if defined(__AVX512F__) && defined(__AVX512BW__)
-    if (ds41_cpu_ffn_graph_supported(l)) {
+    if (ds41_cpu_ffn_graph_supported(l, &hc)) {
         ds41_prof(DS41_PROF_FFN);
-        ds41_cpu_ffn_graph_run(s, l);
+        ds41_cpu_ffn_graph_run(s, l, &hc);
         ds41_prof(DS41_PROF_HC);
         return true;
     }
 #endif
-    if (!ds41_cpu_hc_mix(s, l, true) || !ds41_cpu_moe(s, l)) return false;
+    if (!ds41_cpu_hc_run(&hc) || !ds41_cpu_moe(s, l)) return false;
     ds41_cpu_hc_expand(s->residual, s->block, s->after_attn, s->ffn_split);
     return true;
 }
@@ -526,13 +562,15 @@ static bool ds41_cpu_forward(ds41_cpu_state *s, int token, float *logits,
             if (profile) engram_seconds += now_sec() - phase;
         }
         ds41_prof(DS41_PROF_HC);
-        if (!ds41_cpu_hc_mix(s, l, false)) goto layer_fail;
         /* The newly computed attention mixer is consumed by the next FFN.
-         * Attention itself consumes the preceding layer's FFN preweights. */
+         * Attention itself consumes the preceding layer's FFN preweights,
+         * so the mixer runs inside the attention projections. */
+        const ds41_cpu_hc_job hc = ds41_cpu_hc_mixer(s, l, false);
         ds41_cpu_hc_sum(s->x, s->residual, s->pre);
         if (!ds41_cpu_norm(s->norm, s->x, s->model, l->attn_norm)) goto layer_fail;
         double phase = profile ? now_sec() : 0;
-        if (!ds41_cpu_attention_forward(s->attention, s->model, l, il, s->pos, s->norm, s->block))
+        if (!ds41_cpu_attention_forward(s->attention, s->model, l, il, s->pos, s->norm,
+                                        s->block, &hc))
             goto layer_fail;
         if (profile) attention_seconds += now_sec() - phase;
         ds41_prof(DS41_PROF_HC);
