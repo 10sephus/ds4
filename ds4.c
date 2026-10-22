@@ -16740,6 +16740,8 @@ typedef struct {
     uint64_t            allowed_stride;
     uint32_t            n_tok;
     uint32_t            raw_cap;
+    uint32_t            pos0;
+    uint32_t            raw_base;
 } layer_attention_prefix_batch_ctx;
 
 static inline bool attention_prefix_comp_allowed(
@@ -16784,10 +16786,11 @@ static void layer_attention_prefix_batch_worker(void *vctx, uint64_t i0, uint64_
         lanes.sinks = sinks + h0;
         for (uint32_t side = 0; side < (toks[0] == toks[1] ? 1u : 2u); side++) {
             const uint32_t t = toks[side];
-            const uint32_t raw_count = t + 1 < ctx->raw_cap ? t + 1 : ctx->raw_cap;
+            const uint32_t pos = ctx->pos0 + t, last = ctx->raw_base + t;
+            const uint32_t raw_count = pos + 1 < ctx->raw_cap ? pos + 1 : ctx->raw_cap;
             const uint32_t comp_count = ctx->comp_counts ? ctx->comp_counts[t] : 0;
             uint32_t n_rows = 0;
-            for (uint32_t r = t + 1 - raw_count; r <= t; r++) {
+            for (uint32_t r = last + 1 - raw_count; r <= last; r++) {
                 rows[n_rows++] = ctx->raw_kv + (uint64_t)r * head_dim;
             }
             for (uint32_t c = 0; c < comp_count; c++) {
@@ -16810,8 +16813,11 @@ static void layer_attention_prefix_batch_worker(void *vctx, uint64_t i0, uint64_
     free(rows);
 }
 
-/* Prefix prefill attention for a fresh prompt.  It computes each token's view
- * of the raw window and compressed rows without running the decode loop. */
+/* Prefix prefill attention.  It computes each token's view of the raw window
+ * and compressed rows without running the decode loop.  Token t sits at
+ * position pos0 + t; raw_kv holds raw_base cached rows (the positions just
+ * before pos0, at least min(pos0, raw_cap - 1) of them) followed by the n_tok
+ * new rows. */
 static void layer_attention_prefix_batch(
         float                   * out_heads,
         const ds4_model         * model,
@@ -16824,7 +16830,9 @@ static void layer_attention_prefix_batch(
         const uint8_t           * allowed_bits,
         uint64_t                  allowed_stride,
         uint32_t                  n_tok,
-        uint32_t                  raw_cap) {
+        uint32_t                  raw_cap,
+        uint32_t                  pos0,
+        uint32_t                  raw_base) {
     layer_attention_prefix_batch_ctx ctx = {
         .out_heads = out_heads,
         .model = model,
@@ -16838,6 +16846,8 @@ static void layer_attention_prefix_batch(
         .allowed_stride = allowed_stride,
         .n_tok = n_tok,
         .raw_cap = raw_cap,
+        .pos0 = pos0,
+        .raw_base = raw_base,
     };
     ds4_parallel_for_min_rows((uint64_t)((n_tok + 1) / 2) * ((DS4_N_HEAD + 15) / 16),
                               layer_attention_prefix_batch_worker,
@@ -17090,11 +17100,12 @@ static void prefill_head_rms_norm_rows(float *x, uint32_t n_head, uint32_t head_
     ds4_parallel_for_min_rows(n_tok, prefill_norm_worker, &ctx, 2);
 }
 
-/* Batched prefill attention for a fresh prompt.  It projects Q/KV for all
- * tokens, streams them through the same raw/compressed cache updates decode
- * performs, then runs every token's attention in parallel.  Continued prefill
- * extends an existing cache token by token through the decode path, so the
- * layer cache is empty here and token t sits at position t. */
+/* Batched prefill attention.  It projects Q/KV for all tokens, streams them
+ * through the same raw/compressed cache updates decode performs, then runs
+ * every token's attention in parallel.  Token t sits at position pos0 + t and
+ * the layer cache holds the pos0 tokens before it: a continued prefill reads
+ * the cached raw rows and compressed rows exactly as decode would, and the
+ * compressor state carries over because its rows are indexed by position. */
 static void layer_attention_raw_swa_batch(
         float                   * after_attn_hc,
         const ds4_model         * model,
@@ -17103,10 +17114,13 @@ static void layer_attention_raw_swa_batch(
         const float             * inp_hc,
         uint32_t                  n_tok,
         uint32_t                  il,
+        uint32_t                  pos0,
         const float             * steering_dirs,
         float                     steering_scale) {
-    if (cache->n_raw != 0 || cache->n_comp != 0) {
-        ds4_die("CPU batched prefill attention expects an empty layer cache");
+    const uint32_t raw_base = cache->n_raw;
+    if (raw_base != (pos0 < cache->cap_raw ? pos0 : cache->cap_raw) ||
+        (cache->compress_ratio != 0 && cache->n_comp != pos0 / cache->compress_ratio)) {
+        ds4_die("CPU batched prefill attention: the layer cache does not end at the start position");
     }
     const bool profile = getenv("DS4_PREFILL_PROFILE_DETAIL") != NULL;
     const double t_start = profile ? now_sec() : 0.0;
@@ -17132,7 +17146,13 @@ static void layer_attention_raw_swa_batch(
     float *qr_norm = pf_buf(PF_QR_NORM, (size_t)n_tok * q_rank * sizeof(qr_norm[0]));
     float *q = pf_buf(PF_Q, (size_t)n_tok * q_dim * sizeof(q[0]));
     float *kv_raw = pf_buf(PF_KV_RAW, (size_t)n_tok * DS4_N_HEAD_DIM * sizeof(kv_raw[0]));
-    float *kv = pf_buf(PF_KV, (size_t)n_tok * DS4_N_HEAD_DIM * sizeof(kv[0]));
+    /* The cached raw rows, then the new tokens' rows: the window prefix
+     * attention reads, in position order like the decode cache.  The slot
+     * is shared by every layer, so the layer's cached rows are copied in
+     * each time. */
+    float *kv_all = pf_buf(PF_KV, (size_t)(raw_base + n_tok) * DS4_N_HEAD_DIM * sizeof(kv_all[0]));
+    memcpy(kv_all, cache->raw_kv, (size_t)raw_base * DS4_N_HEAD_DIM * sizeof(kv_all[0]));
+    float *kv = kv_all + (uint64_t)raw_base * DS4_N_HEAD_DIM;
     float *heads = pf_buf(PF_HEADS, (size_t)n_tok * q_dim * sizeof(heads[0]));
     float *attn_out = pf_buf(PF_ATTN_OUT, (size_t)n_tok * DS4_N_EMBD * sizeof(attn_out[0]));
     float *post = xmalloc((size_t)n_tok * n_hc * sizeof(post[0]));
@@ -17180,8 +17200,8 @@ static void layer_attention_raw_swa_batch(
     float *index_comp = NULL, *index_rows = NULL, *index_scores = NULL;
 
     double tx = profile ? now_sec() : 0.0;
-    rope_tail_layer_batch_inplace(q, q_dim, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, 0, il, false, n_tok);
-    rope_tail_layer_batch_inplace(kv, DS4_N_HEAD_DIM, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, 0, il, false, n_tok);
+    rope_tail_layer_batch_inplace(q, q_dim, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos0, il, false, n_tok);
+    rope_tail_layer_batch_inplace(kv, DS4_N_HEAD_DIM, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, pos0, il, false, n_tok);
     if (profile) t_tl_rope_cache += now_sec() - tx;
 
     if (ratio != 0) {
@@ -17230,7 +17250,7 @@ static void layer_attention_raw_swa_batch(
                                   DS4_N_HEAD_DIM,
                                   ratio,
                                   il,
-                                  t)) {
+                                  pos0 + t)) {
             kv_cache_push_comp(cache->attn_comp_kv, &cache->n_comp, cache->comp_cap, DS4_N_HEAD_DIM, comp);
         }
 
@@ -17245,7 +17265,7 @@ static void layer_attention_raw_swa_batch(
                                       DS4_N_INDEXER_HEAD_DIM,
                                       ratio,
                                       il,
-                                      t)) {
+                                      pos0 + t)) {
                 kv_cache_push_comp(cache->index_comp_kv, &cache->n_index_comp, cache->comp_cap, DS4_N_INDEXER_HEAD_DIM, index_comp);
             }
             if (profile) t_tl_compress += now_sec() - tx;
@@ -17256,7 +17276,7 @@ static void layer_attention_raw_swa_batch(
                                                             qr_norm + (uint64_t)t * q_rank,
                                                             cache->index_comp_kv,
                                                             cache->n_index_comp,
-                                                            il, t);
+                                                            il, pos0 + t);
             if (comp_allowed) {
                 if (!allowed_bits) {
                     allowed_bits = xcalloc((size_t)n_tok * allowed_stride, sizeof(allowed_bits[0]));
@@ -17279,17 +17299,19 @@ static void layer_attention_raw_swa_batch(
     tx = profile ? now_sec() : 0.0;
     layer_attention_prefix_batch(heads, model, layer,
                                  q,
-                                 kv,
+                                 kv_all,
                                  cache->attn_comp_kv,
                                  comp_counts,
                                  allowed_mask,
                                  allowed_bits,
                                  allowed_stride,
                                  n_tok,
-                                 cache->cap_raw);
+                                 cache->cap_raw,
+                                 pos0,
+                                 raw_base);
     if (profile) t_tl_attn_rows += now_sec() - tx;
     tx = profile ? now_sec() : 0.0;
-    rope_tail_layer_batch_inplace(heads, q_dim, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, 0, il, true, n_tok);
+    rope_tail_layer_batch_inplace(heads, q_dim, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos0, il, true, n_tok);
     if (profile) t_tl_inv_rope += now_sec() - tx;
     if (profile) t_token_loop = now_sec() - t0;
 
@@ -17601,19 +17623,27 @@ static void forward_token_raw_swa_cpu(
 }
 #endif
 
+/* A continued prompt of at least this many tokens takes the batched prefill;
+ * a shorter one runs the decode path token by token. */
+#define DS4_CPU_CONTINUE_BATCH_MIN 2
+
 /* CPU prefill in layer-major order.  All prompt tokens pass through layer 0,
- * then layer 1, etc., which exposes batch matmul opportunities. */
+ * then layer 1, etc., which exposes batch matmul opportunities.  The tokens
+ * start at position pos0: the cache holds the pos0 tokens before them, so a
+ * continued prompt extends an existing session the same way decode would. */
 static void prefill_layer_major_cpu(
         float             * logits,
         const ds4_model   * model,
         const ds4_weights * weights,
         ds4_kv_cache      * cache,
-        const token_vec   * prompt,
+        const int         * tokens,
+        uint32_t            n_tokens,
+        uint32_t            pos0,
         const float       * steering_dirs,
         float               steering_attn_scale,
         float               steering_ffn_scale) {
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
-    const uint64_t n_tok = (uint64_t)prompt->len;
+    const uint64_t n_tok = n_tokens;
     float *cur = xmalloc((size_t)n_tok * hc_dim * sizeof(cur[0]));
     float *next = xmalloc((size_t)n_tok * hc_dim * sizeof(next[0]));
     float *attn = xmalloc((size_t)n_tok * hc_dim * sizeof(attn[0]));
@@ -17625,7 +17655,7 @@ static void prefill_layer_major_cpu(
     bool decode_scratch_ready = false;
 
     for (uint64_t t = 0; t < n_tok; t++) {
-        embed_token_f16(model, weights, prompt->v[t], plain);
+        embed_token_f16(model, weights, tokens[t], plain);
         hc_from_plain_embedding(cur + t * hc_dim, plain, DS4_N_EMBD, DS4_N_HC);
     }
 
@@ -17643,6 +17673,7 @@ static void prefill_layer_major_cpu(
                                           cur,
                                           (uint32_t)n_tok,
                                           il,
+                                          pos0,
                                           steering_dirs,
                                           steering_attn_scale);
 
@@ -17651,7 +17682,7 @@ static void prefill_layer_major_cpu(
                                        model,
                                        &weights->layer[il],
                                        attn,
-                                       prompt->v,
+                                       tokens,
                                        (uint32_t)n_tok,
                                        il,
                                        steering_dirs,
@@ -17661,7 +17692,7 @@ static void prefill_layer_major_cpu(
                                           model,
                                           &weights->layer[il],
                                           attn,
-                                          prompt->v,
+                                          tokens,
                                           (uint32_t)n_tok,
                                           il,
                                           steering_dirs,
@@ -17673,7 +17704,7 @@ static void prefill_layer_major_cpu(
                                   &weights->layer[il],
                                   attn + t * hc_dim,
                                   il,
-                                  prompt->v[t],
+                                  tokens[t],
                                   steering_dirs,
                                   steering_ffn_scale,
                                   false);
@@ -17681,7 +17712,7 @@ static void prefill_layer_major_cpu(
             }
         } else {
             if (!decode_scratch_ready) {
-                cpu_decode_scratch_init(&decode_scratch, (uint32_t)n_tok);
+                cpu_decode_scratch_init(&decode_scratch, pos0 + (uint32_t)n_tok);
                 decode_scratch_ready = true;
             }
             for (uint64_t t = 0; t < n_tok; t++) {
@@ -17691,8 +17722,8 @@ static void prefill_layer_major_cpu(
                                           &cache->layer[il],
                                           cur + t * hc_dim,
                                           il,
-                                          (uint32_t)t,
-                                          prompt->v[t],
+                                          pos0 + (uint32_t)t,
+                                          tokens[t],
                                           steering_dirs,
                                           steering_attn_scale,
                                           steering_ffn_scale,
@@ -17705,7 +17736,7 @@ static void prefill_layer_major_cpu(
         next = tmp;
     }
 
-    kv_cache_finish_prefill_states(cache, (uint32_t)n_tok);
+    kv_cache_finish_prefill_states(cache, pos0 + (uint32_t)n_tok);
 
     if (logits) {
         output_logits_one(logits, model, weights, cur + (n_tok - 1) * hc_dim);
@@ -47385,7 +47416,7 @@ static int generate_raw_swa_cpu(
         return 1;
     }
 
-    prefill_layer_major_cpu(logits, model, weights, &cache, prompt,
+    prefill_layer_major_cpu(logits, model, weights, &cache, prompt->v, (uint32_t)prompt->len, 0,
                             directional_steering_dirs,
                             directional_steering_attn,
                             directional_steering_ffn);
@@ -78554,6 +78585,23 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             ds4_tokens_starts_with(prompt, &s->checkpoint))
         {
             s->mtp_draft_valid = false;
+            const int n_new = prompt->len - s->checkpoint.len;
+            if (n_new >= DS4_CPU_CONTINUE_BATCH_MIN) {
+                /* Continued prompt: batched layer-major prefill from the
+                 * checkpoint position, bitwise the token loop below. */
+                prefill_layer_major_cpu(s->logits,
+                                        &e->model,
+                                        &e->weights,
+                                        &s->cpu_cache,
+                                        prompt->v + s->checkpoint.len,
+                                        (uint32_t)n_new,
+                                        (uint32_t)s->checkpoint.len,
+                                        e->directional_steering_dirs,
+                                        e->directional_steering_attn_scale,
+                                        e->directional_steering_ffn_scale);
+                ds4_tokens_copy(&s->checkpoint, prompt);
+                if (s->progress) s->progress(s->progress_ud, "prefill_chunk", prompt->len, prompt->len);
+            }
             for (int i = s->checkpoint.len; i < prompt->len; i++) {
                 if (ds4_session_cancelled(s)) {
                     snprintf(err, errlen, "interrupted");
@@ -78585,7 +78633,9 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                                 &e->model,
                                 &e->weights,
                                 &s->cpu_cache,
-                                prompt,
+                                prompt->v,
+                                (uint32_t)prompt->len,
+                                0,
                                 e->directional_steering_dirs,
                                 e->directional_steering_attn_scale,
                                 e->directional_steering_ffn_scale);

@@ -1719,8 +1719,10 @@ static void check_ffn_graph(void) {
 
 /* Prefix prefill attention must match the per-token attention each token
  * would run against its raw window and the compressed rows pushed so far,
- * with and without an indexer mask.  The model shape takes the sixteen-lane
- * kernels; 3 heads of 40 dims take the partial-group and tail paths. */
+ * with and without an indexer mask, for a fresh prompt and for one that
+ * continues a cache (pos0 > 0, the window starting in the cached rows).  The
+ * model shape takes the sixteen-lane kernels; 3 heads of 40 dims take the
+ * partial-group and tail paths. */
 static void check_prefix_attention_shape(uint32_t n_heads, uint32_t n_dims) {
     const ds4_shape saved = g_ds4_shape;
     g_ds4_shape = DS4_SHAPE_FLASH;
@@ -1740,7 +1742,7 @@ static void check_prefix_attention_shape(uint32_t n_heads, uint32_t n_dims) {
     ds4_layer_weights layer = {.attn_sinks = &sinks_t};
 
     float *q = xmalloc((size_t)n_tok * q_dim * sizeof(q[0]));
-    float *kv = xmalloc((size_t)n_tok * head_dim * sizeof(kv[0]));
+    float *kv = xmalloc((size_t)(raw_cap + n_tok) * head_dim * sizeof(kv[0]));
     float *comp = xmalloc((size_t)n_comp_rows * head_dim * sizeof(comp[0]));
     float *batch = xmalloc((size_t)n_tok * q_dim * sizeof(batch[0]));
     float *one = xmalloc(q_dim * sizeof(one[0]));
@@ -1749,7 +1751,7 @@ static void check_prefix_attention_shape(uint32_t n_heads, uint32_t n_dims) {
     uint8_t *bits = xmalloc((size_t)n_tok * allowed_stride);
     bool *allowed = xmalloc(n_comp_rows * sizeof(allowed[0]));
     for (uint64_t i = 0; i < (uint64_t)n_tok * q_dim; i++) q[i] = quant_float();
-    for (uint64_t i = 0; i < (uint64_t)n_tok * head_dim; i++) kv[i] = quant_float();
+    for (uint64_t i = 0; i < (uint64_t)(raw_cap + n_tok) * head_dim; i++) kv[i] = quant_float();
     for (uint64_t i = 0; i < (uint64_t)n_comp_rows * head_dim; i++) comp[i] = quant_float();
     for (uint32_t t = 0; t < n_tok; t++) {
         comp_counts[t] = (t + 1) / 3 < n_comp_rows ? (t + 1) / 3 : n_comp_rows;
@@ -1757,33 +1759,49 @@ static void check_prefix_attention_shape(uint32_t n_heads, uint32_t n_dims) {
         for (uint64_t b = 0; b < allowed_stride; b++) bits[t * allowed_stride + b] = (uint8_t)quant_random();
     }
 
-    for (unsigned masked = 0; masked < 2; masked++) {
-        layer_attention_prefix_batch(batch, &m, &layer, q, kv, comp, comp_counts,
-                                     masked ? mask : NULL, masked ? bits : NULL,
-                                     allowed_stride, n_tok, raw_cap);
-        for (uint32_t t = 0; t < n_tok; t++) {
-            const uint32_t raw_count = t + 1 < raw_cap ? t + 1 : raw_cap;
-            const bool use_mask = masked && mask[t];
-            for (uint32_t c = 0; c < comp_counts[t]; c++)
-                allowed[c] = (bits[t * allowed_stride + (c >> 3)] >> (c & 7u)) & 1u;
-            layer_attention_mixed_one(one, &m, &layer, q + t * q_dim,
-                                      kv + (uint64_t)(t + 1 - raw_count) * head_dim, raw_count,
-                                      comp, comp_counts[t], use_mask ? allowed : NULL);
-            for (uint64_t i = 0; i < q_dim; i++)
-                quant_bits_equal(masked ? "masked prefix attention" : "prefix attention",
-                                 one[i], batch[t * q_dim + i], (unsigned)(t * q_dim + i));
+    /* raw_base cached rows precede the new ones: pos0 below, at and past
+     * the window. */
+    const uint32_t starts[4] = {0, 3, raw_cap - 1, 10};
+    for (unsigned si = 0; si < 4; si++) {
+        const uint32_t pos0 = starts[si];
+        const uint32_t raw_base = pos0 < raw_cap ? pos0 : raw_cap;
+        const float *raw = kv + (uint64_t)(raw_cap - raw_base) * head_dim;
+        for (unsigned masked = 0; masked < 2; masked++) {
+            layer_attention_prefix_batch(batch, &m, &layer, q, raw, comp, comp_counts,
+                                         masked ? mask : NULL, masked ? bits : NULL,
+                                         allowed_stride, n_tok, raw_cap, pos0, raw_base);
+            for (uint32_t t = 0; t < n_tok; t++) {
+                const uint32_t pos = pos0 + t;
+                const uint32_t raw_count = pos + 1 < raw_cap ? pos + 1 : raw_cap;
+                const bool use_mask = masked && mask[t];
+                for (uint32_t c = 0; c < comp_counts[t]; c++)
+                    allowed[c] = (bits[t * allowed_stride + (c >> 3)] >> (c & 7u)) & 1u;
+                layer_attention_mixed_one(one, &m, &layer, q + t * q_dim,
+                                          raw + (uint64_t)(raw_base + t + 1 - raw_count) * head_dim, raw_count,
+                                          comp, comp_counts[t], use_mask ? allowed : NULL);
+                for (uint64_t i = 0; i < q_dim; i++)
+                    quant_bits_equal(masked ? "masked prefix attention" : "prefix attention",
+                                     one[i], batch[t * q_dim + i], (unsigned)(t * q_dim + i));
+            }
         }
     }
 
     /* Raw-only layers: no compressed rows, the per-token path is rows_one. */
     memset(comp_counts, 0, (size_t)n_tok * sizeof(comp_counts[0]));
-    layer_attention_prefix_batch(batch, &m, &layer, q, kv, NULL, comp_counts, NULL, NULL, 0, n_tok, raw_cap);
-    for (uint32_t t = 0; t < n_tok; t++) {
-        const uint32_t raw_count = t + 1 < raw_cap ? t + 1 : raw_cap;
-        layer_attention_rows_one(one, &m, &layer, q + t * q_dim,
-                                 kv + (uint64_t)(t + 1 - raw_count) * head_dim, raw_count);
-        for (uint64_t i = 0; i < q_dim; i++)
-            quant_bits_equal("raw prefix attention", one[i], batch[t * q_dim + i], (unsigned)(t * q_dim + i));
+    for (unsigned si = 0; si < 4; si++) {
+        const uint32_t pos0 = starts[si];
+        const uint32_t raw_base = pos0 < raw_cap ? pos0 : raw_cap;
+        const float *raw = kv + (uint64_t)(raw_cap - raw_base) * head_dim;
+        layer_attention_prefix_batch(batch, &m, &layer, q, raw, NULL, comp_counts, NULL, NULL, 0,
+                                     n_tok, raw_cap, pos0, raw_base);
+        for (uint32_t t = 0; t < n_tok; t++) {
+            const uint32_t pos = pos0 + t;
+            const uint32_t raw_count = pos + 1 < raw_cap ? pos + 1 : raw_cap;
+            layer_attention_rows_one(one, &m, &layer, q + t * q_dim,
+                                     raw + (uint64_t)(raw_base + t + 1 - raw_count) * head_dim, raw_count);
+            for (uint64_t i = 0; i < q_dim; i++)
+                quant_bits_equal("raw prefix attention", one[i], batch[t * q_dim + i], (unsigned)(t * q_dim + i));
+        }
     }
 
     free(allowed); free(bits); free(mask); free(comp_counts);
