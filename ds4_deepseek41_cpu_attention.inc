@@ -22,9 +22,6 @@ typedef struct {
      * [head group][row][16] and 1 / denominator per head. */
     float qt[64 * 512], score[64 * (128 + 512)], inv[64];
     const float *rows[128 + 512];
-    /* Set by the layer-major prefill to the current token's compressor and
-     * indexer projections, computed for the whole chunk beforehand. */
-    const float *given_kv, *given_score, *given_index_q, *given_index_w;
 } ds41_cpu_attention_state;
 
 static void ds41_cpu_attention_free(ds41_cpu_attention_state *s) {
@@ -228,28 +225,17 @@ static bool ds41_cpu_attention_select(ds41_cpu_attention_state *s,
                                       uint32_t il, uint32_t pos, const float *norm) {
     ds41_prof(DS41_PROF_COMP);
     const uint32_t ratio = ds4_layer_compress_ratio(il);
-    if (ds41_kv_source(il)) {
-        if (s->given_kv) memcpy(s->pool_kv, s->given_kv, sizeof(s->pool_kv));
-        else if (!ds41_cpu_matvec(s->pool_kv, m, l->attn_compressor_kv, norm, ratio == 1u))
-            return false;
-        if (ratio == 2u) {
-            if (s->given_score) memcpy(s->pool_score, s->given_score, sizeof(s->pool_score));
-            else if (!ds41_cpu_matvec(s->pool_score, m, l->attn_compressor_gate, norm, false))
-                return false;
-        }
-        if (!ds41_cpu_attention_publish(s, m, l, il, pos)) return false;
-    }
+    if (ds41_kv_source(il) &&
+        (!ds41_cpu_matvec(s->pool_kv, m, l->attn_compressor_kv, norm, ratio == 1u) ||
+         (ratio == 2u &&
+          !ds41_cpu_matvec(s->pool_score, m, l->attn_compressor_gate, norm, false)) ||
+         !ds41_cpu_attention_publish(s, m, l, il, pos))) return false;
     ds41_prof(DS41_PROF_INDEX);
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0;
     if (!n_comp || !ds41_index_source(il)) return true;
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
-    if (s->given_index_q) {
-        memcpy(s->index_q, s->given_index_q, sizeof(s->index_q));
-        memcpy(s->index_weights, s->given_index_w, sizeof(s->index_weights));
-    } else if (!ds41_cpu_matvec(s->index_q, m, l->indexer_attn_q_b, s->qr, true) ||
-               !ds41_cpu_matvec(s->index_weights, m, l->indexer_proj, norm, true)) {
-        return false;
-    }
+    if (!ds41_cpu_matvec(s->index_q, m, l->indexer_attn_q_b, s->qr, true) ||
+        !ds41_cpu_matvec(s->index_weights, m, l->indexer_proj, norm, true)) return false;
     ds41_cpu_attention_index_q(s, pos);
     ds41_cpu_attention_rank(s, il, owner, n_comp);
     return true;
@@ -621,17 +607,6 @@ static bool ds41_cpu_attention_project(ds41_cpu_attention_state *s, const ds4_mo
     if (!ds41_cpu_matvec(s->kv, m, l->attn_kv, norm, true) ||
         !ds41_cpu_norm(s->kv, s->kv, m, l->attn_kv_a_norm)) return false;
     return ds41_cpu_attention_cache(s, m, l, il, pos, norm);
-}
-
-/* Attention of one token from its projected s->qr, s->q and s->kv into
- * s->heads, updating the caches.  Tokens must arrive in position order. */
-static bool ds41_cpu_attention_core(ds41_cpu_attention_state *s, const ds4_model *m,
-                                    const ds4_layer_weights *l, uint32_t il,
-                                    uint32_t pos, const float *norm) {
-    if (!s || il >= 40 || pos >= s->ctx) return false;
-    if (!ds41_cpu_attention_cache(s, m, l, il, pos, norm)) return false;
-    ds41_cpu_attention_attend(s, m, l, il, pos);
-    return true;
 }
 
 /* The grouped low-rank output projection of s->heads into block. */

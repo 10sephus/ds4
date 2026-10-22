@@ -220,6 +220,7 @@ typedef struct ds41_cpu_batch {
     float *pre, *attn_split, *ffn_split, *qr, *q, *kv, *heads, *low;
     float *rows, *engram_kv, *shared_gate, *shared_up, *shared_mid;
     float *mid, *partial, *weight, *mix, *probs, *ckv, *cscore, *iq, *iw;
+    float *prev_window;
     double *xt;
     int *selected;
     uint32_t *ids, *entry, *sel;
@@ -681,16 +682,17 @@ layer_fail:
 
 /* Layer-major prefill.  Each layer runs over a chunk of prompt tokens before
  * the next one, so a dense tile or a routed expert is decoded once for all
- * the chunk's tokens that use it.  Attention, compression and indexing run
- * per token in position order on the shared caches; HC, norms, the router
- * and the other glue run per token in parallel.  Every value is computed by
- * the same operations as in ds41_cpu_forward, so the logits are bitwise
- * those of the token loop. */
+ * the chunk's tokens that use it.  The KV side of attention (raw window,
+ * compression) runs per token in position order on the shared caches; the
+ * query side (indexing, staging, the heads), HC, norms, the router and the
+ * other glue run per token in parallel.  Every value is computed by the
+ * same operations as in ds41_cpu_forward, so the logits are bitwise those
+ * of the token loop. */
 typedef struct {
     ds41_cpu_state *s;
     ds41_cpu_batch *b;
     const ds4_layer_weights *l;
-    uint32_t il;
+    uint32_t il, n;
     bool mixed;     /* mix holds the HC mixer projections */
     bool routed;    /* probs holds the router, partial the routed experts */
     int failed;
@@ -711,6 +713,7 @@ static void ds41_cpu_batch_free(ds41_cpu_batch *b) {
     free(b->selected); free(b->ids); free(b->entry); free(b->sel);
     free(b->mix); free(b->probs); free(b->xt);
     free(b->ckv); free(b->cscore); free(b->iq); free(b->iw);
+    free(b->prev_window);
     free(b);
 }
 
@@ -753,13 +756,14 @@ static ds41_cpu_batch *ds41_cpu_batch_create(void) {
     b->cscore = malloc(n * 512u * f);
     b->iq = malloc(n * 32u * 128u * f);
     b->iw = malloc(n * 32u * f);
+    b->prev_window = malloc(128u * 512u * f);
     if (!b->residual || !b->after_attn || !b->flat || !b->x || !b->norm ||
         !b->block || !b->shared || !b->pre || !b->attn_split || !b->ffn_split ||
         !b->qr || !b->q || !b->kv || !b->heads || !b->low || !b->rows ||
         !b->engram_kv || !b->shared_gate || !b->shared_up || !b->shared_mid ||
         !b->mid || !b->partial || !b->weight || !b->selected || !b->ids || !b->entry ||
         !b->sel || !b->mix || !b->probs || !b->xt || !b->ckv || !b->cscore ||
-        !b->iq || !b->iw) {
+        !b->iq || !b->iw || !b->prev_window) {
         ds41_cpu_batch_free(b);
         return NULL;
     }
@@ -926,6 +930,134 @@ static void ds41_cpu_batch_ffn_out_worker(void *vctx, uint64_t t0, uint64_t t1) 
     }
 }
 
+/* The KV side of the chunk's attention in position order: RoPE and
+ * quantization of each token's KV into the layer's raw window and, on the
+ * KV source layers, the compressor pooling, the compressed row and its
+ * indexer key, as ds41_cpu_attention_cache does them token by token. */
+static bool ds41_cpu_batch_attention_kv(ds41_cpu_batch_ctx *c, uint32_t n) {
+    ds41_cpu_state *s = c->s;
+    ds41_cpu_batch *b = c->b;
+    ds41_cpu_attention_state *as = s->attention;
+    const uint32_t il = c->il, ratio = ds4_layer_compress_ratio(il);
+    const bool kv_source = ds41_kv_source(il);
+    /* The raw rows before the chunk, which the chunk's rows overwrite. */
+    memcpy(b->prev_window, as->window[il], 128u * 512u * sizeof(float));
+    for (uint32_t i = 0; i < n; i++) {
+        const uint32_t pos = s->pos + i;
+        float *kv = b->kv + (size_t)i * 512u;
+        ds41_cpu_rope(kv, 512, 1, pos, ratio != 0, false);
+        ds41_cpu_quantize(kv, 512, 1, DS41_CPU_FP8_E8M0);
+        memcpy(as->window[il] + (size_t)(pos % 128u) * 512u, kv, 512u * sizeof(float));
+        if (!kv_source) continue;
+        memcpy(as->pool_kv, b->ckv + (size_t)i * 512u, sizeof(as->pool_kv));
+        if (ratio == 2u)
+            memcpy(as->pool_score, b->cscore + (size_t)i * 512u, sizeof(as->pool_score));
+        if (!ds41_cpu_attention_publish(as, s->model, c->l, il, pos)) return false;
+    }
+    return true;
+}
+
+typedef struct {
+    const float *rows[128 + 512];
+    float *attended, *qt, *score, *index_scores;
+    float inv[64];
+    ds41_cpu_candidate heap[512];
+} ds41_cpu_batch_attention_scratch;
+
+/* The query side of one token's attention after the KV pass: index scores
+ * and selection on an index source, staging and the sink softmax heads.
+ * The token reads only cache rows up to its own position, which the KV
+ * pass left as the token loop would have at that position, and every step
+ * is the one of ds41_cpu_attention_cache and ds41_cpu_attention_attend
+ * on the same inputs: the lanes workers compute each of their items the
+ * same way whatever the split. */
+static void ds41_cpu_batch_attention_token(ds41_cpu_batch_ctx *c,
+                                           ds41_cpu_batch_attention_scratch *sc,
+                                           uint32_t i) {
+    ds41_cpu_state *s = c->s;
+    ds41_cpu_batch *b = c->b;
+    ds41_cpu_attention_state *as = s->attention;
+    const uint32_t il = c->il, pos = s->pos + i;
+    const uint32_t ratio = ds4_layer_compress_ratio(il);
+    const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
+    const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
+    uint32_t *sel = b->sel + (size_t)i * 512u;
+    float *q = b->q + (size_t)i * 64u * 512u, *heads = b->heads + (size_t)i * 64u * 512u;
+    ds41_cpu_rope(q, 512, 64, pos, ratio != 0, false);
+    if (n_comp && ds41_index_source(il)) {
+        float *iq = b->iq + (size_t)i * 32u * 128u;
+        ds41_cpu_rope(iq, 128, 32, pos, true, false);
+        ds41_cpu_quantize(iq, 128, 32, DS41_CPU_FP4_E8M0);
+        ds41_cpu_index_score_context score = {
+            iq, as->index_cache[owner], b->iw + (size_t)i * 32u, sc->index_scores
+        };
+        ds41_cpu_index_score_worker(&score, 0, n_comp);
+        /* Within 2048 blocks ds41_cpu_attention_candidates only clears the
+         * block mask on layer 20, so the later sources mask nothing. */
+        ds41_cpu_attention_topk(sel, sc->index_scores, n_comp,
+                                n_comp < 512u ? n_comp : 512u, sc->heap);
+    }
+    const uint32_t attended = n_comp < 512u ? n_comp : 512u;
+    const uint32_t n_raw = pos < 127u ? pos + 1u : 128u, n_rows = n_raw + attended;
+    for (uint32_t r = 0; r < n_raw; r++) {
+        const uint32_t p = pos + 1u - n_raw + r;
+        const float *src = p >= s->pos ? b->kv + (size_t)(p - s->pos) * 512u :
+                                         b->prev_window + (size_t)(p % 128u) * 512u;
+        ds41_cpu_f16_round(sc->attended + (size_t)r * 512u, src, 512);
+    }
+    for (uint32_t r = 0; r < attended; r++)
+        ds41_cpu_f16_round(sc->attended + (size_t)(n_raw + r) * 512u,
+                           as->compressed[owner] + (size_t)sel[r] * 512u, 512);
+    ds41_cpu_f16_round(q, q, 64u * 512u);
+    for (uint32_t r = 0; r < n_rows; r++) sc->rows[r] = sc->attended + (size_t)r * 512u;
+    attn_lanes_transpose_q(sc->qt, q, 64, 512);
+    layer_attention_lanes_ctx ctx = {
+        .out_heads = heads,
+        .sinks = tensor_data(s->model, c->l->attn_sinks),
+        .q = q,
+        .qt = sc->qt,
+        .rows = sc->rows,
+        .score = sc->score,
+        .inv = sc->inv,
+        .n_head = 64,
+        .score_stride = 128 + 512,
+        .n_rows = n_rows,
+        .n_chunks = (n_rows + ATTN_LANES_ROWS_PER_ITEM - 1) / ATTN_LANES_ROWS_PER_ITEM,
+        .n_dim_chunks = 512 / 16,
+    };
+    if (n_rows) attn_lanes_score_worker(&ctx, 0, 4u * ctx.n_chunks);
+    ds41_cpu_attention_weight_worker(&ctx, 0, 64);
+    attn_lanes_sum_worker(&ctx, 0, 4u * ctx.n_dim_chunks);
+    ds41_cpu_bf16_rows(heads, 64u * 512u);
+    ds41_cpu_rope(heads, 512, 64, pos, ratio != 0, true);
+}
+
+/* Item p of (n + 1) / 2 pairs the short early token p with the long late
+ * token n - 1 - p, as V4's prefill does, to balance the claims. */
+static void ds41_cpu_batch_attention_worker(void *vctx, uint64_t p0, uint64_t p1) {
+    ds41_cpu_batch_ctx *c = vctx;
+    const uint32_t n = c->n;
+    const size_t f = sizeof(float);
+    ds41_cpu_batch_attention_scratch *sc = malloc(sizeof(*sc));
+    float *attended = malloc((128u + 512u) * 512u * f), *qt = malloc(64u * 512u * f);
+    float *score = malloc(64u * (128u + 512u) * f);
+    float *index_scores = malloc(((size_t)c->s->pos + n + 1u) * f);
+    if (!sc || !attended || !qt || !score || !index_scores) {
+        ds41_cpu_batch_fail(c);
+    } else {
+        sc->attended = attended;
+        sc->qt = qt;
+        sc->score = score;
+        sc->index_scores = index_scores;
+        for (uint64_t p = p0; p < p1; p++) {
+            ds41_cpu_batch_attention_token(c, sc, (uint32_t)p);
+            if (n - 1u - (uint32_t)p != (uint32_t)p)
+                ds41_cpu_batch_attention_token(c, sc, n - 1u - (uint32_t)p);
+        }
+    }
+    free(index_scores); free(score); free(qt); free(attended); free(sc);
+}
+
 static bool ds41_cpu_prefill_layer(ds41_cpu_state *s, uint32_t il, uint32_t n,
                                    double *phase) {
     ds41_cpu_batch *b = s->batch;
@@ -972,26 +1104,16 @@ static bool ds41_cpu_prefill_layer(ds41_cpu_state *s, uint32_t il, uint32_t n,
     if (index &&
         (!ds41_cpu_matmul(b->iq, 32u * 128u, m, l->indexer_attn_q_b, b->qr, 1280, n, true) ||
          !ds41_cpu_matmul(b->iw, 32, m, l->indexer_proj, b->norm, 5120, n, true))) return false;
-    /* A compressed layer that is no index source attends the rows its
-     * token's last index source selected: keep that selection per token. */
-    const bool reuse = !index && ratio != 0;
-    for (uint32_t i = 0; i < n; i++) {
-        uint32_t *sel = b->sel + (size_t)i * 512u;
-        memcpy(as->qr, b->qr + (size_t)i * 1280u, sizeof(as->qr));
-        memcpy(as->q, b->q + (size_t)i * 64u * 512u, sizeof(as->q));
-        memcpy(as->kv, b->kv + (size_t)i * 512u, sizeof(as->kv));
-        if (reuse) memcpy(as->selected_comp, sel, sizeof(as->selected_comp));
-        as->given_kv = kv_source ? b->ckv + (size_t)i * 512u : NULL;
-        as->given_score = kv_source && ratio == 2u ? b->cscore + (size_t)i * 512u : NULL;
-        as->given_index_q = index ? b->iq + (size_t)i * 32u * 128u : NULL;
-        as->given_index_w = index ? b->iw + (size_t)i * 32u : NULL;
-        const bool ok = ds41_cpu_attention_core(as, m, l, il, s->pos + i,
-                                                b->norm + (size_t)i * 5120u);
-        as->given_kv = as->given_score = as->given_index_q = as->given_index_w = NULL;
-        if (!ok) return false;
-        if (index) memcpy(sel, as->selected_comp, sizeof(as->selected_comp));
-        memcpy(b->heads + (size_t)i * 64u * 512u, as->heads, sizeof(as->heads));
-    }
+    /* The KV side in position order, then the query side of the tokens in
+     * parallel.  A compressed layer that is no index source attends the
+     * rows its token's last index source selected, kept per token in sel;
+     * the state keeps the last token's selection, as after the token loop. */
+    if (!ds41_cpu_batch_attention_kv(&c, n)) return false;
+    c.n = n;
+    ds4_parallel_for_min_rows((n + 1u) / 2u, ds41_cpu_batch_attention_worker, &c, 1);
+    if (c.failed) return false;
+    if (ratio && (s->pos + n) / ratio)
+        memcpy(as->selected_comp, b->sel + (size_t)(n - 1u) * 512u, sizeof(as->selected_comp));
     DS41_PHASE(2);
     const ds4_tensor *oa = l->attn_output_a;
     if (oa->type == DS4_TENSOR_Q8_0 && oa->dim[0] == 4096u && oa->elements == 4096u * 8192u &&
