@@ -1107,6 +1107,12 @@ DS4_STATIC_ASSERT(ds4_block_q8_k_size, sizeof(block_q8_K) == 292);
 DS4_STATIC_ASSERT(ds4_block_iq2_xxs_size, sizeof(block_iq2_xxs) == 66);
 DS4_STATIC_ASSERT(ds4_block_mxfp4_size, sizeof(block_mxfp4) == 17);
 
+/* One compressed row in the indexer top-k sort. */
+typedef struct {
+    float    score;
+    uint32_t index;
+} indexer_candidate;
+
 typedef struct {
     uint32_t ctx_size;
     uint32_t comp_cap;
@@ -1142,6 +1148,7 @@ typedef struct {
     float *index_qt;
     float *index_weights;
     float *index_scores;
+    indexer_candidate *index_cand;
 
     float *ffn_cur;
     float *ffn_norm;
@@ -14451,6 +14458,7 @@ static void cpu_decode_scratch_init(ds4_cpu_decode_scratch *scratch, uint32_t ct
     scratch->index_qt = xmalloc((size_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
     scratch->index_weights = xmalloc((size_t)DS4_N_INDEXER_HEAD * sizeof(float));
     scratch->index_scores = xmalloc((size_t)comp_cap * sizeof(float));
+    scratch->index_cand = xmalloc((size_t)comp_cap * sizeof(indexer_candidate));
 
     scratch->ffn_cur = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
     scratch->ffn_norm = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
@@ -14504,6 +14512,7 @@ static void cpu_decode_scratch_free(ds4_cpu_decode_scratch *scratch) {
     free(scratch->ffn_moe);
     free(scratch->ffn_norm);
     free(scratch->ffn_cur);
+    free(scratch->index_cand);
     free(scratch->index_scores);
     free(scratch->index_weights);
     free(scratch->index_qt);
@@ -15220,21 +15229,38 @@ static void indexer_score_rows(
     ds4_parallel_for_min_rows(n_comp, indexer_score_rows_worker, &ctx, 1);
 }
 
-/* top_k rounds, each taking the lowest index with the strictly greatest score
- * among the rows not yet chosen. */
-static void indexer_select_top_k(bool *allowed, const float *scores, uint32_t n_comp, uint32_t top_k) {
-    memset(allowed, 0, (size_t)n_comp * sizeof(allowed[0]));
-    for (uint32_t k = 0; k < top_k; k++) {
-        uint32_t best = 0;
-        float best_score = DS4_NEG_INF;
-        for (uint32_t c = 0; c < n_comp; c++) {
-            if (!allowed[c] && scores[c] > best_score) {
-                best = c;
-                best_score = scores[c];
-            }
-        }
-        allowed[best] = true;
+/* Descending score, ascending index: the order in which argmax rounds with a
+ * strict '>' pick rows.  Candidates are never NaN. */
+static int indexer_candidate_cmp(const void *a, const void *b) {
+    const indexer_candidate *x = a, *y = b;
+    if (x->score != y->score) return x->score > y->score ? -1 : 1;
+    return (x->index > y->index) - (x->index < y->index);
+}
+
+/* Same allowed set as the reference selection, top_k argmax rounds each taking
+ * the lowest index with the strictly greatest score among the rows not yet
+ * chosen, starting from DS4_NEG_INF: a row that never compares greater than
+ * DS4_NEG_INF (NaN or lower) is never a candidate, and once the candidates run
+ * out every remaining round falls back to row 0.  Sorting the candidates is
+ * O(n log n) instead of O(top_k * n).  cand is scratch of n_comp entries. */
+static void indexer_select_top_k(
+        bool              * allowed,
+        indexer_candidate * cand,
+        const float       * scores,
+        uint32_t            n_comp,
+        uint32_t            top_k) {
+    uint32_t n_cand = 0;
+    for (uint32_t c = 0; c < n_comp; c++) {
+        if (scores[c] > DS4_NEG_INF) cand[n_cand++] = (indexer_candidate){ scores[c], c };
     }
+    qsort(cand, n_cand, sizeof(cand[0]), indexer_candidate_cmp);
+
+    memset(allowed, 0, (size_t)n_comp * sizeof(allowed[0]));
+    if (n_cand < top_k) {
+        allowed[0] = true;
+        top_k = n_cand;
+    }
+    for (uint32_t k = 0; k < top_k; k++) allowed[cand[k].index] = true;
 }
 
 /* Indexer query and head weights for one token.  Decode passes its scratch so
@@ -15293,11 +15319,13 @@ static bool *indexer_allowed_decode_one(
     float *qt = xmalloc(q_dim * sizeof(qt[0]));
     float *weights = xmalloc((size_t)DS4_N_INDEXER_HEAD * sizeof(weights[0]));
     float *scores = xmalloc((size_t)n_comp * sizeof(scores[0]));
+    indexer_candidate *cand = xmalloc((size_t)n_comp * sizeof(cand[0]));
 
     indexer_query_decode_one(q, weights, model, layer, cur, qr_norm, il, pos, NULL);
     indexer_score_rows(scores, qt, q, weights, index_comp, n_comp);
-    indexer_select_top_k(allowed, scores, n_comp, top_k);
+    indexer_select_top_k(allowed, cand, scores, n_comp, top_k);
 
+    free(cand);
     free(scores);
     free(weights);
     free(qt);
@@ -15330,7 +15358,7 @@ static bool *indexer_allowed_decode_one_decode_scratch(
                              cur, qr_norm, il, pos, scratch);
     indexer_score_rows(scratch->index_scores, scratch->index_qt, scratch->index_q,
                        scratch->index_weights, index_comp, n_comp);
-    indexer_select_top_k(allowed, scratch->index_scores, n_comp, top_k);
+    indexer_select_top_k(allowed, scratch->index_cand, scratch->index_scores, n_comp, top_k);
     return allowed;
 }
 

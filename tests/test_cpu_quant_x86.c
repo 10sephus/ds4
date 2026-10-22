@@ -212,10 +212,28 @@ static void check_block_dots(void) {
     }
 }
 
+static float indexer_random_float(void) {
+    return (float)(int32_t)quant_random() * 0x1p-31f;
+}
+
+/* The original selection: argmax rounds with a strict '>' from DS4_NEG_INF,
+ * so NaN and -inf rows are never picked and exhausted rounds fall back to
+ * row 0. */
+static void indexer_select_oracle(bool *allowed, const float *scores, unsigned n_comp, unsigned top_k) {
+    memset(allowed, 0, n_comp * sizeof(allowed[0]));
+    for (unsigned k = 0; k < top_k; k++) {
+        unsigned best = 0;
+        float best_score = DS4_NEG_INF;
+        for (unsigned c = 0; c < n_comp; c++) {
+            if (!allowed[c] && scores[c] > best_score) { best = c; best_score = scores[c]; }
+        }
+        allowed[best] = true;
+    }
+}
+
 /* Serial indexer reference: the platform's serial dot_f32 order (scalar
- * ascending i on x86), per-head accumulation in head order, then the argmax
- * rounds of the original loop (strict '>' from DS4_NEG_INF, so NaN and -inf
- * rows are never picked and exhausted rounds fall back to row 0). */
+ * ascending i on x86), per-head accumulation in head order, then the
+ * original selection. */
 static void indexer_oracle(bool *allowed, float *scores, const float *q, const float *weights,
                            const float *comp, unsigned n_comp, unsigned top_k) {
     const unsigned n_head = DS4_N_INDEXER_HEAD, head_dim = DS4_N_INDEXER_HEAD_DIM;
@@ -233,19 +251,46 @@ static void indexer_oracle(bool *allowed, float *scores, const float *q, const f
         }
         scores[c] = s;
     }
-    memset(allowed, 0, n_comp * sizeof(allowed[0]));
-    for (unsigned k = 0; k < top_k; k++) {
-        unsigned best = 0;
-        float best_score = DS4_NEG_INF;
-        for (unsigned c = 0; c < n_comp; c++) {
-            if (!allowed[c] && scores[c] > best_score) { best = c; best_score = scores[c]; }
-        }
-        allowed[best] = true;
-    }
+    indexer_select_oracle(allowed, scores, n_comp, top_k);
 }
 
-static float indexer_random_float(void) {
-    return (float)(int32_t)quant_random() * 0x1p-31f;
+/* Selection alone on crafted scores: ties at every level including the
+ * top_k boundary, +-0, +-inf, NaN, DS4_NEG_INF itself and values below it,
+ * and fewer candidates than top_k with and without row 0 among them. */
+static void check_indexer_selection(void) {
+    const float values[] = {-2.0f, -1.0f, -0.0f, 0.0f, 0.5f, 1.0f, 1.0e30f, 0x1p-149f,
+                            DS4_NEG_INF, -1.0e31f, INFINITY, -INFINITY, NAN};
+    const unsigned n_values = sizeof(values) / sizeof(*values);
+    const unsigned counts[] = {513, 600, 1500};
+    for (unsigned ci = 0; ci < sizeof(counts) / sizeof(*counts); ci++) {
+        const unsigned n_comp = counts[ci];
+        float *scores = xmalloc(n_comp * sizeof(float));
+        bool *allowed = xmalloc(n_comp * sizeof(bool));
+        bool *expected = xmalloc(n_comp * sizeof(bool));
+        indexer_candidate *cand = xmalloc(n_comp * sizeof(indexer_candidate));
+        for (unsigned pattern = 0; pattern < 9; pattern++) {
+            for (unsigned c = 0; c < n_comp; c++) {
+                switch (pattern) {
+                case 0: scores[c] = values[quant_random() % n_values]; break;
+                case 1: scores[c] = values[quant_random() % 8]; break;
+                case 2: scores[c] = indexer_random_float(); break;
+                case 3: scores[c] = (float)(quant_random() % 3); break;
+                case 4: scores[c] = c % 97 ? (c & 1 ? -0.0f : 0.0f) : 2.0f; break;
+                case 5: scores[c] = NAN; break;
+                case 6: scores[c] = c % 5 ? NAN : (float)(c % 7); break;
+                case 7: scores[c] = c % 5 && c ? (float)(c % 7) : NAN; break;
+                default: scores[c] = c < 512 ? 1.0f : -INFINITY; break;
+                }
+            }
+            const unsigned top_ks[] = {512, 1, 100, n_comp - 1};
+            for (unsigned ti = 0; ti < 4; ti++) {
+                indexer_select_oracle(expected, scores, n_comp, top_ks[ti]);
+                indexer_select_top_k(allowed, cand, scores, n_comp, top_ks[ti]);
+                CHECK(memcmp(allowed, expected, n_comp * sizeof(bool)) == 0);
+            }
+        }
+        free(cand); free(expected); free(allowed); free(scores);
+    }
 }
 
 /* Scores feed comparisons only, so a NaN of any payload is the same score. */
@@ -279,6 +324,7 @@ static void check_indexer(void) {
             float *expected = xmalloc(n_comp * sizeof(float));
             bool *allowed = xmalloc(n_comp * sizeof(bool));
             bool *allowed_expected = xmalloc(n_comp * sizeof(bool));
+            indexer_candidate *cand = xmalloc(n_comp * sizeof(indexer_candidate));
             for (unsigned repeat = 0; repeat < 4; repeat++) {
                 /* Random values round at every step, so any reassociation
                  * or fused multiply-add shows; the coarse pass and the
@@ -303,10 +349,10 @@ static void check_indexer(void) {
                 indexer_oracle(allowed_expected, expected, q, weights, comp, n_comp, top_k);
                 indexer_score_rows(scores, qt, q, weights, comp, n_comp);
                 indexer_scores_equal(expected, scores, n_comp);
-                indexer_select_top_k(allowed, scores, n_comp, top_k);
+                indexer_select_top_k(allowed, cand, scores, n_comp, top_k);
                 CHECK(memcmp(allowed, allowed_expected, n_comp * sizeof(bool)) == 0);
             }
-            free(allowed_expected); free(allowed); free(expected); free(scores); free(comp);
+            free(cand); free(allowed_expected); free(allowed); free(expected); free(scores); free(comp);
         }
         free(weights); free(qt); free(q);
     }
@@ -316,6 +362,7 @@ static void check_indexer(void) {
 int main(void) {
     check_integer_dots();
     check_indexer();
+    check_indexer_selection();
     puts("CPU indexer row-parallel scoring and top-k selection oracle PASS");
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     puts("CPU ARM DOTPROD IQ2_XXS/Q2_K integer oracles PASS");
