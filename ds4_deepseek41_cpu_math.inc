@@ -112,15 +112,17 @@ static void ds41_cpu_quantize(float *x, uint32_t width, uint32_t rows, int forma
 }
 
 /* One token, heads contiguous; only the final 64 dimensions are rotated.
- * V4.1 uses adjacent complex pairs and unit magnitude, including compression. */
-static void ds41_cpu_rope(float *x, uint32_t width, uint32_t heads,
-                         uint32_t pos, bool compressed, bool inverse) {
-    assert(x && width >= 64u && heads && pos < 1048576u);
+ * V4.1 uses adjacent complex pairs and unit magnitude, including compression.
+ * Pairs [pair0, pair1) only: a pair's values depend on nothing else. */
+static void ds41_cpu_rope_pairs(float *x, uint32_t width, uint32_t heads,
+                                uint32_t pos, bool compressed, bool inverse,
+                                uint32_t pair0, uint32_t pair1) {
+    assert(x && width >= 64u && heads && pos < 1048576u && pair1 <= 32u);
     const float base = compressed ? 160000.0f : 10000.0f;
     const double pi = 3.14159265358979323846;
     const float low = (float)floor(64.0 * log(65536.0 / (32.0 * 2.0 * pi)) / (2.0 * log(base)));
     const float high = (float)ceil(64.0 * log(65536.0 / (2.0 * pi)) / (2.0 * log(base)));
-    for (uint32_t pair = 0; pair < 32u; pair++) {
+    for (uint32_t pair = pair0; pair < pair1; pair++) {
         const float denominator = powf(base, (float)pair / 32.0f);
         float frequency = 1.0f / denominator;
         if (compressed) {
@@ -139,6 +141,11 @@ static void ds41_cpu_rope(float *x, uint32_t width, uint32_t heads,
             x[i + 1u] = ds41_cpu_bf16(re * s + im * c);
         }
     }
+}
+
+static void ds41_cpu_rope(float *x, uint32_t width, uint32_t heads,
+                         uint32_t pos, bool compressed, bool inverse) {
+    ds41_cpu_rope_pairs(x, width, heads, pos, compressed, inverse, 0, 32);
 }
 
 /* One token: four residual/key streams share the fifth projected KV vector.

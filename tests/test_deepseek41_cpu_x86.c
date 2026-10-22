@@ -537,21 +537,33 @@ static void check_batch_kv(test_layer *tl, const ds4_layer_weights *l) {
 #endif
 
 #if defined(__AVX512F__) && defined(__AVX512BW__)
-/* The staged heads, output projections and HC post against the plain
- * sequence of ds41_cpu_attention_forward() and ds41_cpu_hc_post_run(). */
+/* The staged query side, heads, output projections and HC post against the
+ * plain sequence of ds41_cpu_attention_forward() and ds41_cpu_hc_post_run(),
+ * from a projected query and filled caches: layers without compression
+ * (main's ratios: 2 for layer 2, 1 for layers 20 and 24), raw windows below
+ * and at 128 rows, and up to 512 attended compressed rows. */
 static void check_out_graph(test_layer *tl, const ds4_layer_weights *l) {
-    static const uint32_t rows[] = {1, 17, 130, 640};
-    ds41_cpu_attention_state *a = ds41_cpu_attention_create(64);
-    ds41_cpu_attention_state *b = ds41_cpu_attention_create(64);
+    static const uint32_t cases[][2] = {{0, 5}, {30, 1023}, {2, 40}, {2, 300}, {20, 5}, {24, 700}};
+    ds41_cpu_attention_state *a = ds41_cpu_attention_create(1100);
+    ds41_cpu_attention_state *b = ds41_cpu_attention_create(1100);
     ds41_cpu_state *sa = calloc(1, sizeof(*sa)), *sb = calloc(1, sizeof(*sb));
     CHECK(a && b && sa && sb);
-    for (size_t ri = 0; ri < sizeof(rows) / sizeof(*rows); ri++) {
-        const uint32_t n = rows[ri], pos = 700 + (uint32_t)ri;
-        for (uint32_t i = 0; i < n * 512; i++) a->attended_kv[i] = test_float();
-        for (uint32_t i = 0; i < 64 * 512; i++) a->q[i] = test_float();
+    for (size_t ci = 0; ci < sizeof(cases) / sizeof(*cases); ci++) {
+        const uint32_t il = cases[ci][0], pos = cases[ci][1];
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
+        const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
+        const uint32_t attended = n_comp < 512u ? n_comp : 512u;
+        const uint32_t n_raw = pos < 127u ? pos + 1u : 128u;
+        for (uint32_t i = 0; i < 128 * 512; i++) a->window[il][i] = test_float();
+        for (uint32_t i = 0; i < a->comp_cap[owner] * 512; i++) a->compressed[owner][i] = test_float();
+        for (uint32_t r = 0; r < attended; r++) a->selected_comp[r] = test_random() % n_comp;
+        for (uint32_t i = 0; i < 64 * 512; i++) a->q[i] = ds41_cpu_bf16(test_float());
         for (uint32_t i = 0; i < 4 * 5120; i++) sa->residual[i] = ds41_cpu_bf16(test_float());
         for (uint32_t i = 0; i < 24; i++) sa->attn_split[i] = test_float();
-        memcpy(b->attended_kv, a->attended_kv, n * 512 * sizeof(float));
+        memcpy(b->window[il], a->window[il], 128 * 512 * sizeof(float));
+        memcpy(b->compressed[owner], a->compressed[owner], (size_t)a->comp_cap[owner] * 512 * sizeof(float));
+        memcpy(b->selected_comp, a->selected_comp, sizeof(a->selected_comp));
         memcpy(b->q, a->q, sizeof(a->q));
         memcpy(sb->residual, sa->residual, sizeof(sa->residual));
         memcpy(sb->attn_split, sa->attn_split, sizeof(sa->attn_split));
@@ -561,16 +573,14 @@ static void check_out_graph(test_layer *tl, const ds4_layer_weights *l) {
             post[k] = (ds41_cpu_hc_post_job){.m = &tl->m, .norm_weight = l->ffn_norm,
                 .block = st[k]->block, .residual = st[k]->residual, .split = st[k]->attn_split,
                 .after = st[k]->after_attn, .x = st[k]->x, .norm = st[k]->norm};
-        ds41_cpu_attention_heads(a, tensor_data(&tl->m, l->attn_sinks), n);
-        ds41_cpu_bf16_rows(a->heads, 64u * 512u);
-        ds41_cpu_rope(a->heads, 512, 64, pos, true, true);
-        ds41_cpu_matvec_q8_grouped(a->low, &tl->m, l->attn_output_a, a->heads, 1024u, 4096u);
-        ds41_cpu_bf16_rows(a->low, 8192u);
-        CHECK(ds41_cpu_matvec(sa->block, &tl->m, l->attn_output_b, a->low, false));
-        ds41_cpu_bf16_rows(sa->block, 5120);
+        ds41_cpu_rope(a->q, 512, 64, pos, ratio != 0, false);
+        ds41_cpu_attention_attend(a, &tl->m, l, il, pos);
+        CHECK(ds41_cpu_attention_output(a, &tl->m, l, sa->block));
         CHECK(ds41_cpu_hc_post_run(&post[0]));
         CHECK(ds41_cpu_out_graph_supported(l, &post[1]));
-        ds41_cpu_out_graph_run(b, &tl->m, l, pos, true, n, sb->block, &post[1]);
+        ds41_cpu_out_graph_run(b, &tl->m, l, il, pos, sb->block, &post[1]);
+        test_equal("out query", a->q, b->q, 64 * 512);
+        test_equal("out staged rows", a->attended_kv, b->attended_kv, (size_t)(n_raw + attended) * 512);
         test_equal("out heads", a->heads, b->heads, 64 * 512);
         test_equal("out low", a->low, b->low, 8192);
         test_equal("out block", sa->block, sb->block, 5120);

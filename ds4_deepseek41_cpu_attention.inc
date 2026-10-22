@@ -539,12 +539,12 @@ static void ds41_cpu_attention_weight_worker(void *vctx, uint64_t h0, uint64_t h
 }
 
 /* The lane passes of the 64 staged query heads over the first n_rows
- * staged rows into s->heads: the row list, the transposed query. */
+ * staged rows into s->heads: the row list.  The passes read the query
+ * transposed into s->qt. */
 static void ds41_cpu_attention_lanes(ds41_cpu_attention_state *s,
                                      layer_attention_lanes_ctx *ctx,
                                      const float *sinks, uint32_t n_rows) {
     for (uint32_t r = 0; r < n_rows; r++) s->rows[r] = s->attended_kv + (size_t)r * 512u;
-    attn_lanes_transpose_q(s->qt, s->q, 64, 512);
     *ctx = (layer_attention_lanes_ctx){
         .out_heads = s->heads,
         .sinks = sinks,
@@ -567,6 +567,7 @@ static void ds41_cpu_attention_heads(ds41_cpu_attention_state *s,
                                      const float *sinks, uint32_t n_rows) {
     layer_attention_lanes_ctx ctx;
     ds41_cpu_attention_lanes(s, &ctx, sinks, n_rows);
+    attn_lanes_transpose_q(s->qt, s->q, 64, 512);
     if (n_rows) ds4_parallel_for_min_rows(4u * ctx.n_chunks, attn_lanes_score_worker, &ctx, 1);
     ds4_parallel_for_min_rows(64, ds41_cpu_attention_weight_worker, &ctx, 1);
     ds4_parallel_for_min_rows(4u * ctx.n_dim_chunks, attn_lanes_sum_worker, &ctx, 1);
@@ -616,25 +617,56 @@ static void ds41_cpu_attention_stage(ds41_cpu_attention_state *s,
 }
 
 #if defined(__AVX512F__) && defined(__AVX512BW__)
-/* The heads, both output projections and the HC post into the FFN input as
- * one staged dispatch:
- *   0 head scores, 1 softmax weights <- 0, 2 weighted sums <- 1 -> BF16 and
- *   inverse RoPE of the heads, 3 output a (eight groups) <- 2, 4 output b
- *   <- 3, 5 HC post and FFN input sum per column <- 4 -> FFN norm.
- * The lane passes, row kernels and serial steps are the plain path's, and
- * the BF16 roundings of low and block are applied per claimed row. */
+/* The query side, the heads, both output projections and the HC post into
+ * the FFN input as one staged dispatch, from the projected query and the
+ * KV caches:
+ *   0 RoPE, F16 staging and transpose of the query per 16 heads x 16 dims,
+ *   1 F16 staging of the attended rows, 2 head scores <- 0 1, 3 softmax
+ *   weights <- 2, 4 weighted sums, their BF16 rounding and inverse RoPE
+ *   <- 3, 5 output a (eight groups) <- 4, 6 output b <- 5, 7 HC post and
+ *   FFN input sum per column <- 6 -> FFN norm.
+ * Every value goes through the plain path's operations: the lane passes and
+ * row kernels, RoPE per pair, the F16 and BF16 roundings per element, and
+ * the serial FFN norm as the finish step. */
 typedef struct {
     ds41_cpu_attention_state *s;
     uint32_t pos;
     bool compressed;
+    ds41_cpu_stage_context stage;
     layer_attention_lanes_ctx lanes;
     ds41_cpu_q8_ctx out_a, out_b;
 } ds41_cpu_out_graph;
 
-static void ds41_cpu_out_heads(void *vctx) {
+/* Items [first, last) of 16 heads x 16 dims, as the sum pass numbers them. */
+static void ds41_cpu_out_q_worker(void *vctx, uint64_t first, uint64_t last) {
     ds41_cpu_out_graph *g = vctx;
-    ds41_cpu_bf16_rows(g->s->heads, 64u * 512u);
-    ds41_cpu_rope(g->s->heads, 512, 64, g->pos, g->compressed, true);
+    float *q = g->s->q;
+    for (uint64_t item = first; item < last; item++) {
+        const uint32_t h0 = (uint32_t)(item / 32) * 16, d0 = (uint32_t)(item % 32) * 16;
+        if (d0 >= 448)
+            ds41_cpu_rope_pairs(q + (size_t)h0 * 512u, 512, 16, g->pos, g->compressed,
+                                false, (d0 - 448) / 2, (d0 - 448) / 2 + 8);
+        for (uint32_t h = h0; h < h0 + 16; h++)
+            ds41_cpu_f16_round(q + (size_t)h * 512u + d0, q + (size_t)h * 512u + d0, 16);
+#if defined(DS4_NO_GPU)
+        attn_lanes_transpose16(g->s->qt + (size_t)h0 * 512u + (size_t)d0 * 16u,
+                               q + (size_t)h0 * 512u + d0, 512);
+#endif
+    }
+}
+
+static void ds41_cpu_out_sum_worker(void *vctx, uint64_t first, uint64_t last) {
+    ds41_cpu_out_graph *g = vctx;
+    float *heads = g->s->heads;
+    attn_lanes_sum_worker(&g->lanes, first, last);
+    for (uint64_t item = first; item < last; item++) {
+        const uint32_t h0 = (uint32_t)(item / 32) * 16, d0 = (uint32_t)(item % 32) * 16;
+        for (uint32_t h = h0; h < h0 + 16; h++)
+            ds41_cpu_bf16_rows(heads + (size_t)h * 512u + d0, 16);
+        if (d0 >= 448)
+            ds41_cpu_rope_pairs(heads + (size_t)h0 * 512u, 512, 16, g->pos, g->compressed,
+                                true, (d0 - 448) / 2, (d0 - 448) / 2 + 8);
+    }
 }
 
 static bool ds41_cpu_out_graph_supported(const ds4_layer_weights *l,
@@ -645,11 +677,19 @@ static bool ds41_cpu_out_graph_supported(const ds4_layer_weights *l,
         n && n->type == DS4_TENSOR_F32 && n->dim[0] == 5120;
 }
 
+/* From the projected query of layer il at pos (BF16, before RoPE), its KV
+ * caches and attended compressed rows to block and the FFN input. */
 static void ds41_cpu_out_graph_run(ds41_cpu_attention_state *s, const ds4_model *m,
-                                   const ds4_layer_weights *l, uint32_t pos,
-                                   bool compressed, uint32_t n_rows, float *block,
-                                   const ds41_cpu_hc_post_job *post) {
-    ds41_cpu_out_graph g = {.s = s, .pos = pos, .compressed = compressed};
+                                   const ds4_layer_weights *l, uint32_t il, uint32_t pos,
+                                   float *block, const ds41_cpu_hc_post_job *post) {
+    const uint32_t ratio = ds4_layer_compress_ratio(il);
+    const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
+    const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
+    const uint32_t attended = n_comp < 512u ? n_comp : 512u;
+    const uint32_t n_raw = pos < 127u ? pos + 1u : 128u;
+    const uint32_t n_rows = n_raw + attended;
+    ds41_cpu_out_graph g = {.s = s, .pos = pos, .compressed = ratio != 0,
+        .stage = {s, s->window[il], s->compressed[owner], pos + 1u - n_raw, n_raw}};
     ds41_cpu_attention_lanes(s, &g.lanes, tensor_data(m, l->attn_sinks), n_rows);
     g.out_a = (ds41_cpu_q8_ctx){
         .ref = {.out = s->low, .data = tensor_data(m, l->attn_output_a), .x = s->heads,
@@ -657,24 +697,30 @@ static void ds41_cpu_out_graph_run(ds41_cpu_attention_state *s, const ds4_model 
         .rows = 8192, .group_rows = 1024, .group_in = 4096,
     };
     const uint64_t scores = 4u * g.lanes.n_chunks, sums = 4u * g.lanes.n_dim_chunks;
-    ds4_pool_stage st[6] = {
-        { .fn = attn_lanes_score_worker, .ctx = &g.lanes,
-          .n_rows = n_rows ? scores : 0, .group_rows = scores ? scores : 1 },
+    /* The query and row stagings are a few hundred nanoseconds per item:
+     * claims of 8 and 16 items. */
+    ds4_pool_stage st[8] = {
+        { .fn = ds41_cpu_out_q_worker, .ctx = &g, .n_rows = 4 * 32, .group_rows = 4 * 32,
+          .min_chunk = 8 },
+        { .fn = ds41_cpu_stage_worker, .ctx = &g.stage, .n_rows = n_rows, .group_rows = n_rows,
+          .min_chunk = 16 },
+        { .fn = attn_lanes_score_worker, .ctx = &g.lanes, .n_rows = scores,
+          .group_rows = scores, .deps = (1u << 0) | (1u << 1) },
         { .fn = ds41_cpu_attention_weight_worker, .ctx = &g.lanes,
-          .n_rows = 64, .group_rows = 64, .deps = 1u << 0 },
-        { .fn = attn_lanes_sum_worker, .ctx = &g.lanes, .n_rows = sums, .group_rows = sums,
-          .deps = 1u << 1, .finish = ds41_cpu_out_heads, .finish_ctx = &g },
+          .n_rows = 64, .group_rows = 64, .deps = 1u << 2 },
+        { .fn = ds41_cpu_out_sum_worker, .ctx = &g, .n_rows = sums, .group_rows = sums,
+          .deps = 1u << 3 },
         { .fn = ds41_cpu_q8_bf16_worker, .ctx = &g.out_a, .n_rows = 8192 / 16,
-          .group_rows = 8192 / 16, .deps = 1u << 2,
+          .group_rows = 8192 / 16, .deps = 1u << 4,
           .weights = g.out_a.ref.data, .row_bytes = 16 * g.out_a.ref.blocks * 34 },
         ds41_cpu_q8_stage(&g.out_b, m, l->attn_output_b, block, s->low),
         /* Light elementwise work: claims of 256 columns. */
         { .fn = ds41_cpu_hc_post_worker, .ctx = (void *)post, .n_rows = 5120,
-          .group_rows = 5120, .min_chunk = 256, .deps = 1u << 4,
+          .group_rows = 5120, .min_chunk = 256, .deps = 1u << 6,
           .finish = ds41_cpu_hc_post_norm, .finish_ctx = (void *)post },
     };
-    st[4].deps = 1u << 3;
-    ds4_pool_run_stages(st, 6);
+    st[6].deps = 1u << 5;
+    ds4_pool_run_stages(st, 8);
     if (ds41_prof_on)
         ds41_prof_bytes[DS41_PROF_OUT] += l->attn_output_a->bytes + l->attn_output_b->bytes;
 }
@@ -778,19 +824,16 @@ static bool ds41_cpu_attention_forward(ds41_cpu_attention_state *s,
     if (ds41_cpu_proj_graph_supported(l, il, index, hc)) {
         ds41_prof(DS41_PROF_PROJ);
         if (!ds41_cpu_proj_graph_run(s, m, l, il, pos, norm, index, hc)) return false;
-        ds41_prof(DS41_PROF_Q);
-        ds41_cpu_rope(s->q, 512, 64, pos, ratio != 0, false);
+        /* The index ranking does not read the query. */
         ds41_prof(DS41_PROF_INDEX);
         if (index) ds41_cpu_attention_rank(s, il, owner, n_comp);
         if (ds41_cpu_out_graph_supported(l, post)) {
-            const uint32_t attended = n_comp < 512u ? n_comp : 512u;
-            const uint32_t n_raw = pos < 127u ? pos + 1u : 128u;
-            ds41_prof(DS41_PROF_STAGE);
-            ds41_cpu_attention_stage(s, il, pos, owner, n_raw, attended);
             ds41_prof(DS41_PROF_OUT);
-            ds41_cpu_out_graph_run(s, m, l, pos, ratio != 0, n_raw + attended, block, post);
+            ds41_cpu_out_graph_run(s, m, l, il, pos, block, post);
             return true;
         }
+        ds41_prof(DS41_PROF_Q);
+        ds41_cpu_rope(s->q, 512, 64, pos, ratio != 0, false);
     } else if (!ds41_cpu_attention_project(s, m, l, il, pos, norm, hc)) return false;
 #else
     if (!ds41_cpu_attention_project(s, m, l, il, pos, norm, hc)) return false;
