@@ -220,7 +220,9 @@ static bool ds41_cpu_attention_select(ds41_cpu_attention_state *s,
     ds41_cpu_index_score_context c = {
         s->index_q, s->index_cache[owner], s->index_weights, s->index_scores
     };
-    ds4_parallel_for_min_rows(n_comp, ds41_cpu_index_score_worker, &c, 64);
+    /* A row is 32 serial 128-wide dots, about 8 us, so even a few dozen
+     * rows are worth splitting. */
+    ds4_parallel_for_min_rows(n_comp, ds41_cpu_index_score_worker, &c, 16);
     ds41_cpu_attention_candidates(s, il, n_comp);
     ds41_cpu_attention_topk(s->selected_comp, s->index_scores, n_comp,
                             n_comp < 512u ? n_comp : 512u, s->heap);
