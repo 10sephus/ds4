@@ -157,6 +157,13 @@ static inline __m512i ds41_iq2xxs_parity(__m512i aux) {
                                      _mm512_srli_epi32(aux, 6), 0x96);
 }
 
+/* Element J of a group: magnitude by VPERMPS of its code (values holds 8,
+ * 25 and 43 at indices 0-2 of every four), then the sign bit of
+ * ksigns_iq2xs[index] (index bit J, or the parity for J = 7) xored in. */
+#define DS41_IQ2_VALUE(CODE, S, P, J) _mm512_castsi512_ps(_mm512_ternarylogic_epi32( \
+    _mm512_castps_si512(_mm512_permutexvar_ps(_mm512_srli_epi32(CODE, 2 * (J)), values)), \
+    (J) < 7 ? _mm512_slli_epi32(S, 31 - (J)) : _mm512_slli_epi32(P, 31), sign, 0x78))
+
 /* ds4_vec_dot_iq2_xxs_f32 per lane for 16 rows of two matrices at once, such
  * as an expert's gate and up rows: two independent sums that share the
  * activation broadcasts.  Each lane computes (0.125 * d) * (2 * s + 1) as the
@@ -205,11 +212,6 @@ static void ds41_cpu_iq2xxs_pair16(__m512 out[2], const uint8_t *rows0, uint64_t
                 const __m512i s0 = _mm512_srlv_epi32(aux0, shift), s1 = _mm512_srlv_epi32(aux1, shift);
                 const __m512i p0 = _mm512_srlv_epi32(par0, shift), p1 = _mm512_srlv_epi32(par1, shift);
                 const float *xl = x + b * QK_K + ib * 32u + l * 8u;
-/* Element J: magnitude by VPERMPS of its code, then the sign bit of
- * ksigns_iq2xs[index] (index bit J, or the parity for J = 7) xored in. */
-#define DS41_IQ2_VALUE(CODE, S, P, J) _mm512_castsi512_ps(_mm512_ternarylogic_epi32( \
-    _mm512_castps_si512(_mm512_permutexvar_ps(_mm512_srli_epi32(CODE, 2 * (J)), values)), \
-    (J) < 7 ? _mm512_slli_epi32(S, 31 - (J)) : _mm512_slli_epi32(P, 31), sign, 0x78))
 #define DS41_IQ2_TERM(J) do { \
     const __m512 xj = _mm512_set1_ps(xl[J]); \
     const __m512 v0 = DS41_IQ2_VALUE(code0, s0, p0, J); \
@@ -227,7 +229,6 @@ static void ds41_cpu_iq2xxs_pair16(__m512 out[2], const uint8_t *rows0, uint64_t
                 DS41_IQ2_TERM(7);
             }
 #undef DS41_IQ2_TERM
-#undef DS41_IQ2_VALUE
         }
     }
     out[0] = sum0;
@@ -420,8 +421,8 @@ static void ds41_cpu_down_worker(void *vctx, uint64_t first, uint64_t last) {
 /* Batched prefill kernels.  A tile's weights are decoded once per block and
  * applied to many tokens.  For every (row, token) the products and additions
  * are those of the one-token kernels above, in the same order, so each
- * output is bitwise the decode result.  Tokens advance in pairs or quads
- * only to give the core independent addition chains. */
+ * output is bitwise the decode result.  Tokens advance in groups only to
+ * give the core independent addition chains. */
 #define DS41_CPU_PASS 32u
 
 static inline __m512 ds41_cpu_bf16_16(__m512 v) {
@@ -434,57 +435,83 @@ static inline __m512 ds41_cpu_bf16_16(__m512 v) {
                                                 _mm512_set1_epi32((int)0xffff0000u)));
 }
 
-/* acc[t] += w[i] * x[t][off + i] for i in [0, n), in order of i. */
-static inline void ds41_cpu_apply16(__m512 *acc, const __m512 *w, const float *const *x,
-                                    uint32_t nt, uint64_t off, uint32_t n) {
-    uint32_t t = 0;
-    for (; t + 4 <= nt; t += 4) {
-        const float *x0 = x[t] + off, *x1 = x[t + 1] + off;
-        const float *x2 = x[t + 2] + off, *x3 = x[t + 3] + off;
-        __m512 a0 = acc[t], a1 = acc[t + 1], a2 = acc[t + 2], a3 = acc[t + 3];
-        for (uint32_t i = 0; i < n; i++) {
-            a0 = _mm512_add_ps(a0, _mm512_mul_ps(w[i], _mm512_set1_ps(x0[i])));
-            a1 = _mm512_add_ps(a1, _mm512_mul_ps(w[i], _mm512_set1_ps(x1[i])));
-            a2 = _mm512_add_ps(a2, _mm512_mul_ps(w[i], _mm512_set1_ps(x2[i])));
-            a3 = _mm512_add_ps(a3, _mm512_mul_ps(w[i], _mm512_set1_ps(x3[i])));
-        }
-        acc[t] = a0; acc[t + 1] = a1; acc[t + 2] = a2; acc[t + 3] = a3;
+/* acc[t] += w[i] * x[t][off + i] for i in [0, n), in order of i, for the g
+ * tokens of a group, g a constant after inlining: g independent addition
+ * chains, as one chain waits on the latency of each of its additions. */
+static inline __attribute__((always_inline)) void ds41_cpu_apply16_group(
+        __m512 *acc, const __m512 *w, const float *const *x, uint64_t off,
+        uint32_t n, const unsigned g) {
+    __m512 a[8];
+    const float *xg[8];
+    for (unsigned t = 0; t < g; t++) {
+        a[t] = acc[t];
+        xg[t] = x[t] + off;
     }
-    for (; t < nt; t++) {
-        const float *x0 = x[t] + off;
-        __m512 a0 = acc[t];
-        for (uint32_t i = 0; i < n; i++)
-            a0 = _mm512_add_ps(a0, _mm512_mul_ps(w[i], _mm512_set1_ps(x0[i])));
-        acc[t] = a0;
+    for (uint32_t i = 0; i < n; i++) {
+        const __m512 wi = w[i];
+        for (unsigned t = 0; t < g; t++)
+            a[t] = _mm512_add_ps(a[t], _mm512_mul_ps(wi, _mm512_set1_ps(xg[t][i])));
     }
+    for (unsigned t = 0; t < g; t++) acc[t] = a[t];
 }
 
 /* The same for two matrices that read the same inputs (gate and up). */
-static inline void ds41_cpu_apply16x2(__m512 *a, __m512 *b, const __m512 *wa,
-                                      const __m512 *wb, const float *const *x,
-                                      uint32_t nt, uint64_t off, uint32_t n) {
-    uint32_t t = 0;
-    for (; t + 2 <= nt; t += 2) {
-        const float *x0 = x[t] + off, *x1 = x[t + 1] + off;
-        __m512 a0 = a[t], b0 = b[t], a1 = a[t + 1], b1 = b[t + 1];
-        for (uint32_t i = 0; i < n; i++) {
-            const __m512 v0 = _mm512_set1_ps(x0[i]), v1 = _mm512_set1_ps(x1[i]);
-            a0 = _mm512_add_ps(a0, _mm512_mul_ps(wa[i], v0));
-            b0 = _mm512_add_ps(b0, _mm512_mul_ps(wb[i], v0));
-            a1 = _mm512_add_ps(a1, _mm512_mul_ps(wa[i], v1));
-            b1 = _mm512_add_ps(b1, _mm512_mul_ps(wb[i], v1));
-        }
-        a[t] = a0; b[t] = b0; a[t + 1] = a1; b[t + 1] = b1;
+static inline __attribute__((always_inline)) void ds41_cpu_apply16x2_group(
+        __m512 *a, __m512 *b, const __m512 *wa, const __m512 *wb,
+        const float *const *x, uint64_t off, uint32_t n, const unsigned g) {
+    __m512 ra[4], rb[4];
+    const float *xg[4];
+    for (unsigned t = 0; t < g; t++) {
+        ra[t] = a[t];
+        rb[t] = b[t];
+        xg[t] = x[t] + off;
     }
-    if (t < nt) {
-        const float *x0 = x[t] + off;
-        __m512 a0 = a[t], b0 = b[t];
-        for (uint32_t i = 0; i < n; i++) {
-            const __m512 v0 = _mm512_set1_ps(x0[i]);
-            a0 = _mm512_add_ps(a0, _mm512_mul_ps(wa[i], v0));
-            b0 = _mm512_add_ps(b0, _mm512_mul_ps(wb[i], v0));
+    for (uint32_t i = 0; i < n; i++) {
+        const __m512 wai = wa[i], wbi = wb[i];
+        for (unsigned t = 0; t < g; t++) {
+            const __m512 v = _mm512_set1_ps(xg[t][i]);
+            ra[t] = _mm512_add_ps(ra[t], _mm512_mul_ps(wai, v));
+            rb[t] = _mm512_add_ps(rb[t], _mm512_mul_ps(wbi, v));
         }
-        a[t] = a0; b[t] = b0;
+    }
+    for (unsigned t = 0; t < g; t++) {
+        a[t] = ra[t];
+        b[t] = rb[t];
+    }
+}
+
+/* nt tokens in groups of at most eight (four for two matrices, the same
+ * eight chains) of nearly equal sizes, so that only fewer than four
+ * tokens in all leave the core waiting on additions. */
+static void ds41_cpu_apply16(__m512 *acc, const __m512 *w, const float *const *x,
+                             uint32_t nt, uint64_t off, uint32_t n) {
+    for (uint32_t t = 0, groups = (nt + 7) / 8; t < nt; groups--) {
+        const uint32_t g = (nt - t + groups - 1) / groups;
+        switch (g) {
+        case 8: ds41_cpu_apply16_group(acc + t, w, x + t, off, n, 8); break;
+        case 7: ds41_cpu_apply16_group(acc + t, w, x + t, off, n, 7); break;
+        case 6: ds41_cpu_apply16_group(acc + t, w, x + t, off, n, 6); break;
+        case 5: ds41_cpu_apply16_group(acc + t, w, x + t, off, n, 5); break;
+        case 4: ds41_cpu_apply16_group(acc + t, w, x + t, off, n, 4); break;
+        case 3: ds41_cpu_apply16_group(acc + t, w, x + t, off, n, 3); break;
+        case 2: ds41_cpu_apply16_group(acc + t, w, x + t, off, n, 2); break;
+        default: ds41_cpu_apply16_group(acc + t, w, x + t, off, n, 1); break;
+        }
+        t += g;
+    }
+}
+
+static void ds41_cpu_apply16x2(__m512 *a, __m512 *b, const __m512 *wa, const __m512 *wb,
+                               const float *const *x, uint32_t nt, uint64_t off, uint32_t n) {
+    for (uint32_t t = 0, groups = (nt + 3) / 4; t < nt; groups--) {
+        const uint32_t g = (nt - t + groups - 1) / groups;
+        switch (g) {
+        case 4: ds41_cpu_apply16x2_group(a + t, b + t, wa, wb, x + t, off, n, 4); break;
+        case 3: ds41_cpu_apply16x2_group(a + t, b + t, wa, wb, x + t, off, n, 3); break;
+        case 2: ds41_cpu_apply16x2_group(a + t, b + t, wa, wb, x + t, off, n, 2); break;
+        default: ds41_cpu_apply16x2_group(a + t, b + t, wa, wb, x + t, off, n, 1); break;
+        }
+        t += g;
     }
 }
 
@@ -500,60 +527,69 @@ static inline void ds41_cpu_q8_decode16(__m512 *w, const uint8_t *block, __m512i
     }
 }
 
-/* The 32 values scale * signed grid byte of IQ2_XXS sub-block ib, as
- * ds41_cpu_iq2xxs_rows16; d is 0.125 times the block scale. */
+/* The 32 values scale * signed grid value of IQ2_XXS sub-block ib of 16
+ * rows, built in registers as in ds41_cpu_iq2xxs_pair16, whose products
+ * they are; d is 0.125 times the block scale.  ds41_iq2xxs_codes must be
+ * initialized. */
 static inline void ds41_cpu_iq2xxs_decode16(__m512 *w, const uint8_t *block, unsigned ib,
                                             __m512 d, __m512i offsets) {
-    const __m512i byte = _mm512_set1_epi32(255), zero = _mm512_setzero_si512();
-    const long long *grid = (const long long *)iq2xxs_grid;
+    const __m512i sign = _mm512_set1_epi32((int)0x80000000u);
+    const __m512 values = _mm512_setr_ps(8.0f, 25.0f, 43.0f, 0.0f, 8.0f, 25.0f, 43.0f, 0.0f,
+                                         8.0f, 25.0f, 43.0f, 0.0f, 8.0f, 25.0f, 43.0f, 0.0f);
     const uint8_t *q = block + offsetof(block_iq2_xxs, qs) + ib * 8u;
-    const __m512i aux0 = _mm512_i32gather_epi32(offsets, q, 1);
-    const __m512i aux1 = _mm512_i32gather_epi32(offsets, q + 4, 1);
+    const __m512i aux = _mm512_i32gather_epi32(offsets, q + 4, 1);
+    __m512i c[4];
+    ds41_iq2xxs_codes16(_mm512_i32gather_epi32(offsets, q, 1),
+                        (const __m512i *)ds41_iq2xxs_codes, &c[0], &c[2]);
+    c[1] = _mm512_srli_epi32(c[0], 16);
+    c[3] = _mm512_srli_epi32(c[2], 16);
+    const __m512i par = ds41_iq2xxs_parity(aux);
     const __m512 scale = _mm512_mul_ps(d, _mm512_cvtepi32_ps(_mm512_add_epi32(
-        _mm512_slli_epi32(_mm512_srli_epi32(aux1, 28), 1), _mm512_set1_epi32(1))));
+        _mm512_slli_epi32(_mm512_srli_epi32(aux, 28), 1), _mm512_set1_epi32(1))));
     for (unsigned l = 0; l < 4; l++) {
-        const __m512i idx = _mm512_and_si512(_mm512_srli_epi32(aux0, 8 * l), byte);
-        const __m512i lo = _mm512_i32gather_epi64(_mm512_castsi512_si256(idx), grid, 8);
-        const __m512i hi = _mm512_i32gather_epi64(_mm512_extracti64x4_epi64(idx, 1), grid, 8);
-        const __m512i w0 = _mm512_inserti64x4(_mm512_castsi256_si512(
-            _mm512_cvtepi64_epi32(lo)), _mm512_cvtepi64_epi32(hi), 1);
-        const __m512i w1 = _mm512_inserti64x4(_mm512_castsi256_si512(
-            _mm512_cvtepi64_epi32(_mm512_srli_epi64(lo, 32))),
-            _mm512_cvtepi64_epi32(_mm512_srli_epi64(hi, 32)), 1);
-        const __m512i s7 = _mm512_and_si512(_mm512_srli_epi32(aux1, 7 * l),
-                                            _mm512_set1_epi32(127));
-        __m512i parity = _mm512_xor_si512(s7, _mm512_srli_epi32(s7, 4));
-        parity = _mm512_xor_si512(parity, _mm512_srli_epi32(parity, 2));
-        parity = _mm512_xor_si512(parity, _mm512_srli_epi32(parity, 1));
-        const __m512i signs = _mm512_or_si512(s7, _mm512_slli_epi32(
-            _mm512_and_si512(parity, _mm512_set1_epi32(1)), 7));
-        for (unsigned j = 0; j < 8; j++) {
-            const __m512i g = _mm512_and_si512(
-                _mm512_srli_epi32(j < 4 ? w0 : w1, 8 * (j & 3u)), byte);
-            const __mmask16 neg = _mm512_test_epi32_mask(signs, _mm512_set1_epi32(1 << j));
-            w[l * 8u + j] = _mm512_mul_ps(scale, _mm512_cvtepi32_ps(
-                _mm512_mask_sub_epi32(g, neg, zero, g)));
-        }
+        const __m512i shift = _mm512_set1_epi32((int)(7 * l));
+        const __m512i s = _mm512_srlv_epi32(aux, shift), p = _mm512_srlv_epi32(par, shift);
+#define DS41_IQ2_W(J) w[8 * l + (J)] = _mm512_mul_ps(scale, DS41_IQ2_VALUE(c[l], s, p, J))
+        DS41_IQ2_W(0); DS41_IQ2_W(1); DS41_IQ2_W(2); DS41_IQ2_W(3);
+        DS41_IQ2_W(4); DS41_IQ2_W(5); DS41_IQ2_W(6); DS41_IQ2_W(7);
+#undef DS41_IQ2_W
     }
 }
+#undef DS41_IQ2_VALUE
 
-/* The 16 values (d * (sc & 15)) * q - dmin * (sc >> 4) of Q2_K group g. */
-static inline void ds41_cpu_q2k_decode16(__m512 *w, const uint8_t *block, unsigned g,
+/* The 128 values (d * (sc & 15)) * q - dmin * (sc >> 4) of half h (groups
+ * 8h .. 8h + 7) of a Q2_K block of 16 rows, as ds41_cpu_q2k_pair16 forms
+ * them: the half's 32 quant bytes are gathered once for its eight groups
+ * and a scale dword serves four groups. */
+static inline void ds41_cpu_q2k_decode16(__m512 *w, const uint8_t *block, unsigned h,
                                          __m512 d, __m512 dmin, __m512i offsets) {
-    const __m512i low4 = _mm512_set1_epi32(15), low2 = _mm512_set1_epi32(3);
-    const __m512i sc = _mm512_and_si512(_mm512_srli_epi32(
-        _mm512_i32gather_epi32(offsets, block + (g & ~3u), 1),
-        8 * (g & 3u)), _mm512_set1_epi32(255));
-    const __m512 scale = _mm512_mul_ps(d, _mm512_cvtepi32_ps(_mm512_and_si512(sc, low4)));
-    const __m512 minv = _mm512_mul_ps(dmin, _mm512_cvtepi32_ps(_mm512_srli_epi32(sc, 4)));
-    const unsigned q_base = 32u * (g / 8u) + 16u * (g & 1u);
-    const __m512i shift = _mm512_set1_epi32((int)(((g / 2u) & 3u) * 2u));
-    for (unsigned l = 0; l < 16; l += 4) {
-        const __m512i packed = _mm512_srlv_epi32(_mm512_i32gather_epi32(
-            offsets, block + offsetof(block_q2_K, qs) + q_base + l, 1), shift);
-        for (unsigned j = 0; j < 4; j++)
-            w[l + j] = _mm512_sub_ps(_mm512_mul_ps(scale, _mm512_cvtepi32_ps(
-                _mm512_and_si512(_mm512_srli_epi32(packed, 8 * j), low2))), minv);
+    const __m512i low4 = _mm512_set1_epi32(15), byte = _mm512_set1_epi32(255);
+    const __m512 qf = _mm512_setr_ps(0.0f, 1.0f, 2.0f, 3.0f, 0.0f, 1.0f, 2.0f, 3.0f,
+                                     0.0f, 1.0f, 2.0f, 3.0f, 0.0f, 1.0f, 2.0f, 3.0f);
+    __m512i q[8], sc_word = _mm512_setzero_si512();
+    for (unsigned k = 0; k < 8; k++)
+        q[k] = _mm512_i32gather_epi32(offsets, block + offsetof(block_q2_K, qs) +
+                                      32u * h + 4u * k, 1);
+    for (unsigned gq = 0; gq < 8; gq++) {
+        const unsigned g = 8u * h + gq;
+        if ((gq & 3u) == 0) sc_word = _mm512_i32gather_epi32(offsets, block + g, 1);
+        const __m512i sc = _mm512_and_si512(_mm512_srli_epi32(sc_word, 8 * (gq & 3u)), byte);
+        const __m512 scale = _mm512_mul_ps(d, _mm512_cvtepi32_ps(_mm512_and_si512(sc, low4)));
+        const __m512 minv = _mm512_mul_ps(dmin, _mm512_cvtepi32_ps(_mm512_srli_epi32(sc, 4)));
+        const unsigned shift = ((g / 2u) & 3u) * 2u;
+        const __m512i *qg = q + 4u * (g & 1u);
+        __m512 *wg = w + 16u * gq;
+        for (unsigned l = 0; l < 16; l += 4) {
+            /* (float)q by VPERMPS of the 2-bit value in index bits 0-1. */
+            const __m512i packed = _mm512_srli_epi32(qg[l / 4u], shift);
+            wg[l] = _mm512_sub_ps(_mm512_mul_ps(scale, _mm512_permutexvar_ps(packed, qf)), minv);
+            wg[l + 1] = _mm512_sub_ps(_mm512_mul_ps(scale, _mm512_permutexvar_ps(
+                _mm512_srli_epi32(packed, 8), qf)), minv);
+            wg[l + 2] = _mm512_sub_ps(_mm512_mul_ps(scale, _mm512_permutexvar_ps(
+                _mm512_srli_epi32(packed, 16), qf)), minv);
+            wg[l + 3] = _mm512_sub_ps(_mm512_mul_ps(scale, _mm512_permutexvar_ps(
+                _mm512_srli_epi32(packed, 24), qf)), minv);
+        }
     }
 }
 
@@ -648,6 +684,11 @@ static void ds41_cpu_f32_batch_worker(void *vctx, uint64_t first, uint64_t last)
     }
 }
 
+static int ds41_cpu_desc_u32(const void *a, const void *b) {
+    const uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+
 /* Routed experts of a token chunk grouped by expert: entries
  * [first[u], first[u + 1]) are token * 6 + slot pairs of the u-th distinct
  * expert, in token order.  mid and partial are indexed by entry. */
@@ -718,7 +759,7 @@ static void ds41_cpu_routed_down_batch_worker(void *vctx, uint64_t first, uint64
     const ds41_cpu_routed_batch_ctx *c = vctx;
     const uint32_t tiles = DS4_N_EMBD / 16;
     const __m512i od = ds41_cpu_row_offsets(c->down_row_bytes);
-    __m512 w[16], acc[DS41_CPU_PASS];
+    __m512 w[128], acc[DS41_CPU_PASS];
     const float *xp[DS41_CPU_PASS];
     for (uint64_t unit = first; unit < last; unit++) {
         const uint32_t e = (uint32_t)(unit / tiles);
@@ -737,9 +778,9 @@ static void ds41_cpu_routed_down_batch_worker(void *vctx, uint64_t first, uint64
                     od, block + offsetof(block_q2_K, d), 1);
                 const __m512 d = ds41_cpu_half16(halves);
                 const __m512 dmin = ds41_cpu_half16(_mm512_srli_epi32(halves, 16));
-                for (unsigned g = 0; g < QK_K / 16; g++) {
-                    ds41_cpu_q2k_decode16(w, block, g, d, dmin, od);
-                    ds41_cpu_apply16(acc, w, xp, nt, b * QK_K + g * 16u, 16);
+                for (unsigned h = 0; h < 2; h++) {
+                    ds41_cpu_q2k_decode16(w, block, h, d, dmin, od);
+                    ds41_cpu_apply16(acc, w, xp, nt, b * QK_K + h * 128u, 128);
                 }
             }
             for (uint32_t t = 0; t < nt; t++)
@@ -891,21 +932,25 @@ static bool ds41_cpu_routed_moe_batch(float *partial, float *mid, uint32_t *entr
             ds4_die("V4.1 CPU routed-MoE selected expert is outside range");
         count[selected[k]]++;
     }
-    uint32_t n_used = 0, fill[DS4_MAX_EXPERT];
+    /* The experts with the most tokens first: their units cost the most,
+     * so they are claimed early and the light ones even out the end. */
+    uint32_t order[DS4_MAX_EXPERT], n_used = 0, fill[DS4_MAX_EXPERT];
+    for (uint32_t e = 0; e < DS4_N_EXPERT; e++)
+        if (count[e]) order[n_used++] = count[e] << 16 | (0xffffu - e);
+    qsort(order, n_used, sizeof(*order), ds41_cpu_desc_u32);
     c.first[0] = 0;
-    for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
-        if (!count[e]) continue;
+    for (uint32_t u = 0; u < n_used; u++) {
+        const uint32_t e = 0xffffu - (order[u] & 0xffffu);
         uint64_t gi, go, ui, uo, di, dout;
-        c.gate[n_used] = tensor_expert_bytes(m, l->ffn_gate_exps, e, &gi, &go, &c.gate_row_bytes);
-        c.up[n_used] = tensor_expert_bytes(m, l->ffn_up_exps, e, &ui, &uo, &c.up_row_bytes);
-        c.down[n_used] = tensor_expert_bytes(m, l->ffn_down_exps, e, &di, &dout, &c.down_row_bytes);
+        c.gate[u] = tensor_expert_bytes(m, l->ffn_gate_exps, e, &gi, &go, &c.gate_row_bytes);
+        c.up[u] = tensor_expert_bytes(m, l->ffn_up_exps, e, &ui, &uo, &c.up_row_bytes);
+        c.down[u] = tensor_expert_bytes(m, l->ffn_down_exps, e, &di, &dout, &c.down_row_bytes);
         if (gi != DS4_N_EMBD || ui != DS4_N_EMBD || go != DS4_N_FF_EXP ||
             uo != DS4_N_FF_EXP || di != DS4_N_FF_EXP || dout != DS4_N_EMBD)
             ds4_die("V4.1 CPU routed-MoE found unexpected expert dimensions");
-        used[e] = n_used;
-        fill[n_used] = c.first[n_used];
-        c.first[n_used + 1] = c.first[n_used] + count[e];
-        n_used++;
+        used[e] = u;
+        fill[u] = c.first[u];
+        c.first[u + 1] = c.first[u] + count[e];
     }
     for (uint32_t k = 0; k < pairs; k++) entry[fill[used[selected[k]]]++] = k;
     c.entry = entry;
@@ -915,6 +960,9 @@ static bool ds41_cpu_routed_moe_batch(float *partial, float *mid, uint32_t *entr
     c.mid = mid;
     c.partial = partial;
     c.clamp = DS4_SWIGLU_CLAMP_EXP;
+    /* The IQ2_XXS code table of the gate/up decoder; the dispatch
+     * publishes it to the workers. */
+    pthread_once(&ds41_iq2xxs_once, ds41_iq2xxs_tables_init);
     /* Each expert is a NUMA group: a node takes the row half placed on it. */
     ds4_pool_dispatch((uint64_t)n_used * (DS4_N_FF_EXP / 16), ds41_cpu_routed_mid_batch_worker,
                       &c, DS4_N_FF_EXP / 16, 1, 64);

@@ -614,7 +614,9 @@ static void check_routed_batch(uint32_t embd, uint32_t hidden, float clamp) {
     down.bytes = dbytes;
     down.dim[0] = hidden; down.dim[1] = embd;
     ds4_layer_weights l = {.ffn_gate_exps = &gate, .ffn_up_exps = &up, .ffn_down_exps = &down};
-    const uint32_t tokens[] = {1, 2, 5, 9, 40};
+    /* Up to 77 tokens: experts with more than one pass of tokens, and
+     * token groups of every size. */
+    const uint32_t tokens[] = {1, 2, 3, 5, 9, 17, 40, 77};
     for (size_t tk = 0; tk < sizeof(tokens) / sizeof(*tokens); tk++) {
         const uint32_t nt = tokens[tk];
         float *x = malloc((size_t)nt * embd * sizeof(float));
