@@ -1164,6 +1164,7 @@ typedef struct {
     float *shared_up;
     float *shared_mid;
     float *routed_mid_all;
+    float *routed_down_part;   /* staged FFN: expert-major Q2_K down dots */
     block_q8_K *routed_xq;
     block_q8_K *routed_midq;
     int8_t *routed_q8_xq;
@@ -11735,31 +11736,34 @@ static void matvec_q2_k_expert(
 }
 
 typedef struct {
-    float *out;
+    float *part;   /* n_expert x out_dim dots, expert-major */
     const uint8_t *base[DS4_MAX_EXPERT_USED];
     const block_q8_K *xq[DS4_MAX_EXPERT_USED];
     uint64_t in_dim;
+    uint64_t out_dim;
     uint64_t row_bytes[DS4_MAX_EXPERT_USED];
-    int n_expert;
 } matvec_q2_k_accum_ctx;
 
-static void matvec_q2_k_accum_worker(void *vctx, uint64_t row0, uint64_t row1) {
+static void matvec_q2_k_accum_worker(void *vctx, uint64_t idx0, uint64_t idx1) {
     matvec_q2_k_accum_ctx *ctx = vctx;
 
-    for (uint64_t row = row0; row < row1; row++) {
-        float acc = 0.0f;
-        for (int i = 0; i < ctx->n_expert; i++) {
-            float v = 0.0f;
-            const block_q2_K *br = (const block_q2_K *)(ctx->base[i] + row * ctx->row_bytes[i]);
-            ds4_vec_dot_q2_K_q8_K((int)ctx->in_dim, &v, br, ctx->xq[i]);
-            acc += v;
-        }
-        ctx->out[row] = acc;
+    for (uint64_t idx = idx0; idx < idx1; idx++) {
+        const uint64_t i = idx / ctx->out_dim;
+        const uint64_t row = idx - i * ctx->out_dim;
+        const block_q2_K *br = (const block_q2_K *)(ctx->base[i] + row * ctx->row_bytes[i]);
+        ds4_vec_dot_q2_K_q8_K((int)ctx->in_dim, &ctx->part[idx], br, ctx->xq[i]);
     }
 }
 
-/* Accumulate all selected experts' Q2_K down projections directly into the
- * 4096-wide MoE output. */
+/* Accumulate all selected experts' Q2_K down projections into the
+ * 4096-wide MoE output.  The dots run expert-major, one (expert, row) per
+ * item: a claim streams up to 64 consecutive rows of one expert (43 KB),
+ * where a row-major loop read six 672-byte pieces from six places per output
+ * row, which the hardware prefetcher could not keep up with (about 44 GB/s
+ * against 80 at 40 threads).  The grouped split hands each NUMA node its half
+ * of every expert's rows, the halves model_place_weights() puts there.  Each
+ * row then sums its dots in router slot order starting from 0.0f, the same
+ * float additions as the per-row loop, so the output is unchanged. */
 static void matvec_q2_k_experts_accum_prequant(
         float            *out,
         const ds4_model  *m,
@@ -11786,12 +11790,15 @@ static void matvec_q2_k_experts_accum_prequant(
         }
     }
     if (in_dim0 % QK_K != 0) ds4_die("Q2_K expert row is not QK_K aligned");
+    if (out_dim0 > DS4_MAX_EMBD) ds4_die("Q2_K expert output is too wide");
 
+    /* On the stack: token decode must not touch the heap. */
+    float part[DS4_MAX_EXPERT_USED * DS4_MAX_EMBD];
     const uint64_t n_blocks = in_dim0 / QK_K;
     matvec_q2_k_accum_ctx ctx = {
-        .out = out,
+        .part = part,
         .in_dim = in_dim0,
-        .n_expert = n_expert,
+        .out_dim = out_dim0,
     };
     for (int i = 0; i < n_expert; i++) {
         ctx.base[i] = base[i];
@@ -11799,7 +11806,12 @@ static void matvec_q2_k_experts_accum_prequant(
         ctx.xq[i] = xq + (uint64_t)i * n_blocks;
     }
 
-    ds4_parallel_for(out_dim0, matvec_q2_k_accum_worker, &ctx);
+    ds4_parallel_for_grouped((uint64_t)n_expert * out_dim0, matvec_q2_k_accum_worker, &ctx, out_dim0);
+    for (uint64_t row = 0; row < out_dim0; row++) out[row] = 0.0f;
+    for (int i = 0; i < n_expert; i++) {
+        const float *p = part + (uint64_t)i * out_dim0;
+        for (uint64_t row = 0; row < out_dim0; row++) out[row] += p[row];
+    }
 }
 
 typedef struct {
@@ -12475,7 +12487,8 @@ typedef struct {
 } sum_down_pairs_ctx;
 
 /* Reduce a token's down partials in router slot order: the same
- * acc = 0; acc += v sequence as matvec_q2_k_accum_worker on the decode path. */
+ * acc = 0; acc += v sequence as matvec_q2_k_experts_accum_prequant on the
+ * decode path. */
 static void sum_down_pairs_worker(void *vctx, uint64_t row0, uint64_t row1) {
     sum_down_pairs_ctx *ctx = vctx;
     for (uint64_t idx = row0; idx < row1; idx++) {
@@ -14764,8 +14777,9 @@ static void layer_ffn_one(
  *   2  shared gate/up (Q8_0)        after 0, finish: SwiGLU, Q8_0 mid
  *   3  routed gate/up (IQ2_XXS)     after 1, finish: Q8_K routed mids
  *   4  shared down (Q8_0)           after 2
- *   5  routed down (Q2_K)           after 3
- *   6  moe + shared, HC post        after 4 and 5 (when out_hc is given)
+ *   5  routed down (Q2_K)           after 3, one (expert, row) dot per item
+ *   6  moe, then moe + shared and   after 4 and 5
+ *      the HC post (with out_hc)
  *
  * The plain path runs the six matvecs as six dispatches with the serial steps
  * and the post on the calling thread.  Here the thread that completes a stage
@@ -14773,23 +14787,33 @@ static void layer_ffn_one(
  * independent stage, and there is a single join.  Every row runs the same
  * kernel on the same inputs and the serial steps are the same functions, so
  * moe, shared, post and comb are bitwise the plain ones, and so is out_hc,
- * which stage 6 builds column by column like hc_post_one(). */
+ * which stage 6 builds column by column like hc_post_one().  Stage 6 also
+ * sums each column's six down dots in router slot order from 0.0f, as
+ * matvec_q2_k_experts_accum_prequant() does after its dispatch. */
 typedef struct {
     float *out_hc;
     float *ffn_out;
-    const float *moe;
+    float *moe;
+    const float *part;
     const float *shared;
     const float *residual_hc;
     const float *post;
     const float *comb;
 } ffn_graph_post_ctx;
 
-/* moe + shared and hc_post_one() for a range of embedding columns: every
- * element is computed with the same operations in the same order. */
+/* The routed sum, then moe + shared and hc_post_one() for a range of
+ * embedding columns: every element is computed with the same operations in
+ * the same order as the plain path. */
 static void ffn_graph_post_worker(void *vctx, uint64_t d0, uint64_t d1) {
     ffn_graph_post_ctx *ctx = vctx;
     const uint32_t n_hc = DS4_N_HC;
     const uint64_t n_embd = DS4_N_EMBD;
+    for (uint64_t d = d0; d < d1; d++) {
+        float acc = 0.0f;
+        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) acc += ctx->part[(uint64_t)i * n_embd + d];
+        ctx->moe[d] = acc;
+    }
+    if (!ctx->out_hc) return;
     for (uint64_t d = d0; d < d1; d++) ctx->ffn_out[d] = ctx->moe[d] + ctx->shared[d];
     for (uint32_t dst = 0; dst < n_hc; dst++) {
         float *out = ctx->out_hc + (uint64_t)dst * n_embd;
@@ -14992,15 +15016,16 @@ static void layer_ffn_graph(
         .blocks = mid_blocks,
     };
     g.routed_down = (matvec_q2_k_accum_ctx) {
-        .out = moe,
+        .part = scratch->routed_down_part,
         .in_dim = DS4_N_FF_EXP,
-        .n_expert = (int)DS4_N_EXPERT_USED,
+        .out_dim = DS4_N_EMBD,
     };
 
     g.hc_post = (ffn_graph_post_ctx) {
         .out_hc = out_hc,
         .ffn_out = scratch->ffn_out,
         .moe = moe,
+        .part = scratch->routed_down_part,
         .shared = shared,
         .residual_hc = inp_hc,
         .post = post,
@@ -15023,14 +15048,17 @@ static void layer_ffn_graph(
           .deps = 1u << 1, .finish = ffn_graph_routed_midq, .finish_ctx = &g },
         { .fn = matvec_q8_0_worker, .ctx = &g.shared_down,
           .n_rows = DS4_N_EMBD, .group_rows = DS4_N_EMBD, .deps = 1u << 2 },
+        /* Expert-major, so a claim streams 64 consecutive rows of one
+         * expert and each node reads its half of every expert. */
         { .fn = matvec_q2_k_accum_worker, .ctx = &g.routed_down,
-          .n_rows = DS4_N_EMBD, .group_rows = DS4_N_EMBD, .deps = 1u << 3 },
+          .n_rows = (uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD, .group_rows = DS4_N_EMBD,
+          .deps = 1u << 3 },
         /* Light elementwise work: claims of 256 columns. */
         { .fn = ffn_graph_post_worker, .ctx = &g.hc_post,
           .n_rows = DS4_N_EMBD, .group_rows = DS4_N_EMBD, .min_chunk = 256,
           .deps = (1u << 4) | (1u << 5) },
     };
-    ds4_pool_run_stages(stages, out_hc ? 7 : 6);
+    ds4_pool_run_stages(stages, 7);
 }
 
 /* Allocation-free decode FFN using the persistent CPU scratch buffers. */
@@ -15522,6 +15550,7 @@ static void cpu_decode_scratch_init(ds4_cpu_decode_scratch *scratch, uint32_t ct
     scratch->shared_up = xmalloc((size_t)DS4_N_FF_EXP * sizeof(float));
     scratch->shared_mid = xmalloc((size_t)DS4_N_FF_EXP * sizeof(float));
     scratch->routed_mid_all = xmalloc((size_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP * sizeof(float));
+    scratch->routed_down_part = xmalloc((size_t)DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float));
     scratch->routed_xq = xmalloc((size_t)(DS4_N_EMBD / QK_K) * sizeof(block_q8_K));
     scratch->routed_midq = xmalloc((size_t)DS4_N_EXPERT_USED * (DS4_N_FF_EXP / QK_K) * sizeof(block_q8_K));
     scratch->routed_q8_xq = xmalloc((size_t)routed_q8_x_blocks * 32u);
@@ -15556,6 +15585,7 @@ static void cpu_decode_scratch_free(ds4_cpu_decode_scratch *scratch) {
     free(scratch->routed_q8_xq);
     free(scratch->routed_midq);
     free(scratch->routed_xq);
+    free(scratch->routed_down_part);
     free(scratch->routed_mid_all);
     free(scratch->shared_mid);
     free(scratch->shared_up);
