@@ -15564,6 +15564,124 @@ static bool compressor_project_decode_f16(
     return true;
 }
 
+/* Every decode projection of attn_norm in one dispatch: q_a and kv (Q8_0, on
+ * the shared quantized activation) and, on compressed layers with F16
+ * compressors, the compressor rows of compressor_project_decode_f16().  The
+ * work unit is a group of DS4_F16_ROWS rows of one matrix, ordered first
+ * halves then second halves as in matvec_f16_multi().  Every row runs the
+ * kernel its own matvec runs (dot_q8_0_row, or one dot_f16_rows lane) on the
+ * same inputs, so the outputs are bitwise those of the separate dispatches;
+ * only the number of pool barriers per layer drops from up to three to one. */
+typedef struct {
+    float *out;
+    const uint8_t *data;
+    uint64_t rows;
+    uint64_t g0;
+    uint64_t n_groups;
+    bool f16;
+} attn_proj_seg;
+
+typedef struct {
+    attn_proj_seg seg[12];
+    uint32_t n_seg;
+    const float *x;
+    const int8_t *xq;
+    const float *xscale;
+    uint64_t in_dim;
+    uint64_t blocks;
+} attn_proj_ctx;
+
+static void attn_proj_worker(void *vctx, uint64_t v0, uint64_t v1) {
+    attn_proj_ctx *ctx = vctx;
+    uint64_t base = 0;
+    for (uint32_t s = 0; s < ctx->n_seg && v0 < v1; s++) {
+        const attn_proj_seg *sg = &ctx->seg[s];
+        const uint64_t end = base + sg->n_groups;
+        if (v0 < end) {
+            const uint64_t a = sg->g0 + (v0 - base);
+            const uint64_t b = sg->g0 + ((v1 < end ? v1 : end) - base);
+            const uint64_t row1 = b * DS4_F16_ROWS < sg->rows ? b * DS4_F16_ROWS : sg->rows;
+            for (uint64_t o = a * DS4_F16_ROWS; o < row1; o += DS4_F16_ROWS) {
+                const uint64_t n_rows = row1 - o < DS4_F16_ROWS ? row1 - o : DS4_F16_ROWS;
+                if (sg->f16) {
+                    dot_f16_rows(sg->out + o, (const uint16_t *)sg->data + o * ctx->in_dim,
+                                 n_rows, ctx->x, ctx->in_dim);
+                } else {
+                    for (uint64_t r = o; r < o + n_rows; r++) {
+                        sg->out[r] = dot_q8_0_row(sg->data + r * ctx->blocks * 34,
+                                                  ctx->xq, ctx->xscale, ctx->in_dim, ctx->blocks);
+                    }
+                }
+            }
+            v0 = end < v1 ? end : v1;
+        }
+        base = end;
+    }
+}
+
+/* Returns false (nothing done) unless q_a and kv are Q8_0; *comp_done tells
+ * whether the compressor rows were projected too. */
+static bool attn_input_projections_decode(
+        const ds4_model         * model,
+        const ds4_layer_weights * layer,
+        uint32_t                  ratio,
+        const float             * x,
+        ds4_cpu_decode_scratch  * scratch,
+        bool                    * comp_done) {
+    *comp_done = false;
+    const ds4_tensor *q8[2] = { layer->attn_q_a, layer->attn_kv };
+    float *q8_out[2] = { scratch->qr, scratch->kv_raw };
+    const uint64_t in_dim = DS4_N_EMBD;
+    for (uint32_t k = 0; k < 2; k++) {
+        if (!q8[k] || q8[k]->type != 8 || q8[k]->ndim != 2 || q8[k]->dim[0] != in_dim) return false;
+    }
+    if (layer->attn_q_a->dim[1] != DS4_N_LORA_Q || layer->attn_kv->dim[1] != DS4_N_HEAD_DIM) return false;
+
+    const ds4_tensor *f16[4] = {
+        layer->attn_compressor_kv, layer->attn_compressor_gate,
+        layer->indexer_compressor_kv, layer->indexer_compressor_gate,
+    };
+    float *f16_out[4] = {
+        scratch->comp_kv_cur, scratch->comp_sc_cur,
+        scratch->comp_kv_cur + 2u * DS4_N_HEAD_DIM, scratch->comp_sc_cur + 2u * DS4_N_HEAD_DIM,
+    };
+    uint32_t n_f16 = ratio == 0 ? 0u : ratio == 4 ? 4u : 2u;
+    for (uint32_t k = 0; k < n_f16; k++) {
+        const uint64_t cap = 2u * (k < 2 ? DS4_N_HEAD_DIM : DS4_N_INDEXER_HEAD_DIM);
+        if (!f16[k] || f16[k]->type != 1 || f16[k]->ndim != 2 ||
+            f16[k]->dim[0] != in_dim || f16[k]->dim[1] > cap) {
+            n_f16 = 0;
+            break;
+        }
+    }
+
+    cpu_decode_quantize_q8_0(scratch, x, in_dim);
+    attn_proj_ctx ctx = {
+        .x = x,
+        .xq = scratch->q8_xq,
+        .xscale = scratch->q8_xscale,
+        .in_dim = in_dim,
+        .blocks = (in_dim + 31) / 32,
+    };
+    const uint32_t n = 2u + n_f16;
+    uint64_t total = 0;
+    for (uint32_t k = 0; k < n; k++) {
+        const ds4_tensor *w = k < 2 ? q8[k] : f16[k - 2];
+        float *out = k < 2 ? q8_out[k] : f16_out[k - 2];
+        const uint64_t rows = w->dim[1];
+        const uint64_t groups = (rows + DS4_F16_ROWS - 1) / DS4_F16_ROWS;
+        const uint64_t half = groups / 2;
+        const uint8_t *data = tensor_data(model, w);
+        ctx.seg[k] = (attn_proj_seg){ out, data, rows, 0, half, k >= 2 };
+        ctx.seg[n + k] = (attn_proj_seg){ out, data, rows, half, groups - half, k >= 2 };
+        total += groups;
+    }
+    ctx.n_seg = 2u * n;
+    ds4_parallel_for_min_rows(total, attn_proj_worker, &ctx, 1);
+    *comp_done = n_f16 != 0;
+    return true;
+}
+
 /* Attention over raw SWA rows plus optional compressed rows.  Ratio-4 layers
  * pass an indexer mask to hide compressed rows not selected for this token. */
 static void layer_attention_mixed_one(
@@ -16540,17 +16658,34 @@ static void layer_forward_raw_swa_one(
     t0 = profile ? now_sec() : 0.0;
     layer_attn_norm_one(scratch->attn_norm, model, layer, scratch->attn_cur);
     const uint32_t ratio = cache->compress_ratio;
-    layer_q_projection_with_lora_one_decode_scratch(model, layer,
-                                                    scratch->attn_norm,
-                                                    scratch->q,
-                                                    scratch->qr_norm,
-                                                    scratch);
+    bool comp_projected = false;
+    const bool fused =
+        attn_input_projections_decode(model, layer, ratio, scratch->attn_norm, scratch, &comp_projected);
+    if (fused) {
+        /* q_a, kv and the compressor rows are done: finish q as
+         * layer_q_projection_with_lora_one_decode_scratch() does. */
+        const float *q_a_norm = tensor_data(model, layer->attn_q_a_norm);
+        rms_norm_weight(scratch->qr_norm, scratch->qr, q_a_norm, DS4_N_LORA_Q, DS4_RMS_EPS);
+        matvec_q8_0_decode_scratch(scratch->q, model, layer->attn_q_b, scratch->qr_norm, scratch);
+        head_rms_norm_inplace(scratch->q, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_RMS_EPS);
+    } else {
+        layer_q_projection_with_lora_one_decode_scratch(model, layer,
+                                                        scratch->attn_norm,
+                                                        scratch->q,
+                                                        scratch->qr_norm,
+                                                        scratch);
+    }
     if (profile) t_q = now_sec() - t0;
     t0 = profile ? now_sec() : 0.0;
-    layer_kv_projection_normed_one_decode_scratch(model, layer,
-                                                  scratch->attn_norm,
-                                                  scratch->kv,
-                                                  scratch);
+    if (fused) {
+        const float *kv_norm = tensor_data(model, layer->attn_kv_a_norm);
+        rms_norm_weight(scratch->kv, scratch->kv_raw, kv_norm, DS4_N_HEAD_DIM, DS4_RMS_EPS);
+    } else {
+        layer_kv_projection_normed_one_decode_scratch(model, layer,
+                                                      scratch->attn_norm,
+                                                      scratch->kv,
+                                                      scratch);
+    }
     if (profile) t_kv = now_sec() - t0;
 
     t0 = profile ? now_sec() : 0.0;
@@ -16563,7 +16698,8 @@ static void layer_forward_raw_swa_one(
 
     if (ratio != 0) {
         t0 = profile ? now_sec() : 0.0;
-        const bool projected = compressor_project_decode_f16(model, layer, ratio, scratch->attn_norm, scratch);
+        const bool projected = comp_projected ||
+            compressor_project_decode_f16(model, layer, ratio, scratch->attn_norm, scratch);
         if (projected ?
             compressor_update_one(scratch->comp, model,
                                   layer->attn_compressor_ape,
