@@ -13233,13 +13233,35 @@ static void hc_post_one(
     for (uint32_t dst = 0; dst < n_hc; dst++) {
         float *out = out_hc + (uint64_t)dst * n_embd;
         const float p = post[dst];
-        for (uint32_t d = 0; d < n_embd; d++) out[d] = block_out[d] * p;
+        uint32_t d0 = 0;
+#if defined(__AVX512F__)
+        /* The four-stream case keeps each 16-element slice in a register
+         * across the block term and all sources instead of storing and
+         * reloading the row five times: same operations, same order. */
+        if (n_hc == 4) {
+            const __m512 vp = _mm512_set1_ps(p);
+            const __m512 w0 = _mm512_set1_ps(comb[dst + 0 * n_hc]);
+            const __m512 w1 = _mm512_set1_ps(comb[dst + 1 * n_hc]);
+            const __m512 w2 = _mm512_set1_ps(comb[dst + 2 * n_hc]);
+            const __m512 w3 = _mm512_set1_ps(comb[dst + 3 * n_hc]);
+            const float *r0 = residual_hc, *r1 = r0 + n_embd, *r2 = r1 + n_embd, *r3 = r2 + n_embd;
+            for (; d0 + 16 <= n_embd; d0 += 16) {
+                __m512 v = _mm512_mul_ps(_mm512_loadu_ps(block_out + d0), vp);
+                v = _mm512_add_ps(v, _mm512_mul_ps(w0, _mm512_loadu_ps(r0 + d0)));
+                v = _mm512_add_ps(v, _mm512_mul_ps(w1, _mm512_loadu_ps(r1 + d0)));
+                v = _mm512_add_ps(v, _mm512_mul_ps(w2, _mm512_loadu_ps(r2 + d0)));
+                v = _mm512_add_ps(v, _mm512_mul_ps(w3, _mm512_loadu_ps(r3 + d0)));
+                _mm512_storeu_ps(out + d0, v);
+            }
+        }
+#endif
+        for (uint32_t d = d0; d < n_embd; d++) out[d] = block_out[d] * p;
 
         for (uint32_t src = 0; src < n_hc; src++) {
             /* The HC combine matrix is addressed as [dst_hc, src_hc]. */
             const float w = comb[dst + src * n_hc];
             const float *res = residual_hc + (uint64_t)src * n_embd;
-            for (uint32_t d = 0; d < n_embd; d++) out[d] += w * res[d];
+            for (uint32_t d = d0; d < n_embd; d++) out[d] += w * res[d];
         }
     }
 }
