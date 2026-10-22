@@ -201,9 +201,10 @@ static __m512 ds41_cpu_q2k_rows16(const uint8_t *rows, const float *x,
     return sum;
 }
 
+/* Rows [g * group_rows, (g + 1) * group_rows) read ref.x + g * group_in. */
 typedef struct {
     matvec_q8_0_f32_ref_ctx ref;
-    uint64_t rows;
+    uint64_t rows, group_rows, group_in;
 } ds41_cpu_q8_ctx;
 
 static void ds41_cpu_q8_worker(void *vctx, uint64_t first, uint64_t last) {
@@ -211,11 +212,14 @@ static void ds41_cpu_q8_worker(void *vctx, uint64_t first, uint64_t last) {
     const uint64_t row_bytes = ctx->ref.blocks * 34;
     for (uint64_t tile = first; tile < last; tile++) {
         const uint64_t row = tile * 16;
+        const float *x = ctx->ref.x + row / ctx->group_rows * ctx->group_in;
         if (ctx->rows - row >= 16) {
             _mm512_storeu_ps(ctx->ref.out + row, ds41_cpu_q8_rows16(
-                ctx->ref.data + row * row_bytes, ctx->ref.x, ctx->ref.in_dim, row_bytes));
+                ctx->ref.data + row * row_bytes, x, ctx->ref.in_dim, row_bytes));
         } else {
-            matvec_q8_0_f32_ref_worker(&ctx->ref, row, ctx->rows);
+            matvec_q8_0_f32_ref_ctx ref = ctx->ref;
+            ref.x = x;
+            matvec_q8_0_f32_ref_worker(&ref, row, ctx->rows);
         }
     }
 }
@@ -274,22 +278,42 @@ static void ds41_cpu_down_worker(void *vctx, uint64_t first, uint64_t last) {
 }
 #endif
 
-static void ds41_cpu_matvec_q8(float *out, const ds4_model *m,
-                              const ds4_tensor *t, const float *x) {
+/* A matrix whose row groups read consecutive input slices, like the grouped
+ * output projection, in one pool dispatch instead of one per group: rows
+ * [g * group_rows, (g + 1) * group_rows) read x + g * group_in.  group_rows
+ * must divide the rows; a multiple of 16 keeps the tiles inside one group. */
+static void ds41_cpu_matvec_q8_grouped(float *out, const ds4_model *m,
+                                      const ds4_tensor *t, const float *x,
+                                      uint64_t group_rows, uint64_t group_in) {
+    if (t->type != DS4_TENSOR_Q8_0 || t->ndim < 2 || t->dim[0] == 0)
+        ds4_die("expected a Q8_0 tensor with matrix rows");
+    const uint64_t rows = t->elements / t->dim[0];
+    const uint64_t blocks = (t->dim[0] + 31) / 32;
 #if defined(__AVX512F__) && defined(__AVX512BW__)
-    if (t->type == DS4_TENSOR_Q8_0 && t->ndim >= 2 && t->dim[0] > 0 &&
-        t->dim[0] <= (uint64_t)(INT32_MAX / (15 * 34)) * 32) {
+    if (t->dim[0] <= (uint64_t)(INT32_MAX / (15 * 34)) * 32 &&
+        (group_rows == rows || group_rows % 16 == 0)) {
         ds41_cpu_q8_ctx ctx = {
             .ref = {.out = out, .data = tensor_data(m, t), .x = x,
-                    .in_dim = t->dim[0], .blocks = (t->dim[0] + 31) / 32},
-            .rows = t->elements / t->dim[0],
+                    .in_dim = t->dim[0], .blocks = blocks},
+            .rows = rows, .group_rows = group_rows, .group_in = group_in,
         };
         /* The old threshold was 512 rows; pool work units are now 16 rows. */
         ds4_parallel_for_min_rows((ctx.rows + 15) / 16, ds41_cpu_q8_worker, &ctx, 32);
         return;
     }
 #endif
-    matvec_q8_0_f32_ref(out, m, t, x);
+    for (uint64_t row = 0; row < rows; row += group_rows) {
+        matvec_q8_0_f32_ref_ctx ctx = {
+            .out = out + row, .data = (const uint8_t *)tensor_data(m, t) + row * blocks * 34,
+            .x = x + row / group_rows * group_in, .in_dim = t->dim[0], .blocks = blocks,
+        };
+        ds4_parallel_for(group_rows, matvec_q8_0_f32_ref_worker, &ctx);
+    }
+}
+
+static void ds41_cpu_matvec_q8(float *out, const ds4_model *m,
+                              const ds4_tensor *t, const float *x) {
+    ds41_cpu_matvec_q8_grouped(out, m, t, x, t->elements / t->dim[0], 0);
 }
 
 static void ds41_cpu_routed_moe(float *out, float *mid, const ds4_model *m,

@@ -2045,10 +2045,64 @@ static void check_grouped_ffn(uint64_t in_dim, uint64_t mid_dim, uint64_t out_di
     quant_free(xb); quant_free(db); quant_free(ub); quant_free(gb);
 }
 
+/* The grouped V4.1 Q8_0 dispatch against one reference matvec per group,
+ * with special scales and activations: every row keeps its kernel and its
+ * input slice, so even NaN payloads must match. */
+static void check_ds41_q8_grouped(void) {
+    static const uint16_t scales[] = {0x0000, 0x8000, 0x0001, 0x83ff, 0x7bff,
+                                      0x7c00, 0xfc00, 0x7e00, 0x7c01, 0x3c00};
+    static const uint32_t specials[] = {0x00000000, 0x80000000, 0x00000001,
+        0x7f800000, 0xff800000, 0x7fc12345, 0x7f812345, 0x7f7fffff};
+    const uint64_t dims[] = {32, 100, 4096};
+    const uint64_t group_rows[] = {16, 32, 1024};
+    for (size_t di = 0; di < sizeof(dims) / sizeof(*dims); di++)
+    for (size_t gi = 0; gi < sizeof(group_rows) / sizeof(*group_rows); gi++)
+    for (uint64_t groups = 1; groups <= 8; groups *= 2) {
+        const uint64_t in_dim = dims[di], rows = group_rows[gi] * groups;
+        const uint64_t blocks = (in_dim + 31) / 32, bytes = rows * blocks * 34;
+        uint8_t *w = malloc(bytes);
+        float *x = malloc(groups * in_dim * sizeof(float));
+        float *want = malloc(rows * sizeof(float)), *got = malloc(rows * sizeof(float));
+        CHECK(w && x && want && got);
+        for (uint64_t i = 0; i < bytes; i++) w[i] = (uint8_t)quant_random();
+        for (uint64_t b = 0; b < rows * blocks; b++) {
+            const uint32_t r = quant_random();
+            const uint16_t d = r % 4 ? (uint16_t)(0x1800 + r % 0x1000) :
+                scales[(r >> 8) % (sizeof(scales) / sizeof(*scales))];
+            memcpy(w + b * 34, &d, sizeof(d));
+            if (r % 7 == 0) w[b * 34 + 2 + (r >> 16) % 32] = 0x80;
+        }
+        for (uint64_t i = 0; i < groups * in_dim; i++) {
+            const uint32_t r = quant_random();
+            if (r % 16 == 0) memcpy(&x[i], &specials[(r >> 8) % 8], sizeof(float));
+            else x[i] = (float)((int32_t)(r >> 8) % 20001 - 10000) * 1e-4f;
+        }
+        for (uint64_t g = 0; g < groups; g++) {
+            matvec_q8_0_f32_ref_ctx ref = {
+                .out = want + g * group_rows[gi], .data = w + g * group_rows[gi] * blocks * 34,
+                .x = x + g * in_dim, .in_dim = in_dim, .blocks = blocks,
+            };
+            matvec_q8_0_f32_ref_worker(&ref, 0, group_rows[gi]);
+        }
+        const ds4_model m = {.map = w, .size = bytes};
+        const ds4_tensor t = {.type = DS4_TENSOR_Q8_0, .ndim = 2,
+                              .dim = {in_dim, rows}, .elements = in_dim * rows, .bytes = bytes};
+        ds41_cpu_matvec_q8_grouped(got, &m, &t, x, group_rows[gi], in_dim);
+        CHECK(memcmp(want, got, rows * sizeof(float)) == 0);
+        if (groups == 1) {
+            ds41_cpu_matvec_q8(got, &m, &t, x);
+            CHECK(memcmp(want, got, rows * sizeof(float)) == 0);
+        }
+        free(w); free(x); free(want); free(got);
+    }
+}
+
 int main(void) {
     check_ffn_graph();
     if (getenv("DS4_TEST_FFN_GRAPH_ONLY")) return 0;
     check_thread_pool();
+    check_ds41_q8_grouped();
+    puts("CPU V4.1 grouped Q8_0 projection bitwise against per-group reference PASS");
     check_f16_round_trip();
     check_compressor_project_batch();
     check_prefix_attention();

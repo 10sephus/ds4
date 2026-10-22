@@ -348,18 +348,26 @@ static bool ds41_cpu_attention_forward(ds41_cpu_attention_state *s,
     ds41_cpu_bf16_rows(s->heads, 64u * 512u);
     ds41_cpu_rope(s->heads, 512, 64, pos, ratio != 0, true);
     ds41_prof(DS41_PROF_OUT);
-    uint64_t row_bytes;
-    if (!tensor_nbytes(l->attn_output_a->type, 4096u, &row_bytes)) return false;
-    for (uint32_t group = 0; group < 8; group++) {
-        ds4_tensor a = *l->attn_output_a;
-        a.ndim = 2;
-        a.dim[0] = 4096;
-        a.dim[1] = 1024;
-        a.elements = 4096u * 1024u;
-        a.bytes = 1024u * row_bytes;
-        a.abs_offset += (uint64_t)group * a.bytes;
-        if (!ds41_cpu_matvec(s->low + group * 1024u, m, &a,
-                             s->heads + group * 4096u, true)) return false;
+    if (l->attn_output_a->type == DS4_TENSOR_Q8_0 && l->attn_output_a->dim[0] == 4096u &&
+        l->attn_output_a->elements == 4096u * 8192u) {
+        /* The eight groups in one dispatch: same rows, kernel and inputs. */
+        ds41_cpu_matvec_q8_grouped(s->low, m, l->attn_output_a, s->heads, 1024u, 4096u);
+        if (ds41_prof_on) ds41_prof_bytes[DS41_PROF_OUT] += l->attn_output_a->bytes;
+        ds41_cpu_bf16_rows(s->low, 8192u);
+    } else {
+        uint64_t row_bytes;
+        if (!tensor_nbytes(l->attn_output_a->type, 4096u, &row_bytes)) return false;
+        for (uint32_t group = 0; group < 8; group++) {
+            ds4_tensor a = *l->attn_output_a;
+            a.ndim = 2;
+            a.dim[0] = 4096;
+            a.dim[1] = 1024;
+            a.elements = 4096u * 1024u;
+            a.bytes = 1024u * row_bytes;
+            a.abs_offset += (uint64_t)group * a.bytes;
+            if (!ds41_cpu_matvec(s->low + group * 1024u, m, &a,
+                                 s->heads + group * 4096u, true)) return false;
+        }
     }
     if (!ds41_cpu_matvec(block, m, l->attn_output_b, s->low, false)) return false;
     ds41_cpu_bf16_rows(block, 5120);
