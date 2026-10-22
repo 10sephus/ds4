@@ -12275,11 +12275,11 @@ static void matvec_iq2_xxs_experts_accum_prequant(
  *
  * Prefill sorts the (token, slot) pairs by expert and walks each expert's
  * tokens in tiles of sixteen, so an expert row is read and decoded once per
- * tile instead of once per token.  A tile holds sixteen Q8_K activation rows
- * interleaved for vpdpbusd: within a superblock the 64 four-byte groups of
- * all lanes are adjacent, so one 64-byte load feeds sixteen int32 lanes; the
- * per-row scale and the 16-value block sums (paired per 32-value sub-block)
- * are gathered per lane.  The x16 kernels keep the integer sub-block dots
+ * (expert, row block) task instead of once per token.  A tile holds sixteen
+ * Q8_K activation rows interleaved for vpdpbusd: within a superblock the 64
+ * four-byte groups of all lanes are adjacent, so one 64-byte load feeds
+ * sixteen int32 lanes; the per-row scale and the 16-value block sums (paired
+ * per 32-value sub-block) are gathered per lane.  The x16 kernels keep the integer sub-block dots
  * exact and replay the reference dots' per-superblock float sequence lane by
  * lane, so every lane is bitwise identical to the single-row kernels the
  * decode path uses.  Lanes past n carry zeros and are never stored.
