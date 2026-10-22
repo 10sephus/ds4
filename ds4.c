@@ -2127,6 +2127,27 @@ typedef struct {
     uint64_t v __attribute__((aligned(64)));
 } ds4_pool_cursor;
 
+/* One stage of a staged dispatch (ds4_pool_run_stages): a row-parallel kernel
+ * like a plain dispatch, the earlier stage it waits for, and an optional
+ * serial step run by the thread that completes its last row. */
+typedef struct {
+    ds4_parallel_fn fn;
+    void *ctx;
+    uint64_t n_rows;
+    uint64_t group_rows;
+    uint64_t min_chunk;
+    int dep;                        /* earlier stage that must be finished, or -1 */
+    void (*finish)(void *ctx);      /* NULL, or the serial step after the last row */
+    void *finish_ctx;
+    /* Set up by ds4_pool_run_stages(); the claim layout is the plain one. */
+    uint64_t chunk;
+    uint64_t half_rows;
+    uint64_t end[2];
+    ds4_pool_cursor cursor[2];
+    uint64_t done __attribute__((aligned(64)));    /* rows completed */
+    uint32_t ready __attribute__((aligned(64)));   /* rows and finish completed */
+} ds4_pool_stage;
+
 typedef struct {
     pthread_t threads[DS4_MAX_THREADS];
     uint8_t thread_node[DS4_MAX_THREADS];   /* home NUMA node per thread */
@@ -2147,6 +2168,9 @@ typedef struct {
     uint64_t group_rows;
     uint64_t half_rows;
     uint64_t end[2];
+    /* Non-NULL while a staged dispatch runs instead of fn. */
+    ds4_pool_stage *stages;
+    uint32_t n_stages;
     /* Each dispatch-hot word gets its own cache line: generation is polled by
      * every idle worker, a cursor is bumped by every chunk claim on its node
      * and pending by every finishing worker. */
@@ -2222,6 +2246,53 @@ static void ds4_pool_work(int node) {
     ds4_pool_claim(1 - node);
 }
 
+/* ds4_pool_claim() for one stage.  The thread whose rows complete the stage
+ * runs its finish step and then marks it ready for the stages that wait on
+ * it; the acquire-release count makes every row visible to that thread. */
+static void ds4_stage_claim(ds4_pool_stage *s, int node) {
+    const uint64_t group = s->group_rows;
+    const uint64_t half = node ? group - s->half_rows : s->half_rows;
+    const uint64_t first = node ? s->half_rows : 0;
+    const uint64_t end = s->end[node];
+    for (;;) {
+        uint64_t v = __atomic_fetch_add(&s->cursor[node].v, s->chunk, __ATOMIC_RELAXED);
+        if (v >= end) return;
+        const uint64_t v_end = v + s->chunk < end ? v + s->chunk : end;
+        const uint64_t claimed = v_end - v;
+        while (v < v_end) {
+            const uint64_t g = v / half;
+            const uint64_t i = v - g * half;
+            const uint64_t n = half - i < v_end - v ? half - i : v_end - v;
+            const uint64_t row0 = g * group + first + i;
+            s->fn(s->ctx, row0, row0 + n);
+            v += n;
+        }
+        if (__atomic_add_fetch(&s->done, claimed, __ATOMIC_ACQ_REL) == s->n_rows) {
+            if (s->finish) s->finish(s->finish_ctx);
+            __atomic_store_n(&s->ready, 1, __ATOMIC_RELEASE);
+        }
+    }
+}
+
+/* Walk the stages in order: wait for the stage's dependency, then claim rows
+ * on the home node and on the other node, as ds4_pool_work() does.  A thread
+ * that runs out of rows in one stage starts on the next, so the tail of one
+ * kernel overlaps the next independent one instead of waiting at a join. */
+static void ds4_stages_work(ds4_pool_stage *stages, uint32_t n_stages, int node) {
+    for (uint32_t k = 0; k < n_stages; k++) {
+        ds4_pool_stage *s = &stages[k];
+        if (s->dep >= 0) {
+            const uint32_t *ready = &stages[s->dep].ready;
+            for (uint32_t spins = 0; !__atomic_load_n(ready, __ATOMIC_ACQUIRE); spins++) {
+                ds4_cpu_relax();
+                if ((spins & 4095u) == 4095u) sched_yield();
+            }
+        }
+        ds4_stage_claim(s, node);
+        ds4_stage_claim(s, 1 - node);
+    }
+}
+
 /* Soft-pin the calling thread to its home node's whole CPU set, never to one
  * CPU: the scheduler must still be able to move it off a busy core. */
 static void ds4_numa_pin(int node) {
@@ -2243,7 +2314,8 @@ static void *ds4_worker_main(void *arg) {
     for (;;) {
         ds4_pool_wait(&g_pool.generation, ++generation, &g_pool.work_cond);
         if (g_pool.shutdown) return NULL;
-        ds4_pool_work(node);
+        if (g_pool.stages) ds4_stages_work(g_pool.stages, g_pool.n_stages, node);
+        else ds4_pool_work(node);
         if (__atomic_sub_fetch(&g_pool.pending, 1, __ATOMIC_RELEASE) == 0) {
             ds4_pool_notify(&g_pool.done_cond);
         }
@@ -2481,6 +2553,58 @@ static void ds4_parallel_for(uint64_t n_rows, ds4_parallel_fn fn, void *ctx) {
 
 static void ds4_parallel_for_grouped(uint64_t n_rows, ds4_parallel_fn fn, void *ctx, uint64_t group_rows) {
     ds4_pool_dispatch(n_rows, fn, ctx, group_rows, 512);
+}
+
+/* Run dependent row-parallel kernels in one dispatch with one join.  Each
+ * stage splits its rows between the nodes and sizes its claims exactly like
+ * a plain dispatch of the same rows (but at least min_chunk rows), and every
+ * row is computed whole by one thread, so the results equal running the
+ * stages as separate dispatches with their finish steps in between. */
+static void ds4_pool_run_stages(ds4_pool_stage *stages, uint32_t n_stages) {
+    ds4_threads_init();
+
+    const bool serial = g_parallel_depth > 0 || g_pool.n_threads <= 1;
+    for (uint32_t k = 0; k < n_stages; k++) {
+        ds4_pool_stage *s = &stages[k];
+        if (s->dep >= (int)k) ds4_die("staged dispatch depends on a later stage");
+        uint64_t chunk = s->n_rows / (8u * g_pool.n_threads);
+        if (chunk < 1) chunk = 1;
+        if (chunk > 64) chunk = 64;
+        if (chunk < s->min_chunk) chunk = s->min_chunk;
+        const uint64_t half = g_numa.on ? s->group_rows / 2 : s->group_rows;
+        const uint64_t groups = s->n_rows / s->group_rows;
+        const uint64_t tail = s->n_rows - groups * s->group_rows;
+        s->chunk = chunk;
+        s->half_rows = half;
+        s->end[0] = groups * half + (tail < half ? tail : half);
+        s->end[1] = groups * (s->group_rows - half) + (tail > half ? tail - half : 0);
+        s->cursor[0].v = 0;
+        s->cursor[1].v = 0;
+        s->done = 0;
+        s->ready = 0;
+        if (s->n_rows == 0) {
+            if (s->finish) s->finish(s->finish_ctx);
+            s->ready = 1;
+        }
+    }
+
+    if (serial) {
+        ds4_stages_work(stages, n_stages, 0);
+        return;
+    }
+
+    g_pool.stages = stages;
+    g_pool.n_stages = n_stages;
+    __atomic_store_n(&g_pool.pending, g_pool.n_workers, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&g_pool.generation, 1, __ATOMIC_RELEASE);
+    ds4_pool_notify(&g_pool.work_cond);
+
+    g_parallel_depth++;
+    ds4_stages_work(stages, n_stages, 0);
+    g_parallel_depth--;
+
+    ds4_pool_wait(&g_pool.pending, 0, &g_pool.done_cond);
+    g_pool.stages = NULL;
 }
 
 static void cursor_error(ds4_cursor *c, const char *msg) {
@@ -14630,6 +14754,192 @@ static void layer_ffn_one(
     free(ffn_cur);
 }
 
+/* Decode routed MoE plus shared expert as one staged dispatch:
+ *
+ *   0  router logits (F16)          finish: expert selection, Q8_K input
+ *   1  shared gate/up (Q8_0)        finish: SwiGLU, Q8_0 shared mid
+ *   2  routed gate/up (IQ2_XXS)     after 0, finish: Q8_K routed mids
+ *   3  shared down (Q8_0)           after 1
+ *   4  routed down (Q2_K)           after 2
+ *
+ * The plain path runs these as five dispatches with the serial steps between
+ * them on the calling thread.  Here the thread that completes a stage runs
+ * its serial step while the others stream the weights of the next
+ * independent stage, and there is a single join.  Every row runs the same
+ * kernel on the same inputs, so moe and shared are bitwise the plain ones. */
+typedef struct {
+    const ds4_model *model;
+    const ds4_layer_weights *layer;
+    const float *x;
+    ds4_cpu_decode_scratch *scratch;
+    int token;
+    float logits[DS4_MAX_EXPERT];
+    iq2xxs_q8 yq[DS4_MAX_EMBD / QK_K];
+    matvec_f16_ctx router;
+    matvec_q8_0_pair_ctx shared_gate_up;
+    matvec_iq2_xxs_mid_ctx routed_mid;
+    matvec_q8_0_ctx shared_down;
+    matvec_q2_k_accum_ctx routed_down;
+} ffn_graph_ctx;
+
+static void ffn_graph_route(void *vctx) {
+    ffn_graph_ctx *g = vctx;
+    const ds4_model *model = g->model;
+    const ds4_layer_weights *layer = g->layer;
+    int selected[DS4_MAX_EXPERT_USED];
+    float expert_weight[DS4_MAX_EXPERT_USED];
+    float probs[DS4_MAX_EXPERT] = {0};
+
+    for (uint32_t i = 0; i < DS4_N_EXPERT; i++) probs[i] = sqrtf(softplus_stable(g->logits[i]));
+    if (layer->ffn_gate_tid2eid) {
+        layer_hash_selected_experts(selected, model, layer, g->token);
+        layer_hash_router_weights_from_probs(expert_weight, probs, selected);
+    } else {
+        layer_topk_selected_experts_from_probs(selected, expert_weight, model, layer, probs);
+    }
+
+    matvec_iq2_xxs_mid_ctx *mid = &g->routed_mid;
+    matvec_q2_k_accum_ctx *down = &g->routed_down;
+    const uint64_t mid_blocks = DS4_N_FF_EXP / QK_K;
+    for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+        uint64_t in_dim, out_dim;
+        mid->gate_base[i] = tensor_expert_bytes(model, layer->ffn_gate_exps, (uint32_t)selected[i],
+                                                &in_dim, &out_dim, &mid->gate_row_bytes[i]);
+        mid->up_base[i] = tensor_expert_bytes(model, layer->ffn_up_exps, (uint32_t)selected[i],
+                                              &in_dim, &out_dim, &mid->up_row_bytes[i]);
+        mid->expert_weight[i] = expert_weight[i];
+        down->base[i] = tensor_expert_bytes(model, layer->ffn_down_exps, (uint32_t)selected[i],
+                                            &in_dim, &out_dim, &down->row_bytes[i]);
+        down->xq[i] = g->scratch->routed_midq + (uint64_t)i * mid_blocks;
+    }
+
+    ds4_quantize_row_q8_K(g->x, g->scratch->routed_xq, (int64_t)DS4_N_EMBD);
+    iq2xxs_q8_prepare(g->yq, g->scratch->routed_xq, DS4_N_EMBD / QK_K);
+}
+
+static void ffn_graph_shared_mid(void *vctx) {
+    ffn_graph_ctx *g = vctx;
+    ds4_cpu_decode_scratch *scratch = g->scratch;
+    swiglu(scratch->shared_mid, scratch->shared_gate, scratch->shared_up, DS4_N_FF_EXP,
+           DS4_SWIGLU_CLAMP_EXP);
+    cpu_decode_quantize_q8_0(scratch, scratch->shared_mid, DS4_N_FF_EXP);
+}
+
+static void ffn_graph_routed_midq(void *vctx) {
+    ffn_graph_ctx *g = vctx;
+    for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+        ds4_quantize_row_q8_K(g->scratch->routed_mid_all + (uint64_t)i * DS4_N_FF_EXP,
+                              g->scratch->routed_midq + (uint64_t)i * (DS4_N_FF_EXP / QK_K),
+                              (int64_t)DS4_N_FF_EXP);
+    }
+}
+
+/* The graph covers the V4 Flash layout; anything else takes the plain path. */
+static bool ffn_graph_supported(const ds4_layer_weights *layer) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *env = getenv("DS4_FFN_GRAPH");
+        enabled = !(env && !strcmp(env, "0"));
+    }
+    const ds4_tensor *r = layer->ffn_gate_inp;
+    const ds4_tensor *g = layer->ffn_gate_shexp, *u = layer->ffn_up_shexp, *d = layer->ffn_down_shexp;
+    return enabled &&
+           r && r->type == DS4_TENSOR_F16 && r->ndim == 2 &&
+           r->dim[0] == DS4_N_EMBD && r->dim[1] == DS4_N_EXPERT &&
+           layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
+           layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
+           layer->ffn_down_exps->type == DS4_TENSOR_Q2_K &&
+           layer->ffn_gate_exps->dim[0] == DS4_N_EMBD &&
+           layer->ffn_gate_exps->dim[1] == DS4_N_FF_EXP &&
+           layer->ffn_up_exps->dim[0] == DS4_N_EMBD &&
+           layer->ffn_up_exps->dim[1] == DS4_N_FF_EXP &&
+           layer->ffn_down_exps->dim[0] == DS4_N_FF_EXP &&
+           layer->ffn_down_exps->dim[1] == DS4_N_EMBD &&
+           g->type == DS4_TENSOR_Q8_0 && u->type == DS4_TENSOR_Q8_0 && d->type == DS4_TENSOR_Q8_0 &&
+           g->ndim == 2 && u->ndim == 2 && d->ndim == 2 &&
+           g->dim[0] == DS4_N_EMBD && g->dim[1] == DS4_N_FF_EXP &&
+           u->dim[0] == DS4_N_EMBD && u->dim[1] == DS4_N_FF_EXP &&
+           d->dim[0] == DS4_N_FF_EXP && d->dim[1] == DS4_N_EMBD &&
+           DS4_N_EMBD % QK_K == 0 && DS4_N_FF_EXP % QK_K == 0 && DS4_N_EMBD <= DS4_MAX_EMBD;
+}
+
+static void layer_ffn_moe_shared_graph(
+        float                  * moe,
+        float                  * shared,
+        const ds4_model        * model,
+        const ds4_layer_weights * layer,
+        const float            * x,
+        int                      token,
+        ds4_cpu_decode_scratch * scratch) {
+    ffn_graph_ctx g;   /* on the stack: token decode must not touch the heap */
+    const uint64_t embd_blocks = DS4_N_EMBD / 32u;
+    const uint64_t mid_blocks = DS4_N_FF_EXP / 32u;
+
+    g.model = model;
+    g.layer = layer;
+    g.x = x;
+    g.scratch = scratch;
+    g.token = token;
+    g.router = (matvec_f16_ctx) {
+        .out = g.logits,
+        .data = tensor_data(model, layer->ffn_gate_inp),
+        .x = x,
+        .in_dim = DS4_N_EMBD,
+    };
+    /* Stage 1 reads this quantized input; its finish step then reuses the
+     * buffer for the shared mid, as the plain path does. */
+    cpu_decode_quantize_q8_0(scratch, x, DS4_N_EMBD);
+    g.shared_gate_up = (matvec_q8_0_pair_ctx) {
+        .out0 = scratch->shared_gate,
+        .out1 = scratch->shared_up,
+        .data0 = tensor_data(model, layer->ffn_gate_shexp),
+        .data1 = tensor_data(model, layer->ffn_up_shexp),
+        .xq = scratch->q8_xq,
+        .xscale = scratch->q8_xscale,
+        .in_dim = DS4_N_EMBD,
+        .blocks = embd_blocks,
+    };
+    g.routed_mid = (matvec_iq2_xxs_mid_ctx) {
+        .mid = scratch->routed_mid_all,
+        .xq = g.yq,
+        .clamp = DS4_SWIGLU_CLAMP_EXP,
+        .in_dim = DS4_N_EMBD,
+        .out_dim = DS4_N_FF_EXP,
+        .n_expert = (int)DS4_N_EXPERT_USED,
+    };
+    g.shared_down = (matvec_q8_0_ctx) {
+        .out = shared,
+        .data = tensor_data(model, layer->ffn_down_shexp),
+        .xq = scratch->q8_xq,
+        .xscale = scratch->q8_xscale,
+        .in_dim = DS4_N_FF_EXP,
+        .row0 = 0,
+        .blocks = mid_blocks,
+    };
+    g.routed_down = (matvec_q2_k_accum_ctx) {
+        .out = moe,
+        .in_dim = DS4_N_FF_EXP,
+        .n_expert = (int)DS4_N_EXPERT_USED,
+    };
+
+    ds4_pool_stage stages[5] = {
+        { .fn = matvec_f16_worker, .ctx = &g.router,
+          .n_rows = DS4_N_EXPERT, .group_rows = DS4_N_EXPERT, .min_chunk = DS4_F16_ROWS,
+          .dep = -1, .finish = ffn_graph_route, .finish_ctx = &g },
+        { .fn = matvec_q8_0_pair_worker, .ctx = &g.shared_gate_up,
+          .n_rows = DS4_N_FF_EXP, .group_rows = DS4_N_FF_EXP,
+          .dep = -1, .finish = ffn_graph_shared_mid, .finish_ctx = &g },
+        { .fn = matvec_iq2_xxs_mid_worker, .ctx = &g.routed_mid,
+          .n_rows = (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP, .group_rows = DS4_N_FF_EXP,
+          .dep = 0, .finish = ffn_graph_routed_midq, .finish_ctx = &g },
+        { .fn = matvec_q8_0_worker, .ctx = &g.shared_down,
+          .n_rows = DS4_N_EMBD, .group_rows = DS4_N_EMBD, .dep = 1 },
+        { .fn = matvec_q2_k_accum_worker, .ctx = &g.routed_down,
+          .n_rows = DS4_N_EMBD, .group_rows = DS4_N_EMBD, .dep = 2 },
+    };
+    ds4_pool_run_stages(stages, 5);
+}
+
 /* Allocation-free decode FFN using the persistent CPU scratch buffers. */
 static void layer_ffn_one_decode_scratch(
         float                  * out_hc,
@@ -14667,26 +14977,34 @@ static void layer_ffn_one_decode_scratch(
     rms_norm_weight(scratch->ffn_norm, scratch->ffn_cur, ffn_norm, DS4_N_EMBD, DS4_RMS_EPS);
     if (profile) t_norm = now_sec() - t0;
 
-    t0 = profile ? now_sec() : 0.0;
-    layer_routed_moe_one_prealloc(scratch->ffn_moe,
-                                  model,
-                                  layer,
-                                  scratch->ffn_norm,
-                                  il,
-                                  token,
-                                  DS4_SWIGLU_CLAMP_EXP,
-                                  scratch->routed_mid_all,
-                                  scratch->routed_xq,
-                                  scratch->routed_midq,
-                                  scratch->routed_q8_xq,
-                                  scratch->routed_q8_xscale,
-                                  scratch->routed_q8_midq,
-                                  scratch->routed_q8_midscale);
-    if (profile) t_routed = now_sec() - t0;
+    if (ffn_graph_supported(layer)) {
+        /* One dispatch for both; the profile reports it as routed. */
+        t0 = profile ? now_sec() : 0.0;
+        layer_ffn_moe_shared_graph(scratch->ffn_moe, scratch->ffn_shared, model, layer,
+                                   scratch->ffn_norm, token, scratch);
+        if (profile) t_routed = now_sec() - t0;
+    } else {
+        t0 = profile ? now_sec() : 0.0;
+        layer_routed_moe_one_prealloc(scratch->ffn_moe,
+                                      model,
+                                      layer,
+                                      scratch->ffn_norm,
+                                      il,
+                                      token,
+                                      DS4_SWIGLU_CLAMP_EXP,
+                                      scratch->routed_mid_all,
+                                      scratch->routed_xq,
+                                      scratch->routed_midq,
+                                      scratch->routed_q8_xq,
+                                      scratch->routed_q8_xscale,
+                                      scratch->routed_q8_midq,
+                                      scratch->routed_q8_midscale);
+        if (profile) t_routed = now_sec() - t0;
 
-    t0 = profile ? now_sec() : 0.0;
-    layer_shared_ffn_one_decode_scratch(scratch->ffn_shared, model, layer, scratch->ffn_norm, scratch);
-    if (profile) t_shared = now_sec() - t0;
+        t0 = profile ? now_sec() : 0.0;
+        layer_shared_ffn_one_decode_scratch(scratch->ffn_shared, model, layer, scratch->ffn_norm, scratch);
+        if (profile) t_shared = now_sec() - t0;
+    }
 
     t0 = profile ? now_sec() : 0.0;
     for (uint32_t i = 0; i < DS4_N_EMBD; i++) {

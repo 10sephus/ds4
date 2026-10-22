@@ -1533,6 +1533,136 @@ static void check_compressor_project_batch(void) {
     quant_free(wb);
 }
 
+static uint16_t ffn_graph_half(void) {
+    return f32_to_f16((float)(1 + quant_random() % 200) * 0.00011f);
+}
+
+/* The staged decode FFN (router, shared and routed experts in one dispatch)
+ * must give the plain path's routed and shared outputs bit for bit, for a
+ * hash-routed and a top-k layer, at several thread counts, with and without
+ * the two-cursor NUMA split.  Eight experts are backed by memory; the hash
+ * table and the selection bias keep the router inside them. */
+static void check_ffn_graph(void) {
+    const ds4_shape saved = g_ds4_shape;
+    g_ds4_shape = DS4_SHAPE_FLASH;
+    const uint64_t E = DS4_N_EMBD, F = DS4_N_FF_EXP, NE = DS4_N_EXPERT, U = DS4_N_EXPERT_USED;
+    const uint64_t n_exp = 8, n_tok_ids = 16;
+    const uint64_t router_bytes = NE * E * 2, bias_bytes = NE * 4, hash_bytes = U * n_tok_ids * 4;
+    const uint64_t iq2_row = E / QK_K * 66, q2k_row = F / QK_K * 84;
+    const uint64_t gate_bytes = n_exp * F * iq2_row, down_bytes = n_exp * E * q2k_row;
+    const uint64_t sh_gate_bytes = F * (E / 32) * 34, sh_down_bytes = E * (F / 32) * 34;
+    uint64_t off[9];
+    const uint64_t sizes[9] = {router_bytes, bias_bytes, hash_bytes, gate_bytes, gate_bytes,
+                               down_bytes, sh_gate_bytes, sh_gate_bytes, sh_down_bytes};
+    uint64_t total = 0;
+    for (int i = 0; i < 9; i++) { off[i] = total; total += (sizes[i] + 63) / 64 * 64; }
+    quant_buffer wb = quant_alloc(total);
+    uint8_t *w = wb.data;
+    for (uint64_t i = 0; i < total; i++) w[i] = (uint8_t)quant_random();
+    uint16_t *router = (uint16_t *)(w + off[0]);
+    for (uint64_t i = 0; i < NE * E; i++) router[i] = f32_to_f16(quant_float() * 0.05f);
+    float *bias = (float *)(w + off[1]);
+    for (uint64_t i = 0; i < NE; i++) bias[i] = i < n_exp ? 100.0f : 0.0f;
+    int32_t *hash = (int32_t *)(w + off[2]);
+    for (uint64_t i = 0; i < U * n_tok_ids; i++) hash[i] = (int32_t)(quant_random() % n_exp);
+    for (int t = 3; t <= 4; t++) {                       /* IQ2_XXS: d first */
+        for (uint64_t b = 0; b < sizes[t] / 66; b++) {
+            const uint16_t d = ffn_graph_half();
+            memcpy(w + off[t] + b * 66, &d, 2);
+        }
+    }
+    for (uint64_t b = 0; b < down_bytes / 84; b++) {    /* Q2_K: d, dmin last */
+        const uint16_t d = ffn_graph_half(), dmin = ffn_graph_half();
+        memcpy(w + off[5] + b * 84 + 80, &d, 2);
+        memcpy(w + off[5] + b * 84 + 82, &dmin, 2);
+    }
+    for (int t = 6; t <= 8; t++) {                       /* Q8_0: d first */
+        for (uint64_t b = 0; b < sizes[t] / 34; b++) {
+            const uint16_t d = ffn_graph_half();
+            memcpy(w + off[t] + b * 34, &d, 2);
+        }
+    }
+
+    ds4_model m = {.map = w, .size = total};
+    ds4_tensor t_router = {.type = DS4_TENSOR_F16, .ndim = 2, .dim = {E, NE},
+                           .abs_offset = off[0], .elements = E * NE, .bytes = router_bytes};
+    ds4_tensor t_bias = {.type = DS4_TENSOR_F32, .ndim = 1, .dim = {NE},
+                         .abs_offset = off[1], .elements = NE, .bytes = bias_bytes};
+    ds4_tensor t_hash = {.type = DS4_TENSOR_I32, .ndim = 2, .dim = {U, n_tok_ids},
+                         .abs_offset = off[2], .elements = U * n_tok_ids, .bytes = hash_bytes};
+    /* dim[2] is the model's expert count; only the first n_exp are mapped. */
+    ds4_tensor t_gate = {.type = DS4_TENSOR_IQ2_XXS, .ndim = 3, .dim = {E, F, NE},
+                         .abs_offset = off[3], .elements = E * F * NE, .bytes = gate_bytes};
+    ds4_tensor t_up = t_gate;
+    t_up.abs_offset = off[4];
+    ds4_tensor t_down = {.type = DS4_TENSOR_Q2_K, .ndim = 3, .dim = {F, E, NE},
+                         .abs_offset = off[5], .elements = F * E * NE, .bytes = down_bytes};
+    ds4_tensor t_sh_gate = {.type = DS4_TENSOR_Q8_0, .ndim = 2, .dim = {E, F},
+                            .abs_offset = off[6], .elements = E * F, .bytes = sh_gate_bytes};
+    ds4_tensor t_sh_up = t_sh_gate;
+    t_sh_up.abs_offset = off[7];
+    ds4_tensor t_sh_down = {.type = DS4_TENSOR_Q8_0, .ndim = 2, .dim = {F, E},
+                            .abs_offset = off[8], .elements = F * E, .bytes = sh_down_bytes};
+    ds4_layer_weights layer;
+    memset(&layer, 0, sizeof(layer));
+    layer.ffn_gate_inp = &t_router;
+    layer.ffn_gate_exps = &t_gate;
+    layer.ffn_up_exps = &t_up;
+    layer.ffn_down_exps = &t_down;
+    layer.ffn_gate_shexp = &t_sh_gate;
+    layer.ffn_up_shexp = &t_sh_up;
+    layer.ffn_down_shexp = &t_sh_down;
+    CHECK(ffn_graph_supported(&layer));
+
+    ds4_cpu_decode_scratch scratch;
+    cpu_decode_scratch_init(&scratch, 64);
+    float *x = xmalloc(E * sizeof(float));
+    float *moe0 = xmalloc(E * sizeof(float)), *moe1 = xmalloc(E * sizeof(float));
+    float *sh0 = xmalloc(E * sizeof(float)), *sh1 = xmalloc(E * sizeof(float));
+
+    ds4_numa_init();
+    const bool numa = g_numa.on;
+    const uint32_t threads[] = {1, 3, 16, 40};
+    for (int mode = numa; mode >= 0; mode--) {
+        g_numa.on = mode;
+        for (size_t ti = 0; ti < sizeof(threads) / sizeof(*threads); ti++) {
+            g_requested_threads = threads[ti];
+            ds4_threads_init();
+            for (int iter = 0; iter < 6; iter++) {
+                const bool hashed = iter & 1;
+                layer.ffn_gate_tid2eid = hashed ? &t_hash : NULL;
+                layer.ffn_exp_probs_b = hashed ? NULL : &t_bias;
+                const int token = (int)(quant_random() % n_tok_ids);
+                for (uint64_t i = 0; i < E; i++) x[i] = quant_float() * (iter < 2 ? 1.0f : 30.0f);
+                layer_routed_moe_one_prealloc(moe0, &m, &layer, x, 0, token, DS4_SWIGLU_CLAMP_EXP,
+                                              scratch.routed_mid_all, scratch.routed_xq,
+                                              scratch.routed_midq, scratch.routed_q8_xq,
+                                              scratch.routed_q8_xscale, scratch.routed_q8_midq,
+                                              scratch.routed_q8_midscale);
+                layer_shared_ffn_one_decode_scratch(sh0, &m, &layer, x, &scratch);
+                memset(moe1, 0xff, E * sizeof(float));
+                memset(sh1, 0xff, E * sizeof(float));
+                layer_ffn_moe_shared_graph(moe1, sh1, &m, &layer, x, token, &scratch);
+                uint64_t live = 0;
+                for (uint64_t i = 0; i < E; i++) {
+                    quant_bits_equal("FFN graph routed", moe0[i], moe1[i], (unsigned)i);
+                    quant_bits_equal("FFN graph shared", sh0[i], sh1[i], (unsigned)i);
+                    live += isfinite(moe0[i]) && isfinite(sh0[i]) && moe0[i] != 0.0f && sh0[i] != 0.0f;
+                }
+                CHECK(live > E / 2);   /* the weights exercise real values */
+            }
+            ds4_threads_shutdown();
+            printf("CPU staged decode FFN: %u threads%s PASS\n", threads[ti], mode ? " (NUMA)" : "");
+        }
+    }
+    g_numa.on = numa;
+    g_requested_threads = 0;
+    free(sh1); free(sh0); free(moe1); free(moe0); free(x);
+    cpu_decode_scratch_free(&scratch);
+    quant_free(wb);
+    g_ds4_shape = saved;
+}
+
 /* Prefix prefill attention must match the per-token attention each token
  * would run against its raw window and the compressed rows pushed so far,
  * with and without an indexer mask.  The model shape takes the sixteen-lane
@@ -1844,6 +1974,8 @@ static void check_grouped_ffn(uint64_t in_dim, uint64_t mid_dim, uint64_t out_di
 }
 
 int main(void) {
+    check_ffn_graph();
+    if (getenv("DS4_TEST_FFN_GRAPH_ONLY")) return 0;
     check_thread_pool();
     check_f16_round_trip();
     check_compressor_project_batch();
