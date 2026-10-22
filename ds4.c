@@ -1269,9 +1269,8 @@ static int8_t iq2xxs_signs[128][8];
 #endif
 #if defined(DS4_NO_GPU) && defined(__AVX512BW__)
 /* iq2xxs_grid as 2-bit codes (8 -> 0, 25 -> 1, 43 -> 2).  Element j of an
- * entry sits at bit 8 * (j & 1) + 2 * (j >> 1): a byte shuffle that hands the
- * low code byte to even elements and the high one to odd elements, followed by
- * one 16-bit lane shift, then exposes two neighbouring elements at once. */
+ * entry sits at bit 2 * (j & 3) + 8 * (j >> 2): shifting a 16-bit lane right
+ * by 2 * s exposes elements s and 4 + s in its two bytes. */
 static uint16_t iq2xxs_codes[256] __attribute__((aligned(64)));
 #endif
 static pthread_once_t iq2xxs_tables_once = PTHREAD_ONCE_INIT;
@@ -1290,7 +1289,7 @@ static void iq2xxs_tables_init(void) {
         const uint8_t *grid = (const uint8_t *)(iq2xxs_grid + g);
         uint32_t codes = 0;
         for (uint32_t j = 0; j < 8; j++) {
-            codes |= (uint32_t)((grid[j] > 8) + (grid[j] > 25)) << (8 * (j & 1) + 2 * (j >> 1));
+            codes |= (uint32_t)((grid[j] > 8) + (grid[j] > 25)) << (2 * (j & 3) + 8 * (j >> 2));
         }
         iq2xxs_codes[g] = (uint16_t)codes;
     }
@@ -4592,47 +4591,61 @@ static void ds4_vec_dot_q8_K_pair_q8_K(
 }
 
 #if defined(DS4_NO_GPU) && defined(__AVX512BW__)
-/* Accumulate 64 elements (two sub-blocks): codes holds their eight code words
- * in every 128-bit lane, neg flags the negated weights and ls carries each
- * sub-block's scale in its 16 lanes.  The activation's sign moves onto the
- * weight so that vpmaddubsw sees |q8| (unsigned, 128 allowed) times the
- * signed grid value: exact for every int8 activation, with pair sums below
- * 2 * 128 * 43, and the vpmaddwd by ls <= 31 fits int32 with room to spare. */
-static inline __m512i iq2xxs_group_dot(__m512i acc, __m512i codes, __mmask64 neg, __m512i ls, const int8_t *q8) {
-    /* Element e takes code byte 2 * (e / 8) + (e & 1), shifted by 2 * ((e / 2) % 4). */
-    const __m512i code_bytes = _mm512_set_epi64(0x0f0e0f0e0f0e0f0eLL, 0x0d0c0d0c0d0c0d0cLL,
-                                                0x0b0a0b0a0b0a0b0aLL, 0x0908090809080908LL,
-                                                0x0706070607060706LL, 0x0504050405040504LL,
-                                                0x0302030203020302LL, 0x0100010001000100LL);
-    const __m512i code_shift = _mm512_set1_epi64(0x0006000400020000LL);
-    const __m512i values = _mm512_set1_epi32(0x002b1908); /* 8, 25, 43 */
+/* A Q8_K activation block in the order the AVX-512 IQ2_XXS kernel multiplies
+ * it.  The kernel expands a block into four 64-byte weight vectors whose byte
+ * 2g + h is element 4h + s of grid entry g (s the vector index), so qs[s]
+ * holds the activation in that order and every dword lane m of the four
+ * vectors covers elements 16m .. 16m+15.  Weights are multiplied as the
+ * unsigned bytes 43 + w; bias[m] = 43 * sum(q8[16m .. 16m+15]) takes the
+ * offset back out of the integer lane sums. */
+typedef struct {
+    int8_t  qs[4][64];
+    int32_t bias[16];
+    float   d;
+} iq2xxs_q8;
 
-    __m512i g = _mm512_shuffle_epi8(codes, code_bytes);
-    g = _mm512_and_si512(_mm512_srlv_epi16(g, code_shift), _mm512_set1_epi8(3));
-    g = _mm512_shuffle_epi8(values, g);
-    const __m512i q = _mm512_loadu_si512(q8);
-    g = _mm512_mask_sub_epi8(g, neg ^ _mm512_movepi8_mask(q), _mm512_setzero_si512(), g);
-    return _mm512_add_epi32(acc, _mm512_madd_epi16(_mm512_maddubs_epi16(_mm512_abs_epi8(q), g), ls));
+static void iq2xxs_q8_prepare(iq2xxs_q8 *out, const block_q8_K *y, uint64_t nb) {
+    for (uint64_t i = 0; i < nb; i++) {
+        for (int s = 0; s < 4; s++) {
+            for (int b = 0; b < 64; b++) out[i].qs[s][b] = y[i].qs[8 * (b >> 1) + 4 * (b & 1) + s];
+        }
+        for (int m = 0; m < 16; m++) {
+            int32_t sum = 0;
+            for (int j = 0; j < 16; j++) sum += y[i].qs[16 * m + j];
+            out[i].bias[m] = 43 * sum;
+        }
+        out[i].d = y[i].d;
+    }
 }
 
-/* Scales of sub-blocks 2m and 2m+1, one per half of the 16-bit lanes. */
-static inline __m512i iq2xxs_group_scales(__m512i ls, int m) {
-    const __m512i halves = _mm512_set_epi32(1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0);
-    return _mm512_permutexvar_epi32(_mm512_add_epi32(halves, _mm512_set1_epi32(2 * m)), ls);
+/* acc += the four unsigned-by-signed byte products of every dword lane. */
+static inline __m512i iq2xxs_dpbusd(__m512i acc, __m512i u, __m512i q) {
+#if defined(__AVX512VNNI__)
+    return _mm512_dpbusd_epi32(acc, u, q);
+#else
+    /* Pair sums stay below 2 * 86 * 128, so vpmaddubsw cannot saturate. */
+    return _mm512_add_epi32(acc, _mm512_madd_epi16(_mm512_maddubs_epi16(u, q), _mm512_set1_epi16(1)));
+#endif
 }
 
-/* Exact int32 dot of one IQ2_XXS block with one Q8_K block, each sub-block
- * scaled by its ls.  Each sub-block's qword holds four grid indices in the
- * low dword and the four 7-bit sign indices plus the scale nibble in the
+/* The same 16 bytes in every 128-bit lane, for vpshufb tables and patterns. */
+static inline __m512i iq2xxs_lane_bytes(uint64_t high, uint64_t low) {
+    return _mm512_broadcast_i32x4(_mm_set_epi64x((long long)high, (long long)low));
+}
+
+/* Decode one block into the four weight vectors of iq2xxs_q8, each byte
+ * 43 + w in {0, 18, 35, 51, 68, 86}, and the scale 2 * nibble + 1 of every
+ * dword lane's sub-block.  Each sub-block's qword holds four grid indices in
+ * the low dword and the four 7-bit sign indices plus the scale nibble in the
  * high one. */
-static inline int32_t iq2xxs_block_dot(const block_iq2_xxs *x, const int8_t *q8) {
+static inline void iq2xxs_block_weights(const block_iq2_xxs *x, __m512i u[4], __m512i *ls) {
     const __m512i *table = (const __m512i *)iq2xxs_codes;
-    const __m512i blk = _mm512_permutexvar_epi32(_mm512_set_epi32(15, 13, 11, 9, 7, 5, 3, 1, 14, 12, 10, 8, 6, 4, 2, 0),
-                                                 _mm512_loadu_si512(x->qs));
-    const __m512i gidx = _mm512_cvtepu8_epi16(_mm512_castsi512_si256(blk));
-    const __m512i aux = _mm512_castsi256_si512(_mm512_extracti64x4_epi64(blk, 1));
+    const __m512i qs = _mm512_loadu_si512(x->qs);
 
-    /* 32 grid codes: four 64-entry vpermi2w lookups chosen by index bits 6 and 7. */
+    /* 32 grid codes: the index bytes of a sub-block pair sit at bytes 0-3
+     * and 8-11 of their 128-bit lane; four 64-entry vpermi2w lookups are
+     * chosen by index bits 6 and 7. */
+    const __m512i gidx = _mm512_shuffle_epi8(qs, iq2xxs_lane_bytes(0x800b800a80098008, 0x8003800280018000));
     const __mmask32 bit6 = _mm512_test_epi16_mask(gidx, _mm512_set1_epi16(64));
     const __mmask32 bit7 = _mm512_test_epi16_mask(gidx, _mm512_set1_epi16(128));
     const __m512i codes = _mm512_mask_blend_epi16(bit7,
@@ -4641,34 +4654,69 @@ static inline int32_t iq2xxs_block_dot(const block_iq2_xxs *x, const int8_t *q8)
         _mm512_mask_blend_epi16(bit6, _mm512_permutex2var_epi16(table[4], gidx, table[5]),
                                       _mm512_permutex2var_epi16(table[6], gidx, table[7])));
 
-    /* Sign byte of every 8 elements: dwords 2ib and 2ib+1 take aux[ib] and
-     * aux[ib] >> 14, their two 7-bit fields move to the low and high word,
-     * and as in ksigns_iq2xs bit 7 becomes the parity of the field. */
-    __m512i s = _mm512_permutexvar_epi32(_mm512_set_epi32(7, 7, 6, 6, 5, 5, 4, 4, 3, 3, 2, 2, 1, 1, 0, 0), aux);
-    s = _mm512_srlv_epi32(s, _mm512_set1_epi64(0x0000000e00000000LL));
-    s = _mm512_or_si512(_mm512_and_si512(s, _mm512_set1_epi32(0x7f)),
-                        _mm512_and_si512(_mm512_slli_epi32(s, 9), _mm512_set1_epi32(0x7f0000)));
-    __m512i parity = _mm512_xor_si512(s, _mm512_srli_epi16(s, 4));
-    parity = _mm512_xor_si512(parity, _mm512_srli_epi16(parity, 2));
-    parity = _mm512_xor_si512(parity, _mm512_srli_epi16(parity, 1));
-    s = _mm512_or_si512(s, _mm512_slli_epi16(_mm512_and_si512(parity, _mm512_set1_epi16(1)), 7));
-    uint64_t neg[4];
-    _mm256_storeu_si256((__m256i *)neg, _mm512_cvtepi16_epi8(s));
+    /* The 7-bit sign index of every grid entry in the low bits of its lane:
+     * fields 0, 1 and 3 of a sub-block's sign dword are its two words shifted
+     * right by 0, 7 and 5; field 2 straddles the words and is the dword
+     * shifted right by 14. */
+    __m512i sidx = _mm512_srlv_epi16(_mm512_shuffle_epi8(qs, iq2xxs_lane_bytes(0x0f0e0d0c0d0c0d0c, 0x0706050405040504)),
+                                     _mm512_set1_epi64(0x0005000000070000LL));
+    sidx = _mm512_and_si512(_mm512_mask_blend_epi16(0x44444444u, sidx, _mm512_srli_epi32(qs, 14)),
+                            _mm512_set1_epi16(127));
 
-    /* Sub-block scales 2 * nibble + 1, in both words of their dword. */
-    __m512i ls = _mm512_or_si512(_mm512_slli_epi32(_mm512_srli_epi32(aux, 28), 1), _mm512_set1_epi32(1));
-    ls = _mm512_or_si512(ls, _mm512_slli_epi32(ls, 16));
+    /* ksigns_iq2xs split in two nibbles: low byte = index bits 0-3, high byte
+     * = bits 4-6 with the parity of all seven in bit 3, so bit s of the low
+     * byte is the sign of element s and bit s of the high byte that of
+     * element 4 + s.  The parity comes from a 16-entry table applied to both
+     * nibbles and xored. */
+    const __m512i nib = _mm512_ternarylogic_epi32(sidx, _mm512_slli_epi16(sidx, 4), _mm512_set1_epi16(0x070f), 0xa8);
+    const __m512i par = _mm512_shuffle_epi8(iq2xxs_lane_bytes(0x0008080008000008, 0x0800000800080800), nib);
+    const __m512i signs = _mm512_ternarylogic_epi32(nib, _mm512_xor_si512(par, _mm512_slli_epi16(par, 8)),
+                                                    _mm512_set1_epi16(0x0800), 0xf8);
 
-    __m512i acc = _mm512_setzero_si512();
-    acc = iq2xxs_group_dot(acc, _mm512_shuffle_i32x4(codes, codes, 0x00), neg[0], iq2xxs_group_scales(ls, 0), q8);
-    acc = iq2xxs_group_dot(acc, _mm512_shuffle_i32x4(codes, codes, 0x55), neg[1], iq2xxs_group_scales(ls, 1), q8 + 64);
-    acc = iq2xxs_group_dot(acc, _mm512_shuffle_i32x4(codes, codes, 0xaa), neg[2], iq2xxs_group_scales(ls, 2), q8 + 128);
-    acc = iq2xxs_group_dot(acc, _mm512_shuffle_i32x4(codes, codes, 0xff), neg[3], iq2xxs_group_scales(ls, 3), q8 + 192);
-    return _mm512_reduce_add_epi32(acc);
+    /* Sub-block scales 2 * nibble + 1 in the dword lanes of their elements. */
+    *ls = _mm512_or_si512(_mm512_srli_epi32(_mm512_shuffle_epi32(qs, _MM_PERM_DDBB), 27), _mm512_set1_epi32(1));
+
+    /* Vector s: index = code (bits 0-1) | sign (bit 3), bit 2 ignored, maps
+     * to 43 + w with w = +-8, +-25, +-43. */
+    const __m512i utab = iq2xxs_lane_bytes(0x2b0012232b001223, 0x2b5644332b564433);
+    const __m512i low2 = _mm512_set1_epi8(3);
+    u[0] = _mm512_shuffle_epi8(utab, _mm512_ternarylogic_epi32(codes, _mm512_slli_epi16(signs, 3), low2, 0xe4));
+    u[1] = _mm512_shuffle_epi8(utab, _mm512_ternarylogic_epi32(_mm512_srli_epi16(codes, 2), _mm512_slli_epi16(signs, 2), low2, 0xe4));
+    u[2] = _mm512_shuffle_epi8(utab, _mm512_ternarylogic_epi32(_mm512_srli_epi16(codes, 4), _mm512_slli_epi16(signs, 1), low2, 0xe4));
+    u[3] = _mm512_shuffle_epi8(utab, _mm512_ternarylogic_epi32(_mm512_srli_epi16(codes, 6), signs, low2, 0xe4));
+}
+
+/* Exact int32 lane sums of one block: lane m = ls * sum(w * q8) over its 16
+ * elements.  The lanes add up to the scalar reference's bsum. */
+static inline __m512i iq2xxs_block_sums(const __m512i u[4], const iq2xxs_q8 *y, __m512i ls) {
+    __m512i a = iq2xxs_dpbusd(_mm512_setzero_si512(), u[0], _mm512_loadu_si512(y->qs[0]));
+    __m512i b = iq2xxs_dpbusd(_mm512_setzero_si512(), u[1], _mm512_loadu_si512(y->qs[1]));
+    a = iq2xxs_dpbusd(a, u[2], _mm512_loadu_si512(y->qs[2]));
+    b = iq2xxs_dpbusd(b, u[3], _mm512_loadu_si512(y->qs[3]));
+    a = _mm512_sub_epi32(_mm512_add_epi32(a, b), _mm512_loadu_si512(y->bias));
+    return _mm512_mullo_epi32(a, ls);
+}
+
+/* Lane totals of four vectors as [sum(a), sum(b), sum(c), sum(d)]. */
+static inline __m128i iq2xxs_hsum4(__m512i a, __m512i b, __m512i c, __m512i d) {
+    const __m512i ab = _mm512_add_epi32(_mm512_unpacklo_epi32(a, b), _mm512_unpackhi_epi32(a, b));
+    const __m512i cd = _mm512_add_epi32(_mm512_unpacklo_epi32(c, d), _mm512_unpackhi_epi32(c, d));
+    __m512i t = _mm512_add_epi32(_mm512_unpacklo_epi64(ab, cd), _mm512_unpackhi_epi64(ab, cd));
+    t = _mm512_add_epi32(t, _mm512_shuffle_i32x4(t, t, 0x4e));
+    t = _mm512_add_epi32(t, _mm512_shuffle_i32x4(t, t, 0xb1));
+    return _mm512_castsi512_si128(t);
+}
+#else
+typedef block_q8_K iq2xxs_q8;
+
+static void iq2xxs_q8_prepare(iq2xxs_q8 *out, const block_q8_K *y, uint64_t nb) {
+    memcpy(out, y, nb * sizeof(*out));
 }
 #endif
 
-static DS4_MAYBE_UNUSED void ds4_vec_dot_iq2_xxs_q8_K(int n, float *s, const block_iq2_xxs *x, const block_q8_K *y) {
+/* The activation comes from iq2xxs_q8_prepare(): on AVX-512 that is the
+ * reordered iq2xxs_q8, elsewhere the Q8_K block itself. */
+static DS4_MAYBE_UNUSED void ds4_vec_dot_iq2_xxs_q8_K(int n, float *s, const block_iq2_xxs *x, const iq2xxs_q8 *y) {
     const int nb = n / QK_K;
 
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
@@ -4728,8 +4776,10 @@ static DS4_MAYBE_UNUSED void ds4_vec_dot_iq2_xxs_q8_K(int n, float *s, const blo
     float sumf = 0.0f;
 
     for (int i = 0; i < nb; i++) {
+        __m512i u[4], ls;
+        iq2xxs_block_weights(&x[i], u, &ls);
         const float d = f16_to_f32(x[i].d) * y[i].d;
-        sumf += d * (float)iq2xxs_block_dot(&x[i], y[i].qs);
+        sumf += d * (float)_mm512_reduce_add_epi32(iq2xxs_block_sums(u, &y[i], ls));
     }
     *s = 0.125f * sumf;
 #else
@@ -4772,7 +4822,7 @@ static void ds4_vec_dot_iq2_xxs_pair_q8_K(
         float *s1,
         const block_iq2_xxs *x0,
         const block_iq2_xxs *x1,
-        const block_q8_K *y) {
+        const iq2xxs_q8 *y) {
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     const int nb = n / QK_K;
     float total0 = 0.0f;
@@ -4842,15 +4892,46 @@ static void ds4_vec_dot_iq2_xxs_pair_q8_K(
     *s0 = 0.25f * total0;
     *s1 = 0.25f * total1;
 #elif defined(DS4_NO_GPU) && defined(__AVX512BW__)
+    /* Two blocks of both rows per step: their four lane-sum vectors share one
+     * horizontal add, and the reference's per-row sequence
+     * sumf += d[i] * (float)bsum[i] runs lane-wise on [sumf0, sumf1], one
+     * IEEE multiply and add per block as in the scalar loop.  A step consumes
+     * two cache lines of each row; the prefetch runs about one row ahead. */
     const int nb = n / QK_K;
-    float sumf0 = 0.0f;
-    float sumf1 = 0.0f;
+    __m128 sumv = _mm_setzero_ps();
+    int i = 0;
 
-    for (int i = 0; i < nb; i++) {
+    for (; i + 2 <= nb; i += 2) {
+        __m512i u[4], ls;
+        _mm_prefetch((const char *)(x0 + i + 16), _MM_HINT_T0);
+        _mm_prefetch((const char *)(x0 + i + 17), _MM_HINT_T0);
+        _mm_prefetch((const char *)(x1 + i + 16), _MM_HINT_T0);
+        _mm_prefetch((const char *)(x1 + i + 17), _MM_HINT_T0);
+        iq2xxs_block_weights(&x0[i], u, &ls);
+        const __m512i sa = iq2xxs_block_sums(u, &y[i], ls);
+        iq2xxs_block_weights(&x0[i + 1], u, &ls);
+        const __m512i sb = iq2xxs_block_sums(u, &y[i + 1], ls);
+        iq2xxs_block_weights(&x1[i], u, &ls);
+        const __m512i sc = iq2xxs_block_sums(u, &y[i], ls);
+        iq2xxs_block_weights(&x1[i + 1], u, &ls);
+        const __m512i sd = iq2xxs_block_sums(u, &y[i + 1], ls);
+        const __m128i bsum = iq2xxs_hsum4(sa, sb, sc, sd);
+        const __m128 d = _mm_set_ps(f16_to_f32(x1[i + 1].d) * y[i + 1].d, f16_to_f32(x1[i].d) * y[i].d,
+                                    f16_to_f32(x0[i + 1].d) * y[i + 1].d, f16_to_f32(x0[i].d) * y[i].d);
+        const __m128 p = _mm_mul_ps(d, _mm_cvtepi32_ps(bsum));
+        sumv = _mm_add_ps(sumv, _mm_shuffle_ps(p, _mm_setzero_ps(), _MM_SHUFFLE(0, 0, 2, 0)));
+        sumv = _mm_add_ps(sumv, _mm_shuffle_ps(p, _mm_setzero_ps(), _MM_SHUFFLE(0, 0, 3, 1)));
+    }
+    float sumf0 = _mm_cvtss_f32(sumv);
+    float sumf1 = _mm_cvtss_f32(_mm_shuffle_ps(sumv, sumv, 1));
+    for (; i < nb; i++) {
+        __m512i u0[4], u1[4], ls0, ls1;
+        iq2xxs_block_weights(&x0[i], u0, &ls0);
+        iq2xxs_block_weights(&x1[i], u1, &ls1);
         const float d0 = f16_to_f32(x0[i].d) * y[i].d;
         const float d1 = f16_to_f32(x1[i].d) * y[i].d;
-        sumf0 += d0 * (float)iq2xxs_block_dot(&x0[i], y[i].qs);
-        sumf1 += d1 * (float)iq2xxs_block_dot(&x1[i], y[i].qs);
+        sumf0 += d0 * (float)_mm512_reduce_add_epi32(iq2xxs_block_sums(u0, &y[i], ls0));
+        sumf1 += d1 * (float)_mm512_reduce_add_epi32(iq2xxs_block_sums(u1, &y[i], ls1));
     }
     *s0 = 0.125f * sumf0;
     *s1 = 0.125f * sumf1;
@@ -10494,7 +10575,7 @@ typedef struct {
     float *out1;
     const uint8_t *base0;
     const uint8_t *base1;
-    const block_q8_K *xq;
+    const iq2xxs_q8 *xq;
     uint64_t in_dim;
     uint64_t row_bytes0;
     uint64_t row_bytes1;
@@ -10526,14 +10607,16 @@ static void matvec_iq2_xxs_expert_pair_prequant(
     const uint8_t *base0 = tensor_expert_bytes(m, w0, expert, &in_dim0, &out_dim0, &row_bytes0);
     const uint8_t *base1 = tensor_expert_bytes(m, w1, expert, &in_dim1, &out_dim1, &row_bytes1);
     if (in_dim0 != in_dim1 || out_dim0 != out_dim1) ds4_die("paired IQ2_XXS expert tensors do not match");
-    if (in_dim0 % QK_K != 0) ds4_die("IQ2_XXS expert row is not QK_K aligned");
+    if (in_dim0 % QK_K != 0 || in_dim0 > DS4_MAX_EMBD) ds4_die("IQ2_XXS expert row has an unexpected width");
 
+    iq2xxs_q8 yq[DS4_MAX_EMBD / QK_K];
+    iq2xxs_q8_prepare(yq, xq, in_dim0 / QK_K);
     matvec_iq2_xxs_pair_ctx ctx = {
         .out0 = out0,
         .out1 = out1,
         .base0 = base0,
         .base1 = base1,
-        .xq = xq,
+        .xq = yq,
         .in_dim = in_dim0,
         .row_bytes0 = row_bytes0,
         .row_bytes1 = row_bytes1,
@@ -10547,7 +10630,7 @@ typedef struct {
     float *mid;
     const uint8_t *gate_base[DS4_MAX_EXPERT_USED];
     const uint8_t *up_base[DS4_MAX_EXPERT_USED];
-    const block_q8_K *xq;
+    const iq2xxs_q8 *xq;
     float expert_weight[DS4_MAX_EXPERT_USED];
     float clamp;
     uint64_t in_dim;
@@ -10673,7 +10756,6 @@ static void matvec_iq2_xxs_experts_mid_prequant(
     uint64_t out_dim0 = 0;
     matvec_iq2_xxs_mid_ctx ctx = {
         .mid = mid,
-        .xq = xq,
         .clamp = clamp,
         .n_expert = n_expert,
     };
@@ -10696,10 +10778,14 @@ static void matvec_iq2_xxs_experts_mid_prequant(
         }
         ctx.expert_weight[i] = expert_weight[i];
     }
-    if (in_dim0 % QK_K != 0) ds4_die("IQ2_XXS expert row is not QK_K aligned");
+    if (in_dim0 % QK_K != 0 || in_dim0 > DS4_MAX_EMBD) ds4_die("IQ2_XXS expert row has an unexpected width");
 
+    /* On the stack: token decode must not touch the heap. */
+    iq2xxs_q8 yq[DS4_MAX_EMBD / QK_K];
+    iq2xxs_q8_prepare(yq, xq, in_dim0 / QK_K);
     ctx.in_dim = in_dim0;
     ctx.out_dim = out_dim0;
+    ctx.xq = yq;
     ds4_parallel_for((uint64_t)n_expert * out_dim0, matvec_iq2_xxs_mid_worker, &ctx);
 }
 
@@ -11136,7 +11222,7 @@ static void matvec_q8_k_experts_accum_prequant(
 typedef struct {
     float *out;
     const uint8_t *base[DS4_MAX_EXPERT_USED];
-    const block_q8_K *xq[DS4_MAX_EXPERT_USED];
+    const iq2xxs_q8 *xq[DS4_MAX_EXPERT_USED];
     uint64_t in_dim;
     uint64_t row_bytes[DS4_MAX_EXPERT_USED];
     int n_expert;
@@ -11182,9 +11268,11 @@ static void matvec_iq2_xxs_experts_accum_prequant(
             ds4_die("IQ2_XXS expert tensors do not share a layout");
         }
     }
-    if (in_dim0 % QK_K != 0) ds4_die("IQ2_XXS expert row is not QK_K aligned");
+    if (in_dim0 % QK_K != 0 || in_dim0 > DS4_MAX_FF_EXP) ds4_die("IQ2_XXS expert row has an unexpected width");
 
     const uint64_t n_blocks = in_dim0 / QK_K;
+    iq2xxs_q8 yq[DS4_MAX_EXPERT_USED * (DS4_MAX_FF_EXP / QK_K)];
+    iq2xxs_q8_prepare(yq, xq, (uint64_t)n_expert * n_blocks);
     matvec_iq2_xxs_accum_ctx ctx = {
         .out = out,
         .in_dim = in_dim0,
@@ -11193,7 +11281,7 @@ static void matvec_iq2_xxs_experts_accum_prequant(
     for (int i = 0; i < n_expert; i++) {
         ctx.base[i] = base[i];
         ctx.row_bytes[i] = row_bytes[i];
-        ctx.xq[i] = xq + (uint64_t)i * n_blocks;
+        ctx.xq[i] = yq + (uint64_t)i * n_blocks;
     }
 
     ds4_parallel_for(out_dim0, matvec_iq2_xxs_accum_worker, &ctx);
@@ -11260,7 +11348,7 @@ typedef struct {
     float *mid;
     const uint8_t *gate_base[DS4_MAX_EXPERT];
     const uint8_t *up_base[DS4_MAX_EXPERT];
-    const block_q8_K *xq;
+    const iq2xxs_q8 *xq;
     const ds4_expert_pair *pairs;
     const uint32_t *pair_ids;
     const uint32_t *expert_offset;
@@ -11308,7 +11396,7 @@ static void matvec_iq2_xxs_batch_mid_worker(void *vctx, uint64_t task0, uint64_t
         for (uint32_t i = begin; i < end; i++) {
             const uint32_t pair_id = ctx->pair_ids[i];
             const ds4_expert_pair pair = ctx->pairs[pair_id];
-            const block_q8_K *xq = ctx->xq + (uint64_t)pair.token * ctx->xq_blocks;
+            const iq2xxs_q8 *xq = ctx->xq + (uint64_t)pair.token * ctx->xq_blocks;
             float gate = 0.0f;
             float up = 0.0f;
 
@@ -11988,7 +12076,7 @@ static void matvec_q4_k_batch_accum_rows_worker(void *vctx, uint64_t row0, uint6
 typedef struct {
     float *moe;
     const uint8_t *base[DS4_MAX_EXPERT];
-    const block_q8_K *midq;
+    const iq2xxs_q8 *midq;
     const ds4_expert_pair *pairs;
     const uint32_t *pair_ids;
     const uint32_t *expert_offset;
@@ -12018,7 +12106,7 @@ static void matvec_iq2_xxs_batch_accum_rows_worker(void *vctx, uint64_t row0, ui
             for (uint32_t i = begin; i < end; i++) {
                 const uint32_t pair_id = ctx->pair_ids[i];
                 const ds4_expert_pair pair = ctx->pairs[pair_id];
-                const block_q8_K *xq = ctx->midq + (uint64_t)pair_id * ctx->midq_blocks;
+                const iq2xxs_q8 *xq = ctx->midq + (uint64_t)pair_id * ctx->midq_blocks;
                 float v = 0.0f;
 
                 ds4_vec_dot_iq2_xxs_q8_K((int)ctx->in_dim, &v, br, xq);
@@ -12147,12 +12235,15 @@ static void matvec_expert_down(
         if (in_dim % QK_K != 0) ds4_die("IQ2_XXS expert row is not QK_K aligned");
 
         block_q8_K *xq = xmalloc((size_t)(in_dim / QK_K) * sizeof(xq[0]));
+        iq2xxs_q8 *yq = xmalloc((size_t)(in_dim / QK_K) * sizeof(yq[0]));
         ds4_quantize_row_q8_K(x, xq, (int64_t)in_dim);
+        iq2xxs_q8_prepare(yq, xq, in_dim / QK_K);
 
         for (uint64_t row = 0; row < out_dim; row++) {
             const block_iq2_xxs *br = (const block_iq2_xxs *)(base + row * row_bytes);
-            ds4_vec_dot_iq2_xxs_q8_K((int)in_dim, &out[row], br, xq);
+            ds4_vec_dot_iq2_xxs_q8_K((int)in_dim, &out[row], br, yq);
         }
+        free(yq);
         free(xq);
     } else if (w->type == DS4_TENSOR_Q2_K) {
         matvec_q2_k_expert(out, m, w, x, expert);
@@ -13949,9 +14040,11 @@ static void layer_routed_moe_batch(
 
     /* Build mid vectors: dispatch based on gate/up tensor type. */
     if (gate_type == DS4_TENSOR_IQ2_XXS) {
+        iq2xxs_q8 *yq = xmalloc((size_t)n_tok * xq_blocks * sizeof(*yq));
+        iq2xxs_q8_prepare(yq, xq, (uint64_t)n_tok * xq_blocks);
         matvec_iq2_xxs_batch_mid_ctx mid_ctx = {
             .mid = mid,
-            .xq = xq,
+            .xq = yq,
             .pairs = pairs,
             .pair_ids = pair_ids,
             .expert_offset = counts,
@@ -13978,6 +14071,7 @@ static void layer_routed_moe_batch(
         }
 
         ds4_parallel_for((uint64_t)n_active * expert_out_dim, matvec_iq2_xxs_batch_mid_worker, &mid_ctx);
+        free(yq);
     } else if (gate_type == DS4_TENSOR_Q2_K) {
         matvec_q2_k_batch_mid_ctx mid_ctx = {
             .mid = mid,
@@ -14057,9 +14151,11 @@ static void layer_routed_moe_batch(
     const uint32_t down_type = layer->ffn_down_exps->type;
 
     if (down_type == DS4_TENSOR_IQ2_XXS) {
+        iq2xxs_q8 *yq = xmalloc((size_t)total_pairs * midq_blocks * sizeof(*yq));
+        iq2xxs_q8_prepare(yq, midq, (uint64_t)total_pairs * midq_blocks);
         matvec_iq2_xxs_batch_accum_rows_ctx down_ctx = {
             .moe = moe,
-            .midq = midq,
+            .midq = yq,
             .pairs = pairs,
             .pair_ids = pair_ids,
             .expert_offset = counts,
@@ -14082,6 +14178,7 @@ static void layer_routed_moe_batch(
         }
 
         ds4_parallel_for(down_out_dim, matvec_iq2_xxs_batch_accum_rows_worker, &down_ctx);
+        free(yq);
     } else if (down_type == DS4_TENSOR_Q2_K) {
         matvec_q2_k_batch_accum_rows_ctx down_ctx = {
             .moe = moe,

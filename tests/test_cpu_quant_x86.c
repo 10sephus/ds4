@@ -92,7 +92,7 @@ static void check_iq2_tables(void) {
     static const unsigned values[4] = {8, 25, 43, 0};
     for (unsigned g = 0; g < 256; g++) {
         for (unsigned j = 0; j < 8; j++) {
-            const unsigned code = (iq2xxs_codes[g] >> (8 * (j & 1) + 2 * (j >> 1))) & 3u;
+            const unsigned code = (iq2xxs_codes[g] >> (2 * (j & 3) + 8 * (j >> 2))) & 3u;
             CHECK(code < 3 && values[code] == ((iq2xxs_grid[g] >> (8 * j)) & 255u));
         }
     }
@@ -169,9 +169,11 @@ static const float quant_scale[8] = {0.0f, -0.0f, 0x1p-20f, -0.00173f, 0.375f, -
 static void check_rows(const char *label, unsigned n, const block_iq2_xxs *iq0, const block_iq2_xxs *iq1,
                        const block_q2_K *q2, const block_q8_K *q8, unsigned pattern) {
     float actual0, actual1;
-    ds4_vec_dot_iq2_xxs_q8_K((int)(n * QK_K), &actual0, iq0, q8);
+    iq2xxs_q8 yq[64];
+    iq2xxs_q8_prepare(yq, q8, n);
+    ds4_vec_dot_iq2_xxs_q8_K((int)(n * QK_K), &actual0, iq0, yq);
     quant_equal(label, iq2_block_oracle(n, iq0, q8), actual0, n, pattern);
-    ds4_vec_dot_iq2_xxs_pair_q8_K((int)(n * QK_K), &actual0, &actual1, iq0, iq1, q8);
+    ds4_vec_dot_iq2_xxs_pair_q8_K((int)(n * QK_K), &actual0, &actual1, iq0, iq1, yq);
     quant_equal(label, iq2_block_oracle(n, iq0, q8), actual0, n, pattern);
     quant_equal(label, iq2_block_oracle(n, iq1, q8), actual1, n, pattern);
     ds4_vec_dot_q2_K_q8_K((int)(n * QK_K), &actual0, q2, q8);
