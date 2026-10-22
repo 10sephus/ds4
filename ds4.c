@@ -12455,21 +12455,29 @@ static void moe_iq2_xxs_x16(
 
         for (int ib = 0; ib < QK_K / 32; ib++) {
             /* Sub-block ib is dwords 2ib and 2ib + 1 of the four weight
-             * vectors, and tile group 16s + m holds their activations. */
-            __m512i d0 = _mm512_setzero_si512();
-            __m512i d1 = _mm512_setzero_si512();
-            for (int s = 0; s < 4; s++) {
-                for (int m = 2 * ib; m < 2 * ib + 2; m++) {
-                    const __m512i xv = _mm512_loadu_si512((const void *)(q + (16 * s + m) * 64));
-                    d0 = _mm512_dpbusd_epi32(d0, moe_bcast_u8x4(wb0 + s * 64 + m * 4), xv);
-                    d1 = _mm512_dpbusd_epi32(d1, moe_bcast_u8x4(wb1 + s * 64 + m * 4), xv);
-                }
+             * vectors, and tile group 16s + m holds their activations.
+             * Two chains per row hide the vpdpbusd latency. */
+            __m512i p0 = _mm512_setzero_si512(), p1 = _mm512_setzero_si512();
+            __m512i q0 = _mm512_setzero_si512(), q1 = _mm512_setzero_si512();
+            for (int m = 2 * ib; m < 2 * ib + 2; m++) {
+                const __m512i xv0 = _mm512_loadu_si512((const void *)(q + m * 64));
+                const __m512i xv1 = _mm512_loadu_si512((const void *)(q + (16 + m) * 64));
+                const __m512i xv2 = _mm512_loadu_si512((const void *)(q + (32 + m) * 64));
+                const __m512i xv3 = _mm512_loadu_si512((const void *)(q + (48 + m) * 64));
+                p0 = _mm512_dpbusd_epi32(p0, moe_bcast_u8x4(wb0 + m * 4), xv0);
+                q0 = _mm512_dpbusd_epi32(q0, moe_bcast_u8x4(wb1 + m * 4), xv0);
+                p1 = _mm512_dpbusd_epi32(p1, moe_bcast_u8x4(wb0 + 64 + m * 4), xv1);
+                q1 = _mm512_dpbusd_epi32(q1, moe_bcast_u8x4(wb1 + 64 + m * 4), xv1);
+                p0 = _mm512_dpbusd_epi32(p0, moe_bcast_u8x4(wb0 + 128 + m * 4), xv2);
+                q0 = _mm512_dpbusd_epi32(q0, moe_bcast_u8x4(wb1 + 128 + m * 4), xv2);
+                p1 = _mm512_dpbusd_epi32(p1, moe_bcast_u8x4(wb0 + 192 + m * 4), xv3);
+                q1 = _mm512_dpbusd_epi32(q1, moe_bcast_u8x4(wb1 + 192 + m * 4), xv3);
             }
             /* (43 + w) . q = w . q + 43 * sum(q) over the sub-block. */
             const __m512i corr = _mm512_madd_epi16(
                 _mm512_loadu_si512((const void *)(bs + ib * 2 * DS4_MOE_TILE)), bias);
-            d0 = _mm512_sub_epi32(d0, corr);
-            d1 = _mm512_sub_epi32(d1, corr);
+            const __m512i d0 = _mm512_sub_epi32(_mm512_add_epi32(p0, p1), corr);
+            const __m512i d1 = _mm512_sub_epi32(_mm512_add_epi32(q0, q1), corr);
             bsum0 = _mm512_add_epi32(bsum0, _mm512_mullo_epi32(d0, _mm512_set1_epi32(ls0[i * (QK_K / 32) + ib])));
             bsum1 = _mm512_add_epi32(bsum1, _mm512_mullo_epi32(d1, _mm512_set1_epi32(ls1[i * (QK_K / 32) + ib])));
         }
@@ -12505,21 +12513,26 @@ static void moe_q2_k_x16(
         const int8_t *q = t->q + (size_t)i * DS4_MOE_TILE_Q_STRIDE;
         const int16_t *bs = t->bsums + (size_t)i * DS4_MOE_TILE_BS_STRIDE;
 
-        /* Four accumulators per row hide the vpdpbusd latency. */
-        __m512i acc0[4], acc1[4];
-        for (int a = 0; a < 4; a++) {
-            acc0[a] = _mm512_setzero_si512();
-            acc1[a] = _mm512_setzero_si512();
+        /* Four chains per row, named so they stay in registers, hide the
+         * vpdpbusd latency. */
+        __m512i a0 = _mm512_setzero_si512(), a1 = a0, a2 = a0, a3 = a0;
+        __m512i b0 = a0, b1 = a0, b2 = a0, b3 = a0;
+        for (int m = 0; m < QK_K / 4; m += 4) {
+            const __m512i xv0 = _mm512_loadu_si512((const void *)(q + m * 64));
+            const __m512i xv1 = _mm512_loadu_si512((const void *)(q + (m + 1) * 64));
+            const __m512i xv2 = _mm512_loadu_si512((const void *)(q + (m + 2) * 64));
+            const __m512i xv3 = _mm512_loadu_si512((const void *)(q + (m + 3) * 64));
+            a0 = _mm512_dpbusd_epi32(a0, moe_bcast_u8x4(wb0 + m * 4), xv0);
+            b0 = _mm512_dpbusd_epi32(b0, moe_bcast_u8x4(wb1 + m * 4), xv0);
+            a1 = _mm512_dpbusd_epi32(a1, moe_bcast_u8x4(wb0 + m * 4 + 4), xv1);
+            b1 = _mm512_dpbusd_epi32(b1, moe_bcast_u8x4(wb1 + m * 4 + 4), xv1);
+            a2 = _mm512_dpbusd_epi32(a2, moe_bcast_u8x4(wb0 + m * 4 + 8), xv2);
+            b2 = _mm512_dpbusd_epi32(b2, moe_bcast_u8x4(wb1 + m * 4 + 8), xv2);
+            a3 = _mm512_dpbusd_epi32(a3, moe_bcast_u8x4(wb0 + m * 4 + 12), xv3);
+            b3 = _mm512_dpbusd_epi32(b3, moe_bcast_u8x4(wb1 + m * 4 + 12), xv3);
         }
-        for (int m = 0; m < QK_K / 4; m++) {
-            const __m512i xv = _mm512_loadu_si512((const void *)(q + m * 64));
-            acc0[m & 3] = _mm512_dpbusd_epi32(acc0[m & 3], moe_bcast_u8x4(wb0 + m * 4), xv);
-            acc1[m & 3] = _mm512_dpbusd_epi32(acc1[m & 3], moe_bcast_u8x4(wb1 + m * 4), xv);
-        }
-        const __m512i isum0 = _mm512_add_epi32(_mm512_add_epi32(acc0[0], acc0[1]),
-                                               _mm512_add_epi32(acc0[2], acc0[3]));
-        const __m512i isum1 = _mm512_add_epi32(_mm512_add_epi32(acc1[0], acc1[1]),
-                                               _mm512_add_epi32(acc1[2], acc1[3]));
+        const __m512i isum0 = _mm512_add_epi32(_mm512_add_epi32(a0, a1), _mm512_add_epi32(a2, a3));
+        const __m512i isum1 = _mm512_add_epi32(_mm512_add_epi32(b0, b1), _mm512_add_epi32(b2, b3));
 
         /* summs = sum over the 16 blocks of bsums * min, two blocks per madd. */
         __m512i summs0 = _mm512_setzero_si512();
