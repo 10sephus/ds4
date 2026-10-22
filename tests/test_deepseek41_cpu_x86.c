@@ -578,7 +578,7 @@ static void check_out_graph(test_layer *tl, const ds4_layer_weights *l) {
         CHECK(ds41_cpu_attention_output(a, &tl->m, l, sa->block));
         CHECK(ds41_cpu_hc_post_run(&post[0]));
         CHECK(ds41_cpu_out_graph_supported(l, &post[1]));
-        ds41_cpu_out_graph_run(b, &tl->m, l, il, pos, sb->block, &post[1]);
+        ds41_cpu_out_graph_run(b, &tl->m, l, il, pos, sb->block, &post[1], NULL, 0);
         test_equal("out query", a->q, b->q, 64 * 512);
         test_equal("out staged rows", a->attended_kv, b->attended_kv, (size_t)(n_raw + attended) * 512);
         test_equal("out heads", a->heads, b->heads, 64 * 512);
@@ -591,6 +591,70 @@ static void check_out_graph(test_layer *tl, const ds4_layer_weights *l) {
     }
     free(sb); free(sa);
     ds41_cpu_attention_free(b); ds41_cpu_attention_free(a);
+}
+#endif
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+/* The staged FFN run as the tail of the attention output dispatch against
+ * the two dispatches one after the other (each checked against the plain
+ * path above). */
+static void check_out_ffn_graph(test_layer *tl, const ds4_layer_weights *l) {
+    static const uint32_t cases[][2] = {{2, 300}, {24, 700}, {0, 5}};
+    ds41_cpu_state *st[2];
+    for (int k = 0; k < 2; k++) {
+        st[k] = calloc(1, sizeof(*st[k]));
+        CHECK(st[k]);
+        st[k]->model = &tl->m;
+        st[k]->attention = ds41_cpu_attention_create(1100);
+        CHECK(st[k]->attention);
+    }
+    ds41_cpu_attention_state *a = st[0]->attention, *b = st[1]->attention;
+    for (size_t ci = 0; ci < sizeof(cases) / sizeof(*cases); ci++) {
+        const uint32_t il = cases[ci][0], pos = cases[ci][1];
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
+        const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
+        const uint32_t attended = n_comp < 512u ? n_comp : 512u;
+        for (uint32_t i = 0; i < 128 * 512; i++) a->window[il][i] = test_float();
+        for (uint32_t i = 0; i < a->comp_cap[owner] * 512; i++) a->compressed[owner][i] = test_float();
+        for (uint32_t r = 0; r < attended; r++) a->selected_comp[r] = test_random() % n_comp;
+        for (uint32_t i = 0; i < 64 * 512; i++) a->q[i] = ds41_cpu_bf16(test_float());
+        for (uint32_t i = 0; i < 4 * 5120; i++) st[0]->residual[i] = ds41_cpu_bf16(test_float());
+        for (uint32_t i = 0; i < 24; i++) st[0]->attn_split[i] = test_float();
+        memcpy(b->window[il], a->window[il], 128 * 512 * sizeof(float));
+        memcpy(b->compressed[owner], a->compressed[owner], (size_t)a->comp_cap[owner] * 512 * sizeof(float));
+        memcpy(b->selected_comp, a->selected_comp, sizeof(a->selected_comp));
+        memcpy(b->q, a->q, sizeof(a->q));
+        memcpy(st[1]->residual, st[0]->residual, sizeof(st[0]->residual));
+        memcpy(st[1]->attn_split, st[0]->attn_split, sizeof(st[0]->attn_split));
+        ds41_cpu_hc_post_job post[2];
+        ds41_cpu_hc_job hc[2];
+        for (int k = 0; k < 2; k++) {
+            post[k] = (ds41_cpu_hc_post_job){.m = &tl->m, .norm_weight = l->ffn_norm,
+                .block = st[k]->block, .residual = st[k]->residual, .split = st[k]->attn_split,
+                .after = st[k]->after_attn, .x = st[k]->x, .norm = st[k]->norm};
+            hc[k] = ds41_cpu_hc_mixer(st[k], l, true);
+            CHECK(ds41_cpu_ffn_graph_supported(l, &hc[k]));
+        }
+        ds41_cpu_out_graph_run(a, &tl->m, l, il, pos, st[0]->block, &post[0], NULL, 0);
+        ds41_cpu_ffn_graph_run(st[0], l, &hc[0]);
+        ds41_cpu_ffn_graph g;
+        ds4_pool_stage ffn[8];
+        ds41_cpu_ffn_graph_stages(&g, st[1], l, &hc[1], ffn);
+        ds41_cpu_out_graph_run(b, &tl->m, l, il, pos, st[1]->block, &post[1], ffn, 8);
+        test_equal("tail heads", a->heads, b->heads, 64 * 512);
+        test_equal("tail FFN input", st[0]->x, st[1]->x, 5120);
+        test_equal("tail FFN norm", st[0]->norm, st[1]->norm, 5120);
+        test_equal("tail after attention", st[0]->after_attn, st[1]->after_attn, 4 * 5120);
+        test_equal("tail FFN split", st[0]->ffn_split, st[1]->ffn_split, 24);
+        test_equal("tail shared", st[0]->shared, st[1]->shared, 5120);
+        test_equal("tail block", st[0]->block, st[1]->block, 5120);
+        test_equal("tail HC state", st[0]->residual, st[1]->residual, 4 * 5120);
+        for (uint32_t i = 0; i < 4 * 5120; i++) CHECK(isfinite(st[1]->residual[i]));
+    }
+    for (int k = 0; k < 2; k++) {
+        ds41_cpu_attention_free(st[k]->attention);
+        free(st[k]);
+    }
 }
 #endif
 /* The batched prefill kernels against the one-token ones, token by token:
@@ -1020,6 +1084,7 @@ int main(void) {
             check_ffn_graph(&tl, &l);
             check_proj_graph(&tl, &l);
             check_out_graph(&tl, &l);
+            check_out_ffn_graph(&tl, &l);
             check_batch_kv(&tl, &l);
             ds4_threads_shutdown();
             printf("V4.1 CPU staged FFN, projections, output and batch KV bitwise checks: "

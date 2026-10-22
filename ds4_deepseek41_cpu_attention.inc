@@ -678,10 +678,14 @@ static bool ds41_cpu_out_graph_supported(const ds4_layer_weights *l,
 }
 
 /* From the projected query of layer il at pos (BF16, before RoPE), its KV
- * caches and attended compressed rows to block and the FFN input. */
+ * caches and attended compressed rows to block and the FFN input.  The
+ * n_tail stages of tail, numbered from 0 among themselves, run in the same
+ * dispatch after the FFN input: the FFN, whose tail of streams then
+ * overlaps the output projections' tail. */
 static void ds41_cpu_out_graph_run(ds41_cpu_attention_state *s, const ds4_model *m,
                                    const ds4_layer_weights *l, uint32_t il, uint32_t pos,
-                                   float *block, const ds41_cpu_hc_post_job *post) {
+                                   float *block, const ds41_cpu_hc_post_job *post,
+                                   const ds4_pool_stage *tail, uint32_t n_tail) {
     const uint32_t ratio = ds4_layer_compress_ratio(il);
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
@@ -699,7 +703,7 @@ static void ds41_cpu_out_graph_run(ds41_cpu_attention_state *s, const ds4_model 
     const uint64_t scores = 4u * g.lanes.n_chunks, sums = 4u * g.lanes.n_dim_chunks;
     /* The query and row stagings are a few hundred nanoseconds per item:
      * claims of 8 and 16 items. */
-    ds4_pool_stage st[8] = {
+    ds4_pool_stage st[8 + 16] = {
         { .fn = ds41_cpu_out_q_worker, .ctx = &g, .n_rows = 4 * 32, .group_rows = 4 * 32,
           .min_chunk = 8 },
         { .fn = ds41_cpu_stage_worker, .ctx = &g.stage, .n_rows = n_rows, .group_rows = n_rows,
@@ -720,7 +724,12 @@ static void ds41_cpu_out_graph_run(ds41_cpu_attention_state *s, const ds4_model 
           .finish = ds41_cpu_hc_post_norm, .finish_ctx = (void *)post },
     };
     st[6].deps = 1u << 5;
-    ds4_pool_run_stages(st, 8);
+    if (n_tail > 16) ds4_die("V4.1 CPU attention output tail is too long");
+    for (uint32_t k = 0; k < n_tail; k++) {
+        st[8 + k] = tail[k];
+        st[8 + k].deps = tail[k].deps ? tail[k].deps << 8 : 1u << 7;
+    }
+    ds4_pool_run_stages(st, 8 + n_tail);
     if (ds41_prof_on)
         ds41_prof_bytes[DS41_PROF_OUT] += l->attn_output_a->bytes + l->attn_output_b->bytes;
 }
@@ -814,7 +823,10 @@ static bool ds41_cpu_attention_forward(ds41_cpu_attention_state *s,
                                        const ds4_model *m, const ds4_layer_weights *l,
                                        uint32_t il, uint32_t pos, const float *norm,
                                        float *block, const ds41_cpu_hc_job *hc,
-                                       const ds41_cpu_hc_post_job *post) {
+                                       const ds41_cpu_hc_post_job *post,
+                                       const ds4_pool_stage *tail, uint32_t n_tail,
+                                       bool *tail_done) {
+    *tail_done = false;
     if (!s || il >= 40 || pos >= s->ctx) return false;
 #if defined(__AVX512F__) && defined(__AVX512BW__)
     const uint32_t ratio = ds4_layer_compress_ratio(il);
@@ -829,13 +841,15 @@ static bool ds41_cpu_attention_forward(ds41_cpu_attention_state *s,
         if (index) ds41_cpu_attention_rank(s, il, owner, n_comp);
         if (ds41_cpu_out_graph_supported(l, post)) {
             ds41_prof(DS41_PROF_OUT);
-            ds41_cpu_out_graph_run(s, m, l, il, pos, block, post);
+            ds41_cpu_out_graph_run(s, m, l, il, pos, block, post, tail, n_tail);
+            *tail_done = true;
             return true;
         }
         ds41_prof(DS41_PROF_Q);
         ds41_cpu_rope(s->q, 512, 64, pos, ratio != 0, false);
     } else if (!ds41_cpu_attention_project(s, m, l, il, pos, norm, hc)) return false;
 #else
+    (void)tail; (void)n_tail;
     if (!ds41_cpu_attention_project(s, m, l, il, pos, norm, hc)) return false;
 #endif
     ds41_cpu_attention_attend(s, m, l, il, pos);

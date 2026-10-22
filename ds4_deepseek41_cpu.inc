@@ -493,55 +493,73 @@ static bool ds41_cpu_ffn_graph_supported(const ds4_layer_weights *l,
         ds41_cpu_q8_shape(l->ffn_down_shexp, 2304, 5120);
 }
 
-/* From the FFN norm in s->norm and the HC state in s->after_attn to
- * s->ffn_split and the new HC state in s->residual. */
-static void ds41_cpu_ffn_graph_run(ds41_cpu_state *s, const ds4_layer_weights *l,
-                                   const ds41_cpu_hc_job *hc) {
+/* The stages from the FFN norm in s->norm and the HC state in s->after_attn
+ * to s->ffn_split and the new HC state in s->residual, with their contexts
+ * in g.  They read their inputs only when they run. */
+static void ds41_cpu_ffn_graph_stages(ds41_cpu_ffn_graph *g, ds41_cpu_state *s,
+                                      const ds4_layer_weights *l, const ds41_cpu_hc_job *hc,
+                                      ds4_pool_stage stages[8]) {
     const ds4_model *m = s->model;
     const uint64_t mid_tiles = 2304 / 16, tiles = 5120 / 16;
-    ds41_cpu_ffn_graph g = {.s = s, .l = l, .hc = *hc};
-    g.router = (matvec_f32_ctx){.out = g.logits, .data = tensor_data(m, l->ffn_gate_inp),
-                                .x = s->norm, .in_dim = 5120};
-    g.shared_gate_up.units = mid_tiles;
+    *g = (ds41_cpu_ffn_graph){.s = s, .l = l, .hc = *hc};
+    g->router = (matvec_f32_ctx){.out = g->logits, .data = tensor_data(m, l->ffn_gate_inp),
+                                 .x = s->norm, .in_dim = 5120};
+    g->shared_gate_up.units = mid_tiles;
     for (unsigned k = 0; k < 2; k++) {
-        g.shared_gate_up.m[k] = (ds41_cpu_q8_ctx){
+        g->shared_gate_up.m[k] = (ds41_cpu_q8_ctx){
             .ref = {.out = k ? s->shared_up : s->shared_gate,
                     .data = tensor_data(m, k ? l->ffn_up_shexp : l->ffn_gate_shexp),
                     .x = s->norm, .in_dim = 5120, .blocks = 5120 / 32},
             .rows = 2304, .group_rows = 2304,
         };
     }
-    g.shared_down = (ds41_cpu_q8_ctx){
+    g->shared_down = (ds41_cpu_q8_ctx){
         .ref = {.out = s->shared, .data = tensor_data(m, l->ffn_down_shexp),
                 .x = s->shared_mid, .in_dim = 2304, .blocks = 2304 / 32},
         .rows = 5120, .group_rows = 5120,
     };
-    ds41_cpu_routed_init(&g.mid, &g.down, l, s->norm, s->expert_mid, s->block);
+    ds41_cpu_routed_init(&g->mid, &g->down, l, s->norm, s->expert_mid, s->block);
     /* Independent stages first: a thread waits at the first stage whose
      * inputs are not ready.  The gate/up rows of each expert are their own
-     * NUMA group, so each node reads the half of every expert placed on it. */
-    ds4_pool_stage stages[8] = {
-        ds41_cpu_hc_norm_stage(&g.hc),
-        { .fn = matvec_f32_worker, .ctx = &g.router, .n_rows = DS4_N_EXPERT,
-          .group_rows = DS4_N_EXPERT, .finish = ds41_cpu_ffn_route, .finish_ctx = &g },
-        { .fn = ds41_cpu_q8_pair_worker, .ctx = &g.shared_gate_up, .n_rows = 2 * mid_tiles,
+     * NUMA group, so each node reads the half of every expert placed on it.
+     * Only the router declares its weights for claims ahead: when the FFN
+     * runs behind the attention output, the threads waiting for the FFN
+     * norm stream it, and with it the routed experts' critical path. */
+    const ds4_pool_stage st[8] = {
+        ds41_cpu_hc_norm_stage(&g->hc),
+        { .fn = matvec_f32_worker, .ctx = &g->router, .n_rows = DS4_N_EXPERT,
+          .group_rows = DS4_N_EXPERT, .finish = ds41_cpu_ffn_route, .finish_ctx = g,
+          .weights = (const uint8_t *)g->router.data, .row_bytes = 5120 * sizeof(float) },
+        { .fn = ds41_cpu_q8_pair_worker, .ctx = &g->shared_gate_up, .n_rows = 2 * mid_tiles,
           .group_rows = mid_tiles, .finish = ds41_cpu_ffn_shared_mid, .finish_ctx = s },
-        { .fn = ds41_cpu_mid_worker, .ctx = &g.mid, .n_rows = DS4_N_EXPERT_USED * mid_tiles,
+        { .fn = ds41_cpu_mid_worker, .ctx = &g->mid, .n_rows = DS4_N_EXPERT_USED * mid_tiles,
           .group_rows = mid_tiles, .deps = 1u << 1 },
-        ds41_cpu_hc_mix_stage(&g.hc, 0),
-        { .fn = ds41_cpu_q8_worker, .ctx = &g.shared_down, .n_rows = tiles,
+        ds41_cpu_hc_mix_stage(&g->hc, 0),
+        { .fn = ds41_cpu_q8_worker, .ctx = &g->shared_down, .n_rows = tiles,
           .group_rows = tiles, .deps = 1u << 2 },
-        { .fn = ds41_cpu_down_worker, .ctx = &g.down, .n_rows = tiles,
+        { .fn = ds41_cpu_down_worker, .ctx = &g->down, .n_rows = tiles,
           .group_rows = tiles, .deps = 1u << 3 },
         /* Light elementwise work: claims of 256 columns. */
         { .fn = ds41_cpu_ffn_post_worker, .ctx = s, .n_rows = 5120, .group_rows = 5120,
           .min_chunk = 256, .deps = (1u << 4) | (1u << 5) | (1u << 6) },
     };
-    ds4_pool_run_stages(stages, 8);
+    memcpy(stages, st, sizeof(st));
+}
+
+static void ds41_cpu_ffn_graph_bytes(const ds4_layer_weights *l, int phase) {
     if (ds41_prof_on)
-        ds41_prof_bytes[DS41_PROF_FFN] += l->hc_ffn_fn->bytes + l->ffn_gate_inp->bytes +
+        ds41_prof_bytes[phase] += l->hc_ffn_fn->bytes + l->ffn_gate_inp->bytes +
             l->ffn_gate_shexp->bytes + l->ffn_up_shexp->bytes + l->ffn_down_shexp->bytes +
             DS4_N_EXPERT_USED * ds41_cpu_routed_expert_bytes(l);
+}
+
+static void ds41_cpu_ffn_graph_run(ds41_cpu_state *s, const ds4_layer_weights *l,
+                                   const ds41_cpu_hc_job *hc) {
+    ds41_cpu_ffn_graph g;
+    ds4_pool_stage stages[8];
+    ds41_cpu_ffn_graph_stages(&g, s, l, hc, stages);
+    ds4_pool_run_stages(stages, 8);
+    ds41_cpu_ffn_graph_bytes(l, DS41_PROF_FFN);
 }
 #endif
 
@@ -640,16 +658,32 @@ static bool ds41_cpu_forward(ds41_cpu_state *s, int token, float *logits,
             .residual = s->residual, .split = s->attn_split,
             .after = s->after_attn, .x = s->x, .norm = s->norm,
         };
+        /* The staged FFN runs in the attention output's dispatch when both
+         * are staged: its stages read their inputs only when they run. */
+        ds4_pool_stage ffn_stages[8];
+        uint32_t n_ffn = 0;
+        bool ffn_done = false;
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+        ds41_cpu_ffn_graph ffn;
+        const ds41_cpu_hc_job ffn_hc = ds41_cpu_hc_mixer(s, l, true);
+        if (ds41_cpu_ffn_graph_supported(l, &ffn_hc)) {
+            ds41_cpu_ffn_graph_stages(&ffn, s, l, &ffn_hc, ffn_stages);
+            n_ffn = 8;
+        }
+#endif
         ds41_cpu_hc_sum(s->x, s->residual, s->pre);
         if (!ds41_cpu_norm(s->norm, s->x, s->model, l->attn_norm)) goto layer_fail;
         double phase = profile ? now_sec() : 0;
         if (!ds41_cpu_attention_forward(s->attention, s->model, l, il, s->pos, s->norm,
-                                        s->block, &hc, &post))
+                                        s->block, &hc, &post, ffn_stages, n_ffn, &ffn_done))
             goto layer_fail;
         if (profile) attention_seconds += now_sec() - phase;
         ds41_prof(DS41_PROF_HC);
         phase = profile ? now_sec() : 0;
-        if (!ds41_cpu_ffn(s, l)) goto layer_fail;
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+        if (ffn_done) ds41_cpu_ffn_graph_bytes(l, DS41_PROF_OUT);
+#endif
+        if (!ffn_done && !ds41_cpu_ffn(s, l)) goto layer_fail;
         if (profile) moe_seconds += now_sec() - phase;
         memcpy(s->pre, s->ffn_split, sizeof(s->pre));
         continue;
