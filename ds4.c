@@ -2214,6 +2214,9 @@ typedef struct {
 static ds4_thread_pool g_pool;
 static __thread int g_parallel_depth;
 static uint32_t g_requested_threads;
+/* Pool dispatches and staged dispatches so far (calling thread only), for
+ * the CPU profiles: each one costs a wake-up and a join. */
+static uint64_t g_pool_dispatches;
 
 static inline void ds4_cpu_relax(void) {
 #if defined(__x86_64__) || defined(__i386__)
@@ -2556,6 +2559,7 @@ static void ds4_pool_dispatch(uint64_t n_rows, ds4_parallel_fn fn, void *ctx,
     const uint64_t half = g_numa.on ? group_rows / 2 : group_rows;
     const uint64_t groups = n_rows / group_rows;
     const uint64_t tail = n_rows - groups * group_rows;
+    g_pool_dispatches++;
     g_pool.fn = fn;
     g_pool.ctx = ctx;
     g_pool.chunk = chunk;
@@ -2626,6 +2630,7 @@ static void ds4_pool_run_stages(ds4_pool_stage *stages, uint32_t n_stages) {
         return;
     }
 
+    g_pool_dispatches++;
     g_pool.stages = stages;
     g_pool.n_stages = n_stages;
     __atomic_store_n(&g_pool.pending, g_pool.n_workers, __ATOMIC_RELAXED);

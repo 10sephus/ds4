@@ -298,6 +298,7 @@ static bool ds41_cpu_forward(ds41_cpu_state *s, int token, float *logits,
         return ds41_cpu_error(error, cap, "V4.1 CPU token is outside vocabulary");
     const bool profile = getenv("DS4_CPU_PROFILE") != NULL;
     const double started = profile ? now_sec() : 0;
+    const uint64_t dispatches = g_pool_dispatches;
     ds41_prof_on = profile;
     ds41_prof_t = started;
     ds41_prof_phase = DS41_PROF_EREAD;
@@ -388,10 +389,12 @@ layer_fail:
         const double finished = now_sec(), total = finished - started;
         const double head_seconds = finished - head_started;
         fprintf(stderr, "ds4: CPU profile pos=%u total=%.3f read=%.3f engram=%.3f "
-                "attention=%.3f moe=%.3f head=%.3f other=%.3f seconds\n",
+                "attention=%.3f moe=%.3f head=%.3f other=%.3f seconds "
+                "dispatches=%" PRIu64 "\n",
                 s->pos - 1u, total, read_seconds, engram_seconds, attention_seconds,
                 moe_seconds, head_seconds, total - read_seconds - engram_seconds -
-                attention_seconds - moe_seconds - head_seconds);
+                attention_seconds - moe_seconds - head_seconds,
+                g_pool_dispatches - dispatches);
         ds41_prof(DS41_PROF_GLUE);
         fprintf(stderr, "ds4: CPU phases pos=%u", s->pos - 1u);
         for (int i = 0; i < DS41_PROF_N; i++)
