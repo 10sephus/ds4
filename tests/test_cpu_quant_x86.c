@@ -2093,6 +2093,28 @@ static void check_ds41_q8_grouped(void) {
             ds41_cpu_matvec_q8(got, &m, &t, x);
             CHECK(memcmp(want, got, rows * sizeof(float)) == 0);
         }
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+        if (groups == 2) {
+            /* The two groups as two matrices that share the first input. */
+            ds4_tensor t0 = t, t1 = t;
+            t0.dim[1] = t1.dim[1] = group_rows[gi];
+            t0.elements = t1.elements = in_dim * group_rows[gi];
+            t0.bytes = t1.bytes = bytes / 2;
+            t1.abs_offset = bytes / 2;
+            float *pair = malloc(rows * sizeof(float));
+            CHECK(pair);
+            for (uint64_t g = 0; g < 2; g++) {
+                matvec_q8_0_f32_ref_ctx ref = {
+                    .out = want + g * group_rows[gi], .data = w + g * group_rows[gi] * blocks * 34,
+                    .x = x, .in_dim = in_dim, .blocks = blocks,
+                };
+                matvec_q8_0_f32_ref_worker(&ref, 0, group_rows[gi]);
+            }
+            CHECK(ds41_cpu_matvec_q8_pair(pair, pair + group_rows[gi], &m, &t0, &t1, x));
+            CHECK(memcmp(want, pair, rows * sizeof(float)) == 0);
+            free(pair);
+        }
+#endif
         free(w); free(x); free(want); free(got);
     }
 }
@@ -2102,7 +2124,7 @@ int main(void) {
     if (getenv("DS4_TEST_FFN_GRAPH_ONLY")) return 0;
     check_thread_pool();
     check_ds41_q8_grouped();
-    puts("CPU V4.1 grouped Q8_0 projection bitwise against per-group reference PASS");
+    puts("CPU V4.1 grouped and paired Q8_0 projections bitwise against the reference PASS");
     check_f16_round_trip();
     check_compressor_project_batch();
     check_prefix_attention();

@@ -224,6 +224,23 @@ static void ds41_cpu_q8_worker(void *vctx, uint64_t first, uint64_t last) {
     }
 }
 
+/* Units [0, units) are 16-row tiles of m[0], the next units those of m[1]. */
+typedef struct {
+    ds41_cpu_q8_ctx m[2];
+    uint64_t units;
+} ds41_cpu_q8_pair_ctx;
+
+static void ds41_cpu_q8_pair_worker(void *vctx, uint64_t first, uint64_t last) {
+    ds41_cpu_q8_pair_ctx *ctx = vctx;
+    while (first < last) {
+        const unsigned k = first >= ctx->units;
+        const uint64_t base = k ? ctx->units : 0;
+        const uint64_t end = last < base + ctx->units ? last : base + ctx->units;
+        ds41_cpu_q8_worker(&ctx->m[k], first - base, end - base);
+        first = end;
+    }
+}
+
 static void ds41_cpu_mid_worker(void *vctx, uint64_t first, uint64_t last) {
     glm_routed_moe_f32_mid_ctx *ctx = vctx;
     const uint64_t tiles = (ctx->out_dim + 15) / 16;
@@ -314,6 +331,35 @@ static void ds41_cpu_matvec_q8_grouped(float *out, const ds4_model *m,
 static void ds41_cpu_matvec_q8(float *out, const ds4_model *m,
                               const ds4_tensor *t, const float *x) {
     ds41_cpu_matvec_q8_grouped(out, m, t, x, t->elements / t->dim[0], 0);
+}
+
+/* Two Q8_0 matrices of the same shape and input, such as the shared expert's
+ * gate and up projections, in one dispatch.  Each matrix is its own NUMA
+ * group, so a node takes the half of both that the warm pass placed on it.
+ * Returns false, having done nothing, when the pair does not qualify. */
+static bool ds41_cpu_matvec_q8_pair(float *out0, float *out1, const ds4_model *m,
+                                   const ds4_tensor *t0, const ds4_tensor *t1,
+                                   const float *x) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    if (t0->type != DS4_TENSOR_Q8_0 || t1->type != DS4_TENSOR_Q8_0 ||
+        t0->ndim < 2 || t1->ndim < 2 || t0->dim[0] == 0 || t0->dim[0] != t1->dim[0] ||
+        t0->elements != t1->elements || t0->elements < t0->dim[0] ||
+        t0->dim[0] > (uint64_t)(INT32_MAX / (15 * 34)) * 32) return false;
+    const uint64_t rows = t0->elements / t0->dim[0];
+    ds41_cpu_q8_pair_ctx ctx = {.units = (rows + 15) / 16};
+    for (unsigned k = 0; k < 2; k++) {
+        ctx.m[k] = (ds41_cpu_q8_ctx){
+            .ref = {.out = k ? out1 : out0, .data = tensor_data(m, k ? t1 : t0), .x = x,
+                    .in_dim = t0->dim[0], .blocks = (t0->dim[0] + 31) / 32},
+            .rows = rows, .group_rows = rows, .group_in = 0,
+        };
+    }
+    ds4_pool_dispatch(2 * ctx.units, ds41_cpu_q8_pair_worker, &ctx, ctx.units, 32);
+    return true;
+#else
+    (void)out0; (void)out1; (void)m; (void)t0; (void)t1; (void)x;
+    return false;
+#endif
 }
 
 static void ds41_cpu_routed_moe(float *out, float *mid, const ds4_model *m,

@@ -247,8 +247,17 @@ static bool ds41_cpu_moe(ds41_cpu_state *s, const ds4_layer_weights *l) {
         probs[i] = sqrtf(softplus_stable(probs[i]));
     layer_topk_selected_experts_from_probs(selected, expert_weight, s->model, l, probs);
     ds41_prof(DS41_PROF_SHARED);
-    if (!ds41_cpu_matvec(s->shared_gate, s->model, l->ffn_gate_shexp, s->norm, true) ||
-        !ds41_cpu_matvec(s->shared_up, s->model, l->ffn_up_shexp, s->norm, true)) return false;
+    if (l->ffn_gate_shexp->elements == l->ffn_gate_shexp->dim[0] * 2304u &&
+        ds41_cpu_matvec_q8_pair(s->shared_gate, s->shared_up, s->model,
+                                l->ffn_gate_shexp, l->ffn_up_shexp, s->norm)) {
+        if (ds41_prof_on)
+            ds41_prof_bytes[DS41_PROF_SHARED] += l->ffn_gate_shexp->bytes + l->ffn_up_shexp->bytes;
+        ds41_cpu_bf16_rows(s->shared_gate, 2304);
+        ds41_cpu_bf16_rows(s->shared_up, 2304);
+    } else if (!ds41_cpu_matvec(s->shared_gate, s->model, l->ffn_gate_shexp, s->norm, true) ||
+               !ds41_cpu_matvec(s->shared_up, s->model, l->ffn_up_shexp, s->norm, true)) {
+        return false;
+    }
     swiglu(s->shared_mid, s->shared_gate, s->shared_up, 2304, DS4_SWIGLU_CLAMP_EXP);
     ds41_cpu_bf16_rows(s->shared_mid, 2304);
     if (!ds41_cpu_matvec(s->shared, s->model, l->ffn_down_shexp, s->shared_mid, true)) return false;
