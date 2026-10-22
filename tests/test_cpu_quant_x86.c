@@ -1,5 +1,5 @@
 /* Integer SIMD must preserve the CPU reference's block-level FP ordering.
- * Compile with CPU_CFLAGS; this also tests the scalar fallback without AVX2. */
+ * Compile with CPU_CFLAGS; this also tests the scalar fallback without AVX. */
 #include "../ds4.c"
 
 #define CHECK(x) do { if (!(x)) { \
@@ -16,8 +16,8 @@ static uint32_t quant_random(void) {
 
 typedef struct { void *map; size_t size; uint8_t *data; } quant_buffer;
 
-/* Exact 8-byte grid loads and 16-byte activation loads end at PROT_NONE.
- * Separate offset tests below cover addresses unaligned to those widths. */
+/* Buffers end at a PROT_NONE page so that any load past the last block,
+ * including 64-byte vector loads of a 66-byte IQ2_XXS block, faults. */
 static quant_buffer quant_alloc(size_t bytes) {
     const size_t page = (size_t)sysconf(_SC_PAGESIZE);
     const size_t rounded = ((bytes ? bytes : 1) + page - 1) / page * page;
@@ -41,12 +41,6 @@ static int8_t quant_byte(unsigned pattern, unsigned lane) {
     }
 }
 
-static int32_t iq2_pair_oracle(const int8_t *g0, const int8_t *g1, const int8_t *q) {
-    int64_t sum = 0;
-    for (unsigned i = 0; i < 16; i++) sum += (int64_t)(i < 8 ? g0[i] : g1[i - 8]) * q[i];
-    return (int32_t)sum;
-}
-
 static int32_t q2_oracle(const uint8_t *q2, const int8_t *q8, unsigned shift) {
     int64_t sum = 0;
     for (unsigned i = 0; i < 16; i++) sum += (int64_t)((q2[i] >> shift) & 3u) * q8[i];
@@ -59,38 +53,9 @@ static int8_t iq2_value(unsigned grid, unsigned sign, unsigned lane) {
 }
 
 static void check_integer_dots(void) {
-    quant_buffer ga = quant_alloc(8), gb = quant_alloc(8);
     quant_buffer qa = quant_alloc(16), qb = quant_alloc(16);
-    int8_t *g0 = (int8_t *)ga.data, *g1 = (int8_t *)gb.data, *q8 = (int8_t *)qa.data;
+    int8_t *q8 = (int8_t *)qa.data;
     uint8_t *q2 = qb.data;
-
-    /* Exhaust all signed-byte products, including the -128 * -128 case that
-     * overflows a signed 16-bit pair sum in saturating multiply-add schemes. */
-    for (int g = -128; g <= 127; g++) {
-        memset(g0, (unsigned char)g, 8);
-        memset(g1, (unsigned char)g, 8);
-        for (int q = -128; q <= 127; q++) {
-            memset(q8, (unsigned char)q, 16);
-            CHECK(dot_iq2_pair_16(g0, g1, q8) == 16 * g * q);
-        }
-    }
-
-    CHECK(pthread_once(&iq2xxs_signed_grid_once, iq2xxs_signed_grid_init) == 0);
-    for (unsigned g = 0; g < 256; g++) {
-        for (unsigned s = 0; s < 128; s++) {
-            int8_t expected0[8], expected1[8];
-            memcpy(g0, iq2xxs_signed_grid[g][s], 8);
-            memcpy(g1, iq2xxs_signed_grid[255 - g][127 - s], 8);
-            for (unsigned i = 0; i < 8; i++) {
-                expected0[i] = iq2_value(g, s, i);
-                expected1[i] = iq2_value(255 - g, 127 - s, i);
-            }
-            for (unsigned p = 0; p < 6; p++) {
-                for (unsigned i = 0; i < 16; i++) q8[i] = quant_byte(p, i);
-                CHECK(dot_iq2_pair_16(g0, g1, q8) == iq2_pair_oracle(expected0, expected1, q8));
-            }
-        }
-    }
 
     for (unsigned value = 0; value < 256; value++) {
         for (unsigned p = 0; p < 6; p++) {
@@ -104,24 +69,38 @@ static void check_integer_dots(void) {
     }
 
     /* Move each operand through every alignment modulo 32 independently. */
-    uint8_t a[64], b[64], c[64], d[64];
+    uint8_t c[64], d[64];
     for (unsigned offset = 0; offset < 32; offset++) {
-        int8_t *u = (int8_t *)a + offset, *v = (int8_t *)b + (31 - offset);
         int8_t *q = (int8_t *)c + (offset * 7 % 32);
         uint8_t *packed = d + (offset * 13 % 32);
         for (unsigned repeat = 0; repeat < 64; repeat++) {
-            for (unsigned i = 0; i < 8; i++) { u[i] = quant_byte(5, i); v[i] = quant_byte(5, i); }
             for (unsigned i = 0; i < 16; i++) { q[i] = quant_byte(5, i); packed[i] = (uint8_t)quant_random(); }
-            CHECK(dot_iq2_pair_16(u, v, q) == iq2_pair_oracle(u, v, q));
             for (unsigned shift = 0; shift <= 6; shift += 2)
                 CHECK(dot_q2_16(packed, q, (int)shift) == q2_oracle(packed, q, shift));
         }
     }
-    quant_free(qb); quant_free(qa); quant_free(gb); quant_free(ga);
+    quant_free(qb); quant_free(qa);
 }
 
-/* Decode each logical weight directly; do not reuse signed-grid tables,
- * SIMD dot helpers, or Q8 block sums in the independent block oracles. */
+/* The sign and code tables the SIMD kernels derive instead of looking up. */
+static void check_iq2_tables(void) {
+    for (unsigned s = 0; s < 128; s++) {
+        CHECK(ksigns_iq2xs[s] == (s | (unsigned)(__builtin_popcount(s) & 1) << 7));
+    }
+    CHECK(pthread_once(&iq2xxs_tables_once, iq2xxs_tables_init) == 0);
+#if defined(DS4_NO_GPU) && defined(__AVX512BW__)
+    static const unsigned values[4] = {8, 25, 43, 0};
+    for (unsigned g = 0; g < 256; g++) {
+        for (unsigned j = 0; j < 8; j++) {
+            const unsigned code = (iq2xxs_codes[g] >> (8 * (j & 1) + 2 * (j >> 1))) & 3u;
+            CHECK(code < 3 && values[code] == ((iq2xxs_grid[g] >> (8 * j)) & 255u));
+        }
+    }
+#endif
+}
+
+/* Decode each logical weight directly; do not reuse derived tables, SIMD dot
+ * helpers, or Q8 block sums in the independent block oracles. */
 static float iq2_block_oracle(unsigned blocks, const block_iq2_xxs *x, const block_q8_K *y) {
     float sum = 0.0f;
     for (unsigned b = 0; b < blocks; b++) {
@@ -173,44 +152,119 @@ static void quant_equal(const char *name, float expected, float actual, unsigned
     }
 }
 
+static void fill_q8_block(block_q8_K *q8, float d, unsigned pattern, unsigned lane0) {
+    q8->d = d;
+    for (unsigned j = 0; j < QK_K; j++) q8->qs[j] = quant_byte(pattern, lane0 + j);
+    for (unsigned group = 0; group < 16; group++) {
+        int sum = 0;
+        for (unsigned j = 0; j < 16; j++) sum += q8->qs[group * 16 + j];
+        q8->bsums[group] = (int16_t)sum;
+    }
+}
+
+static const uint16_t quant_half[12] = {0, 0x8000, 1, 0x8001, 0x03ff, 0x8400,
+                                        0x1801, 0x9a17, 0x3555, 0xba31, 0x7bff, 0xfbff};
+static const float quant_scale[8] = {0.0f, -0.0f, 0x1p-20f, -0.00173f, 0.375f, -1.13f, 17.3f, -1024.0f};
+
+static void check_rows(const char *label, unsigned n, const block_iq2_xxs *iq0, const block_iq2_xxs *iq1,
+                       const block_q2_K *q2, const block_q8_K *q8, unsigned pattern) {
+    float actual0, actual1;
+    ds4_vec_dot_iq2_xxs_q8_K((int)(n * QK_K), &actual0, iq0, q8);
+    quant_equal(label, iq2_block_oracle(n, iq0, q8), actual0, n, pattern);
+    ds4_vec_dot_iq2_xxs_pair_q8_K((int)(n * QK_K), &actual0, &actual1, iq0, iq1, q8);
+    quant_equal(label, iq2_block_oracle(n, iq0, q8), actual0, n, pattern);
+    quant_equal(label, iq2_block_oracle(n, iq1, q8), actual1, n, pattern);
+    ds4_vec_dot_q2_K_q8_K((int)(n * QK_K), &actual0, q2, q8);
+    quant_equal(label, q2_block_oracle(n, q2, q8), actual0, n, pattern);
+}
+
 static void check_block_dots(void) {
     const unsigned counts[] = {0, 1, 2, 3, 9, 20, 32, 64};
-    const uint16_t half[] = {0, 0x8000, 1, 0x8001, 0x03ff, 0x8400,
-                            0x1801, 0x9a17, 0x3555, 0xba31, 0x7bff, 0xfbff};
-    const float scales[] = {0.0f, -0.0f, 0x1p-20f, -0.00173f, 0.375f, -1.13f, 17.3f, -1024.0f};
     for (unsigned c = 0; c < sizeof(counts) / sizeof(*counts); c++) {
         const unsigned n = counts[c];
-        quant_buffer ib = quant_alloc(n * sizeof(block_iq2_xxs));
+        quant_buffer ib0 = quant_alloc(n * sizeof(block_iq2_xxs));
+        quant_buffer ib1 = quant_alloc(n * sizeof(block_iq2_xxs));
         quant_buffer qb = quant_alloc(n * sizeof(block_q2_K));
         quant_buffer yb = quant_alloc(n * sizeof(block_q8_K));
-        block_iq2_xxs *iq = (block_iq2_xxs *)ib.data;
+        block_iq2_xxs *iq0 = (block_iq2_xxs *)ib0.data;
+        block_iq2_xxs *iq1 = (block_iq2_xxs *)ib1.data;
         block_q2_K *q2 = (block_q2_K *)qb.data;
         block_q8_K *q8 = (block_q8_K *)yb.data;
         for (unsigned p = 0; p < 12; p++) {
             for (unsigned b = 0; b < n; b++) {
-                for (unsigned j = 0; j < sizeof(iq[b].qs); j++) ((uint8_t *)iq[b].qs)[j] = (uint8_t)quant_random();
+                for (unsigned j = 0; j < sizeof(iq0[b].qs); j++) {
+                    ((uint8_t *)iq0[b].qs)[j] = (uint8_t)quant_random();
+                    ((uint8_t *)iq1[b].qs)[j] = (uint8_t)quant_random();
+                }
                 for (unsigned j = 0; j < sizeof(q2[b].qs); j++) q2[b].qs[j] = (uint8_t)quant_random();
                 for (unsigned j = 0; j < 16; j++) q2[b].scales[j] = (uint8_t)quant_random();
-                iq[b].d = half[(p + b) % 12];
-                q2[b].d = half[(p + 3 * b) % 12];
-                q2[b].dmin = half[(p + 5 * b + 7) % 12];
-                q8[b].d = scales[(p + b) % 8];
-                for (unsigned j = 0; j < QK_K; j++) q8[b].qs[j] = quant_byte(p % 6, j + b);
-                for (unsigned group = 0; group < 16; group++) {
-                    int sum = 0;
-                    for (unsigned j = 0; j < 16; j++) sum += q8[b].qs[group * 16 + j];
-                    q8[b].bsums[group] = (int16_t)sum;
-                }
+                iq0[b].d = quant_half[(p + b) % 12];
+                iq1[b].d = quant_half[(p + 2 * b + 5) % 12];
+                q2[b].d = quant_half[(p + 3 * b) % 12];
+                q2[b].dmin = quant_half[(p + 5 * b + 7) % 12];
+                fill_q8_block(&q8[b], quant_scale[(p + b) % 8], p % 6, b);
             }
-            float actual;
-            ds4_vec_dot_iq2_xxs_q8_K((int)(n * QK_K), &actual, iq, q8);
-            quant_equal("IQ2_XXS", iq2_block_oracle(n, iq, q8), actual, n, p);
-            ds4_vec_dot_q2_K_q8_K((int)(n * QK_K), &actual, q2, q8);
-            quant_equal("Q2_K", q2_block_oracle(n, q2, q8), actual, n, p);
+            check_rows("random", n, iq0, iq1, q2, q8, p);
         }
-        quant_free(yb); quant_free(qb); quant_free(ib);
+        quant_free(yb); quant_free(qb); quant_free(ib1); quant_free(ib0);
     }
 }
+
+/* Every grid index, sign index and scale nibble, in rows long enough to cycle
+ * through all of them four times, against each activation pattern; and the
+ * largest magnitudes both formats can produce, where the 16-bit intermediate
+ * sums of the SIMD kernels come closest to saturating. */
+static void check_extremes(void) {
+    const unsigned n = 32;
+    quant_buffer ib0 = quant_alloc(n * sizeof(block_iq2_xxs));
+    quant_buffer ib1 = quant_alloc(n * sizeof(block_iq2_xxs));
+    quant_buffer qb = quant_alloc(n * sizeof(block_q2_K));
+    quant_buffer yb = quant_alloc(n * sizeof(block_q8_K));
+    block_iq2_xxs *iq0 = (block_iq2_xxs *)ib0.data;
+    block_iq2_xxs *iq1 = (block_iq2_xxs *)ib1.data;
+    block_q2_K *q2 = (block_q2_K *)qb.data;
+    block_q8_K *q8 = (block_q8_K *)yb.data;
+
+    unsigned heaviest = 0;
+    for (unsigned g = 1; g < 256; g++) {
+        unsigned sum = 0, best = 0;
+        for (unsigned j = 0; j < 8; j++) {
+            sum += (iq2xxs_grid[g] >> (8 * j)) & 255u;
+            best += (iq2xxs_grid[heaviest] >> (8 * j)) & 255u;
+        }
+        if (sum > best) heaviest = g;
+    }
+
+    for (unsigned p = 0; p < 8; p++) {
+        for (unsigned b = 0; b < n; b++) {
+            uint8_t *packed0 = (uint8_t *)iq0[b].qs;
+            uint8_t *packed1 = (uint8_t *)iq1[b].qs;
+            for (unsigned group = 0; group < 8; group++) {
+                uint32_t signs0 = ((b + group) & 15u) << 28, signs1 = 15u << 28;
+                for (unsigned l = 0; l < 4; l++) {
+                    const unsigned t = b * 32 + group * 4 + l;
+                    packed0[group * 8 + l] = (uint8_t)t;
+                    signs0 |= ((t >> 1) & 127u) << (7 * l);
+                    /* All weights at their largest magnitude with one sign. */
+                    packed1[group * 8 + l] = (uint8_t)heaviest;
+                    signs1 |= (p & 1 ? 127u : 0u) << (7 * l);
+                }
+                memcpy(packed0 + group * 8 + 4, &signs0, sizeof(signs0));
+                memcpy(packed1 + group * 8 + 4, &signs1, sizeof(signs1));
+            }
+            memset(q2[b].qs, 0xff, sizeof(q2[b].qs));
+            memset(q2[b].scales, 0xff, sizeof(q2[b].scales));
+            iq0[b].d = quant_half[(p + b) % 12];
+            iq1[b].d = quant_half[(3 * p + b) % 12];
+            q2[b].d = quant_half[(p + 2 * b + 1) % 12];
+            q2[b].dmin = quant_half[(p + 3 * b + 2) % 12];
+            fill_q8_block(&q8[b], quant_scale[(p + b) % 8], p % 6, 3 * b);
+        }
+        check_rows("extremes", n, iq0, iq1, q2, q8, p);
+    }
+    quant_free(yb); quant_free(qb); quant_free(ib1); quant_free(ib0);
+}
+
 
 static float indexer_random_float(void) {
     return (float)(int32_t)quant_random() * 0x1p-31f;
@@ -672,6 +726,7 @@ static void check_f16c_scales(void) {
 
 int main(void) {
     check_integer_dots();
+    check_iq2_tables();
 #if defined(DS4_NO_GPU) && defined(__AVX2__) && defined(__F16C__)
     check_f16c_scales();
 #endif
@@ -681,10 +736,11 @@ int main(void) {
     check_indexer_selection();
     puts("CPU indexer row-parallel scoring and top-k selection oracle PASS");
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-    puts("CPU ARM DOTPROD IQ2_XXS/Q2_K integer oracles PASS");
+    puts("CPU ARM DOTPROD Q2_K integer oracle PASS");
     puts("Block FP oracle skipped: existing ARM DOTPROD accumulation order differs");
 #else
     check_block_dots();
+    check_extremes();
     check_q8_0_dots();
     puts("CPU Q8_0 row dots match the scalar block order bitwise");
     check_f16_rows();
@@ -692,7 +748,9 @@ int main(void) {
     check_f16_conversion();
     puts("CPU F16C conversion and F16 row-group matvec bitwise oracles PASS");
 #endif
-#if defined(DS4_NO_GPU) && defined(__AVX2__)
+#if defined(DS4_NO_GPU) && defined(__AVX512BW__)
+    puts("CPU AVX-512 IQ2_XXS/Q2_K integer and bitwise block oracles PASS");
+#elif defined(DS4_NO_GPU) && defined(__AVX2__)
     puts("CPU AVX2 IQ2_XXS/Q2_K integer and bitwise block oracles PASS");
 #elif defined(__ARM_NEON)
     puts("CPU NEON IQ2_XXS/Q2_K integer and bitwise block oracles PASS");

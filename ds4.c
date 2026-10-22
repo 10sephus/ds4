@@ -1259,60 +1259,36 @@ static const uint64_t iq2xxs_grid[256] = {
     0x2b2b082b08080808, 0x2b2b190808192b08, 0x2b2b2b0819190808, 0x2b2b2b1908081908,
 };
 
-static int8_t iq2xxs_signed_grid[256][128][8];
+#if defined(__ARM_NEON)
 static int8_t iq2xxs_signs[128][8];
-static pthread_once_t iq2xxs_signed_grid_once = PTHREAD_ONCE_INIT;
+#endif
+#if defined(DS4_NO_GPU) && defined(__AVX512BW__)
+/* iq2xxs_grid as 2-bit codes (8 -> 0, 25 -> 1, 43 -> 2).  Element j of an
+ * entry sits at bit 8 * (j & 1) + 2 * (j >> 1): a byte shuffle that hands the
+ * low code byte to even elements and the high one to odd elements, followed by
+ * one 16-bit lane shift, then exposes two neighbouring elements at once. */
+static uint16_t iq2xxs_codes[256] __attribute__((aligned(64)));
+#endif
+static pthread_once_t iq2xxs_tables_once = PTHREAD_ONCE_INIT;
 
-static void iq2xxs_signed_grid_init(void) {
+static void iq2xxs_tables_init(void) {
+#if defined(__ARM_NEON)
     for (uint32_t s = 0; s < 128; s++) {
         const uint8_t signs = ksigns_iq2xs[s];
         for (uint32_t j = 0; j < 8; j++) {
             iq2xxs_signs[s][j] = (int8_t)((signs & kmask_iq2xs[j]) ? -1 : 1);
         }
     }
-
+#endif
+#if defined(DS4_NO_GPU) && defined(__AVX512BW__)
     for (uint32_t g = 0; g < 256; g++) {
         const uint8_t *grid = (const uint8_t *)(iq2xxs_grid + g);
-        for (uint32_t s = 0; s < 128; s++) {
-            const uint8_t signs = ksigns_iq2xs[s];
-            for (uint32_t j = 0; j < 8; j++) {
-                const int v = (int)grid[j];
-                iq2xxs_signed_grid[g][s][j] = (int8_t)((signs & kmask_iq2xs[j]) ? -v : v);
-            }
+        uint32_t codes = 0;
+        for (uint32_t j = 0; j < 8; j++) {
+            codes |= (uint32_t)((grid[j] > 8) + (grid[j] > 25)) << (8 * (j & 1) + 2 * (j >> 1));
         }
+        iq2xxs_codes[g] = (uint16_t)codes;
     }
-}
-
-static inline DS4_MAYBE_UNUSED int32_t dot_iq2_pair_16(const int8_t *grid0, const int8_t *grid1, const int8_t *q8) {
-#if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
-    const int8x16_t gv = vcombine_s8(vld1_s8(grid0), vld1_s8(grid1));
-    const int32x4_t acc = vdotq_s32(vdupq_n_s32(0), gv, vld1q_s8(q8));
-    return vaddvq_s32(acc);
-#elif defined(__ARM_NEON)
-    const int8x16_t gv = vcombine_s8(vld1_s8(grid0), vld1_s8(grid1));
-    const int8x16_t qv = vld1q_s8(q8);
-    const int16x8_t p0 = vmull_s8(vget_low_s8(gv), vget_low_s8(qv));
-    const int16x8_t p1 = vmull_s8(vget_high_s8(gv), vget_high_s8(qv));
-    return vaddvq_s32(vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1)));
-#elif defined(DS4_NO_GPU) && defined(__AVX2__)
-    /* Each lookup contains only eight bytes. Widen signed bytes before the
-     * multiply so even -128 * -128 and its pair sum remain exact. */
-    const __m128i grids = _mm_unpacklo_epi64(
-        _mm_loadl_epi64((const __m128i *)grid0),
-        _mm_loadl_epi64((const __m128i *)grid1));
-    const __m256i products = _mm256_madd_epi16(
-        _mm256_cvtepi8_epi16(grids),
-        _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)q8)));
-    __m128i sum = _mm_add_epi32(_mm256_castsi256_si128(products),
-                               _mm256_extracti128_si256(products, 1));
-    sum = _mm_add_epi32(sum, _mm_srli_si128(sum, 8));
-    sum = _mm_add_epi32(sum, _mm_srli_si128(sum, 4));
-    return _mm_cvtsi128_si32(sum);
-#else
-    int32_t sum = 0;
-    for (uint32_t i = 0; i < 8; i++) sum += (int32_t)grid0[i] * (int32_t)q8[i];
-    for (uint32_t i = 0; i < 8; i++) sum += (int32_t)grid1[i] * (int32_t)q8[8 + i];
-    return sum;
 #endif
 }
 
@@ -2181,7 +2157,7 @@ static void *ds4_worker_main(void *arg) {
 static void ds4_threads_init(void) {
     if (g_pool.initialized) return;
 
-    pthread_once(&iq2xxs_signed_grid_once, iq2xxs_signed_grid_init);
+    pthread_once(&iq2xxs_tables_once, iq2xxs_tables_init);
 
     uint32_t n_threads = 12;
     const long online_cpus = sysconf(_SC_NPROCESSORS_ONLN);
@@ -4043,6 +4019,49 @@ static void ds4_vec_dot_q2_K_q8_K(int n, float *s, const block_q2_K *x, const bl
     }
 
     *s = sum;
+#elif defined(DS4_NO_GPU) && defined(__AVX512BW__)
+    /* 64 elements per vpmaddubsw: the unsigned 2-bit values keep every pair
+     * sum below 768, and a vpmaddwd by the 4-bit sub-block scales completes
+     * the exact int32 sum of the 256 products.  Only the per-block float
+     * steps of the scalar reference remain, in the same order. */
+    const __m512i m3 = _mm512_set1_epi8(3);
+    const __m128i m4 = _mm_set1_epi8(0x0f);
+    /* Lanes 0-15 of a product hold one 2-bit shift, lanes 16-31 the next one. */
+    const __m512i shift01 = _mm512_inserti64x4(_mm512_setzero_si512(), _mm256_set1_epi16(2), 1);
+    const __m512i shift23 = _mm512_add_epi16(shift01, _mm512_set1_epi16(4));
+    /* Sub-block scale of each 16-bit product lane: 8 lanes per 16 elements. */
+    const __m512i lane_sc = _mm512_set_epi64(0x0003000300030003LL, 0x0003000300030003LL,
+                                             0x0002000200020002LL, 0x0002000200020002LL,
+                                             0x0001000100010001LL, 0x0001000100010001LL, 0, 0);
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const __m128i packed = _mm_loadu_si128((const __m128i *)x[i].scales);
+        const __m512i sc = _mm512_castsi256_si512(_mm256_cvtepu8_epi16(_mm_and_si128(packed, m4)));
+        const __m256i mins = _mm256_cvtepu8_epi16(_mm_and_si128(_mm_srli_epi16(packed, 4), m4));
+        const int summs = _mm512_reduce_add_epi32(_mm512_zextsi256_si512(
+            _mm256_madd_epi16(mins, _mm256_loadu_si256((const __m256i *)y[i].bsums))));
+
+        __m512i acc = _mm512_setzero_si512();
+        for (int k = 0; k < 2; k++) {
+            const __m256i q2 = _mm256_loadu_si256((const __m256i *)(x[i].qs + 32 * k));
+            const __m512i q2x2 = _mm512_inserti64x4(_mm512_castsi256_si512(q2), q2, 1);
+            const __m512i v01 = _mm512_and_si512(_mm512_srlv_epi16(q2x2, shift01), m3);
+            const __m512i v23 = _mm512_and_si512(_mm512_srlv_epi16(q2x2, shift23), m3);
+            const __m512i p01 = _mm512_maddubs_epi16(v01, _mm512_loadu_si512(y[i].qs + 128 * k));
+            const __m512i p23 = _mm512_maddubs_epi16(v23, _mm512_loadu_si512(y[i].qs + 128 * k + 64));
+            const __m512i sc01 = _mm512_permutexvar_epi16(_mm512_add_epi16(lane_sc, _mm512_set1_epi16((short)(8 * k))), sc);
+            const __m512i sc23 = _mm512_permutexvar_epi16(_mm512_add_epi16(lane_sc, _mm512_set1_epi16((short)(8 * k + 4))), sc);
+            acc = _mm512_add_epi32(acc, _mm512_madd_epi16(p01, sc01));
+            acc = _mm512_add_epi32(acc, _mm512_madd_epi16(p23, sc23));
+        }
+        const int isum = _mm512_reduce_add_epi32(acc);
+
+        const float dall = y[i].d * f16_to_f32(x[i].d);
+        const float dmin = y[i].d * f16_to_f32(x[i].dmin);
+        sumf += dall * (float)isum - dmin * (float)summs;
+    }
+    *s = sumf;
 #else
     float sumf = 0.0f;
 
@@ -4426,8 +4445,6 @@ static inline float ds4_vec_dot_q5_q6_K_f32(uint32_t type, int n, const uint8_t 
 }
 
 static float ds4_vec_dot_iq2_xxs_f32(int n, const block_iq2_xxs *x, const float *y) {
-    pthread_once(&iq2xxs_signed_grid_once, iq2xxs_signed_grid_init);
-
     const int nb = n / QK_K;
     float sumf = 0.0f;
     uint32_t aux32[2];
@@ -4445,11 +4462,12 @@ static float ds4_vec_dot_iq2_xxs_f32(int n, const block_iq2_xxs *x, const float 
             const float scale = 0.125f * d * (float)(2u * (aux32[1] >> 28) + 1u);
             const uint32_t base = (uint32_t)ib32 * 32u;
             for (int l = 0; l < 4; l++) {
-                const uint32_t sign_idx = (aux32[1] >> (7 * l)) & 127u;
-                const int8_t *grid = iq2xxs_signed_grid[aux8[l]][sign_idx];
+                const uint8_t *grid = (const uint8_t *)(iq2xxs_grid + aux8[l]);
+                const uint8_t signs = ksigns_iq2xs[(aux32[1] >> (7 * l)) & 127u];
                 const float *yf = yb + base + (uint32_t)l * 8u;
                 for (int j = 0; j < 8; j++) {
-                    sumf += scale * (float)grid[j] * yf[j];
+                    const int v = (signs & kmask_iq2xs[j]) ? -(int)grid[j] : (int)grid[j];
+                    sumf += scale * (float)v * yf[j];
                 }
             }
         }
@@ -4520,6 +4538,83 @@ static void ds4_vec_dot_q8_K_pair_q8_K(
     *s1 = sum1;
 }
 
+#if defined(DS4_NO_GPU) && defined(__AVX512BW__)
+/* Accumulate 64 elements (two sub-blocks): codes holds their eight code words
+ * in every 128-bit lane, neg flags the negated weights and ls carries each
+ * sub-block's scale in its 16 lanes.  The activation's sign moves onto the
+ * weight so that vpmaddubsw sees |q8| (unsigned, 128 allowed) times the
+ * signed grid value: exact for every int8 activation, with pair sums below
+ * 2 * 128 * 43, and the vpmaddwd by ls <= 31 fits int32 with room to spare. */
+static inline __m512i iq2xxs_group_dot(__m512i acc, __m512i codes, __mmask64 neg, __m512i ls, const int8_t *q8) {
+    /* Element e takes code byte 2 * (e / 8) + (e & 1), shifted by 2 * ((e / 2) % 4). */
+    const __m512i code_bytes = _mm512_set_epi64(0x0f0e0f0e0f0e0f0eLL, 0x0d0c0d0c0d0c0d0cLL,
+                                                0x0b0a0b0a0b0a0b0aLL, 0x0908090809080908LL,
+                                                0x0706070607060706LL, 0x0504050405040504LL,
+                                                0x0302030203020302LL, 0x0100010001000100LL);
+    const __m512i code_shift = _mm512_set1_epi64(0x0006000400020000LL);
+    const __m512i values = _mm512_set1_epi32(0x002b1908); /* 8, 25, 43 */
+
+    __m512i g = _mm512_shuffle_epi8(codes, code_bytes);
+    g = _mm512_and_si512(_mm512_srlv_epi16(g, code_shift), _mm512_set1_epi8(3));
+    g = _mm512_shuffle_epi8(values, g);
+    const __m512i q = _mm512_loadu_si512(q8);
+    g = _mm512_mask_sub_epi8(g, neg ^ _mm512_movepi8_mask(q), _mm512_setzero_si512(), g);
+    return _mm512_add_epi32(acc, _mm512_madd_epi16(_mm512_maddubs_epi16(_mm512_abs_epi8(q), g), ls));
+}
+
+/* Scales of sub-blocks 2m and 2m+1, one per half of the 16-bit lanes. */
+static inline __m512i iq2xxs_group_scales(__m512i ls, int m) {
+    const __m512i halves = _mm512_set_epi32(1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0);
+    return _mm512_permutexvar_epi32(_mm512_add_epi32(halves, _mm512_set1_epi32(2 * m)), ls);
+}
+
+/* Exact int32 dot of one IQ2_XXS block with one Q8_K block, each sub-block
+ * scaled by its ls.  Each sub-block's qword holds four grid indices in the
+ * low dword and the four 7-bit sign indices plus the scale nibble in the
+ * high one. */
+static inline int32_t iq2xxs_block_dot(const block_iq2_xxs *x, const int8_t *q8) {
+    const __m512i *table = (const __m512i *)iq2xxs_codes;
+    const __m512i blk = _mm512_permutexvar_epi32(_mm512_set_epi32(15, 13, 11, 9, 7, 5, 3, 1, 14, 12, 10, 8, 6, 4, 2, 0),
+                                                 _mm512_loadu_si512(x->qs));
+    const __m512i gidx = _mm512_cvtepu8_epi16(_mm512_castsi512_si256(blk));
+    const __m512i aux = _mm512_castsi256_si512(_mm512_extracti64x4_epi64(blk, 1));
+
+    /* 32 grid codes: four 64-entry vpermi2w lookups chosen by index bits 6 and 7. */
+    const __mmask32 bit6 = _mm512_test_epi16_mask(gidx, _mm512_set1_epi16(64));
+    const __mmask32 bit7 = _mm512_test_epi16_mask(gidx, _mm512_set1_epi16(128));
+    const __m512i codes = _mm512_mask_blend_epi16(bit7,
+        _mm512_mask_blend_epi16(bit6, _mm512_permutex2var_epi16(table[0], gidx, table[1]),
+                                      _mm512_permutex2var_epi16(table[2], gidx, table[3])),
+        _mm512_mask_blend_epi16(bit6, _mm512_permutex2var_epi16(table[4], gidx, table[5]),
+                                      _mm512_permutex2var_epi16(table[6], gidx, table[7])));
+
+    /* Sign byte of every 8 elements: dwords 2ib and 2ib+1 take aux[ib] and
+     * aux[ib] >> 14, their two 7-bit fields move to the low and high word,
+     * and as in ksigns_iq2xs bit 7 becomes the parity of the field. */
+    __m512i s = _mm512_permutexvar_epi32(_mm512_set_epi32(7, 7, 6, 6, 5, 5, 4, 4, 3, 3, 2, 2, 1, 1, 0, 0), aux);
+    s = _mm512_srlv_epi32(s, _mm512_set1_epi64(0x0000000e00000000LL));
+    s = _mm512_or_si512(_mm512_and_si512(s, _mm512_set1_epi32(0x7f)),
+                        _mm512_and_si512(_mm512_slli_epi32(s, 9), _mm512_set1_epi32(0x7f0000)));
+    __m512i parity = _mm512_xor_si512(s, _mm512_srli_epi16(s, 4));
+    parity = _mm512_xor_si512(parity, _mm512_srli_epi16(parity, 2));
+    parity = _mm512_xor_si512(parity, _mm512_srli_epi16(parity, 1));
+    s = _mm512_or_si512(s, _mm512_slli_epi16(_mm512_and_si512(parity, _mm512_set1_epi16(1)), 7));
+    uint64_t neg[4];
+    _mm256_storeu_si256((__m256i *)neg, _mm512_cvtepi16_epi8(s));
+
+    /* Sub-block scales 2 * nibble + 1, in both words of their dword. */
+    __m512i ls = _mm512_or_si512(_mm512_slli_epi32(_mm512_srli_epi32(aux, 28), 1), _mm512_set1_epi32(1));
+    ls = _mm512_or_si512(ls, _mm512_slli_epi32(ls, 16));
+
+    __m512i acc = _mm512_setzero_si512();
+    acc = iq2xxs_group_dot(acc, _mm512_shuffle_i32x4(codes, codes, 0x00), neg[0], iq2xxs_group_scales(ls, 0), q8);
+    acc = iq2xxs_group_dot(acc, _mm512_shuffle_i32x4(codes, codes, 0x55), neg[1], iq2xxs_group_scales(ls, 1), q8 + 64);
+    acc = iq2xxs_group_dot(acc, _mm512_shuffle_i32x4(codes, codes, 0xaa), neg[2], iq2xxs_group_scales(ls, 2), q8 + 128);
+    acc = iq2xxs_group_dot(acc, _mm512_shuffle_i32x4(codes, codes, 0xff), neg[3], iq2xxs_group_scales(ls, 3), q8 + 192);
+    return _mm512_reduce_add_epi32(acc);
+}
+#endif
+
 static DS4_MAYBE_UNUSED void ds4_vec_dot_iq2_xxs_q8_K(int n, float *s, const block_iq2_xxs *x, const block_q8_K *y) {
     const int nb = n / QK_K;
 
@@ -4576,6 +4671,14 @@ static DS4_MAYBE_UNUSED void ds4_vec_dot_iq2_xxs_q8_K(int n, float *s, const blo
     }
 
     *s = 0.25f * sumf;
+#elif defined(DS4_NO_GPU) && defined(__AVX512BW__)
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = f16_to_f32(x[i].d) * y[i].d;
+        sumf += d * (float)iq2xxs_block_dot(&x[i], y[i].qs);
+    }
+    *s = 0.125f * sumf;
 #else
     uint32_t aux32[2];
     const uint8_t *aux8 = (const uint8_t *)aux32;
@@ -4593,13 +4696,14 @@ static DS4_MAYBE_UNUSED void ds4_vec_dot_iq2_xxs_q8_K(int n, float *s, const blo
 
             const uint32_t ls = 2 * (aux32[1] >> 28) + 1;
             int32_t sumi = 0;
-            for (int l = 0; l < 4; l += 2) {
-                const uint32_t sign_idx0 = (aux32[1] >> (7 * l)) & 127;
-                const uint32_t sign_idx1 = (aux32[1] >> (7 * (l + 1))) & 127;
-                sumi += dot_iq2_pair_16(iq2xxs_signed_grid[aux8[l]][sign_idx0],
-                                        iq2xxs_signed_grid[aux8[l + 1]][sign_idx1],
-                                        q8);
-                q8 += 16;
+            for (int l = 0; l < 4; l++) {
+                const uint8_t *grid = (const uint8_t *)(iq2xxs_grid + aux8[l]);
+                const uint8_t signs = ksigns_iq2xs[(aux32[1] >> (7 * l)) & 127];
+                for (int j = 0; j < 8; j++) {
+                    const int v = (signs & kmask_iq2xs[j]) ? -(int)grid[j] : (int)grid[j];
+                    sumi += v * q8[j];
+                }
+                q8 += 8;
             }
             bsum += sumi * (int32_t)ls;
         }
@@ -4684,6 +4788,19 @@ static void ds4_vec_dot_iq2_xxs_pair_q8_K(
 
     *s0 = 0.25f * total0;
     *s1 = 0.25f * total1;
+#elif defined(DS4_NO_GPU) && defined(__AVX512BW__)
+    const int nb = n / QK_K;
+    float sumf0 = 0.0f;
+    float sumf1 = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const float d0 = f16_to_f32(x0[i].d) * y[i].d;
+        const float d1 = f16_to_f32(x1[i].d) * y[i].d;
+        sumf0 += d0 * (float)iq2xxs_block_dot(&x0[i], y[i].qs);
+        sumf1 += d1 * (float)iq2xxs_block_dot(&x1[i], y[i].qs);
+    }
+    *s0 = 0.125f * sumf0;
+    *s1 = 0.125f * sumf1;
 #else
     ds4_vec_dot_iq2_xxs_q8_K(n, s0, x0, y);
     ds4_vec_dot_iq2_xxs_q8_K(n, s1, x1, y);
