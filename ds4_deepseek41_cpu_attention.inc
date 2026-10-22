@@ -18,6 +18,10 @@ typedef struct {
     float pool_kv[512], pool_score[512], latent[512];
     float index_q[32 * 128], index_k[128], index_weights[32];
     float attended_kv[(128 + 512) * 512];
+    /* layer_attention_lanes scratch: transposed query, row list, scores
+     * [head group][row][16] and 1 / denominator per head. */
+    float qt[64 * 512], score[64 * (128 + 512)], inv[64];
+    const float *rows[128 + 512];
 } ds41_cpu_attention_state;
 
 static void ds41_cpu_attention_free(ds41_cpu_attention_state *s) {
@@ -223,49 +227,92 @@ static bool ds41_cpu_attention_select(ds41_cpu_attention_state *s,
     return true;
 }
 
-typedef struct {
-    const float *q, *kv, *sinks;
-    float *out;
-    uint32_t rows;
-} ds41_cpu_attention_context;
+/* Pass B1 of layer_attention_lanes with this path's running peak: fmaxf
+ * from the sink, then the expf chain and the denominator in row order.  The
+ * score and weighted-sum passes are the V4 ones: per head and row the same
+ * products and sums in the same order as dot_f32 and axpy_f32 over the
+ * staged rows, so every head output is bitwise the serial result. */
+static void ds41_cpu_attention_weight_worker(void *vctx, uint64_t h0, uint64_t h1) {
+    const layer_attention_lanes_ctx *ctx = vctx;
+    for (uint64_t h = h0; h < h1; h++) {
+        float *score = attn_lanes_score(ctx, (uint32_t)h, 0);
+        float peak = ctx->sinks[h];
+        for (uint32_t r = 0; r < ctx->n_rows; r++) peak = fmaxf(peak, score[(uint64_t)r * 16]);
+        float sum = expf(ctx->sinks[h] - peak);
+        for (uint32_t r = 0; r < ctx->n_rows; r++) {
+            score[(uint64_t)r * 16] = expf(score[(uint64_t)r * 16] - peak);
+            sum += score[(uint64_t)r * 16];
+        }
+        ctx->inv[h] = 1.0f / sum;
+    }
+}
 
-static void ds41_cpu_attention_worker(void *vctx, uint64_t first, uint64_t end) {
-    ds41_cpu_attention_context *c = vctx;
-    const float scale = 1.0f / sqrtf(512.0f);
-    for (uint64_t h = first; h < end; h++) {
-        float scores[128 + 512];
-        const float *q = c->q + h * 512u;
-        float *out = c->out + h * 512u;
-        float peak = c->sinks[h];
-        for (uint32_t r = 0; r < c->rows; r++) {
-            scores[r] = dot_f32(q, c->kv + (size_t)r * 512u, 512) * scale;
-            peak = fmaxf(peak, scores[r]);
-        }
-        memset(out, 0, 512u * sizeof(float));
-        float sum = expf(c->sinks[h] - peak);
-        for (uint32_t r = 0; r < c->rows; r++) {
-            const float p = expf(scores[r] - peak);
-            sum += p;
-            axpy_f32(out, c->kv + (size_t)r * 512u, p, 512);
-        }
-        scale_f32(out, 1.0f / sum, 512);
+/* Sink softmax of the 64 staged query heads over the first n_rows staged
+ * rows into s->heads. */
+static void ds41_cpu_attention_heads(ds41_cpu_attention_state *s,
+                                     const float *sinks, uint32_t n_rows) {
+    for (uint32_t r = 0; r < n_rows; r++) s->rows[r] = s->attended_kv + (size_t)r * 512u;
+    attn_lanes_transpose_q(s->qt, s->q, 64, 512);
+    layer_attention_lanes_ctx ctx = {
+        .out_heads = s->heads,
+        .sinks = sinks,
+        .q = s->q,
+        .qt = s->qt,
+        .rows = s->rows,
+        .score = s->score,
+        .inv = s->inv,
+        .n_head = 64,
+        .score_stride = 128 + 512,
+        .n_rows = n_rows,
+        .n_chunks = (n_rows + ATTN_LANES_ROWS_PER_ITEM - 1) / ATTN_LANES_ROWS_PER_ITEM,
+        .n_dim_chunks = 512 / 16,
+    };
+    if (n_rows) ds4_parallel_for_min_rows(4u * ctx.n_chunks, attn_lanes_score_worker, &ctx, 1);
+    ds4_parallel_for_min_rows(64, ds41_cpu_attention_weight_worker, &ctx, 1);
+    ds4_parallel_for_min_rows(4u * ctx.n_dim_chunks, attn_lanes_sum_worker, &ctx, 1);
+}
+
+/* f16_to_f32(f32_to_f16(x)) for every non-NaN x: both are round to nearest
+ * even with the same overflow to infinity and subnormal grid.  A NaN stays a
+ * NaN but may keep its payload. */
+static void ds41_cpu_f16_round(float *dst, const float *src, uint32_t n) {
+    uint32_t i = 0;
+#if defined(__AVX512F__)
+    for (; i + 16 <= n; i += 16) {
+        const __m256i h = _mm512_cvtps_ph(_mm512_loadu_ps(src + i),
+                                          _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+        _mm512_storeu_ps(dst + i, _mm512_cvtph_ps(h));
+    }
+#endif
+    for (; i < n; i++) dst[i] = f16_to_f32(f32_to_f16(src[i]));
+}
+
+typedef struct {
+    ds41_cpu_attention_state *s;
+    const float *window, *compressed;
+    uint32_t first, n_raw;
+} ds41_cpu_stage_context;
+
+static void ds41_cpu_stage_worker(void *vctx, uint64_t first, uint64_t end) {
+    const ds41_cpu_stage_context *c = vctx;
+    for (uint64_t r = first; r < end; r++) {
+        const float *src = r < c->n_raw ?
+            c->window + (size_t)((c->first + r) % 128u) * 512u :
+            c->compressed + (size_t)c->s->selected_comp[r - c->n_raw] * 512u;
+        ds41_cpu_f16_round(c->s->attended_kv + (size_t)r * 512u, src, 512);
     }
 }
 
 static void ds41_cpu_attention_stage(ds41_cpu_attention_state *s,
                                       uint32_t il, uint32_t pos, uint32_t owner,
                                       uint32_t n_raw, uint32_t n_comp) {
-    const uint32_t first = pos + 1u - n_raw;
-    for (uint32_t r = 0; r < n_raw + n_comp; r++) {
-        const float *src = r < n_raw ?
-            s->window[il] + (size_t)((first + r) % 128u) * 512u :
-            s->compressed[owner] + (size_t)s->selected_comp[r - n_raw] * 512u;
-        float *dst = s->attended_kv + (size_t)r * 512u;
-        /* Metal's decode attention stages both Q and KV as F16. Keep this
-         * boundary even though most quantized cache values fit exactly. */
-        for (uint32_t d = 0; d < 512; d++) dst[d] = f16_to_f32(f32_to_f16(src[d]));
-    }
-    f16_round_inplace_cpu(s->q, 64u * 512u);
+    /* Metal's decode attention stages both Q and KV as F16. Keep this
+     * boundary even though most quantized cache values fit exactly. */
+    ds41_cpu_stage_context c = {
+        s, s->window[il], s->compressed[owner], pos + 1u - n_raw, n_raw
+    };
+    ds4_parallel_for_min_rows(n_raw + n_comp, ds41_cpu_stage_worker, &c, 64);
+    ds41_cpu_f16_round(s->q, s->q, 64u * 512u);
 }
 
 static bool ds41_cpu_attention_forward(ds41_cpu_attention_state *s,
@@ -294,10 +341,7 @@ static bool ds41_cpu_attention_forward(ds41_cpu_attention_state *s,
     const uint32_t attended = n_comp < 512u ? n_comp : 512u;
     const uint32_t n_raw = pos < 127u ? pos + 1u : 128u;
     ds41_cpu_attention_stage(s, il, pos, owner, n_raw, attended);
-    ds41_cpu_attention_context c = {
-        s->q, s->attended_kv, tensor_data(m, l->attn_sinks), s->heads, n_raw + attended
-    };
-    ds4_parallel_for_min_rows(64, ds41_cpu_attention_worker, &c, 2);
+    ds41_cpu_attention_heads(s, tensor_data(m, l->attn_sinks), n_raw + attended);
     ds41_cpu_bf16_rows(s->heads, 64u * 512u);
     ds41_cpu_rope(s->heads, 512, 64, pos, ratio != 0, true);
     ds41_prof(DS41_PROF_OUT);

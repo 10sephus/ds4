@@ -127,20 +127,53 @@ static void check_index_scores(ds41_cpu_attention_state *s) {
     }
 }
 
+/* The serial per-head loop the lane-wise heads replaced. */
+static void serial_heads(float *heads, const float *q, const float *kv,
+                         const float *sinks, uint32_t rows) {
+    const float scale = 1.0f / sqrtf(512.0f);
+    for (uint32_t h = 0; h < 64; h++) {
+        float scores[128 + 512];
+        float *out = heads + h * 512u;
+        float peak = sinks[h];
+        for (uint32_t r = 0; r < rows; r++) {
+            scores[r] = dot_f32(q + h * 512u, kv + (size_t)r * 512u, 512) * scale;
+            peak = fmaxf(peak, scores[r]);
+        }
+        memset(out, 0, 512u * sizeof(float));
+        float sum = expf(sinks[h] - peak);
+        for (uint32_t r = 0; r < rows; r++) {
+            const float p = expf(scores[r] - peak);
+            sum += p;
+            axpy_f32(out, kv + (size_t)r * 512u, p, 512);
+        }
+        scale_f32(out, 1.0f / sum, 512);
+    }
+}
+
+static uint64_t rng_state = 0x9e3779b97f4a7c15ull;
+
+static float rand_unit(void) {
+    rng_state = rng_state * 6364136223846793005ull + 1442695040888963407ull;
+    return (float)((rng_state >> 40) & 0xffffffu) / 8388608.0f - 1.0f;
+}
+
 static void check_softmax(ds41_cpu_attention_state *s) {
-    enum { HEADS = 3 };
-    float sinks[HEADS] = {-4, 0, 3.5f};
-    const uint32_t counts[] = {1, 33, 129, 640};
-    for (uint32_t i = 0; i < HEADS * 512; i++)
+    float sinks[64];
+    static float expected[64 * 512];
+    const uint32_t counts[] = {1, 7, 33, 129, 511, 640};
+    for (uint32_t h = 0; h < 64; h++) sinks[h] = (float)((int)(h % 9u) - 4);
+    for (uint32_t i = 0; i < 64 * 512; i++)
         s->q[i] = (float)((int)((i * 19u) % 131u) - 65) / 64.0f;
     for (uint32_t i = 0; i < 640 * 512; i++)
         s->attended_kv[i] = (float)((int)((i * 23u) % 139u) - 69) / 32.0f;
     for (size_t ci = 0; ci < sizeof(counts) / sizeof(*counts); ci++) {
-        ds41_cpu_attention_context c = {s->q, s->attended_kv, sinks, s->heads, counts[ci]};
-        ds41_cpu_attention_worker(&c, 0, HEADS);
-        for (uint32_t h = 0; h < HEADS; h++) {
+        const uint32_t rows = counts[ci];
+        ds41_cpu_attention_heads(s, sinks, rows);
+        serial_heads(expected, s->q, s->attended_kv, sinks, rows);
+        assert(!memcmp(s->heads, expected, sizeof(expected)));
+        for (uint32_t h = 0; h < 3; h++) {
             double scores[640], peak = sinks[h], result[512] = {0};
-            for (uint32_t r = 0; r < c.rows; r++) {
+            for (uint32_t r = 0; r < rows; r++) {
                 double dot = 0;
                 for (uint32_t d = 0; d < 512; d++)
                     dot += (double)s->q[h * 512u + d] * s->attended_kv[r * 512u + d];
@@ -148,7 +181,7 @@ static void check_softmax(ds41_cpu_attention_state *s) {
                 peak = fmax(peak, scores[r]);
             }
             double denominator = exp(sinks[h] - peak);
-            for (uint32_t r = 0; r < c.rows; r++) {
+            for (uint32_t r = 0; r < rows; r++) {
                 const double weight = exp(scores[r] - peak);
                 denominator += weight;
                 for (uint32_t d = 0; d < 512; d++)
@@ -158,16 +191,75 @@ static void check_softmax(ds41_cpu_attention_state *s) {
                 assert(fabs(s->heads[h * 512u + d] - result[d] / denominator) < 2e-5);
         }
     }
+    /* Bitwise against the serial loop on F16-staged random rows with signed
+     * zeros, exact zero scores and equal scores, at several thread counts. */
+    for (uint32_t trial = 0; trial < 24; trial++) {
+        const uint32_t rows = counts[trial % 6u] + (trial / 6u == 3u && counts[trial % 6u] < 640u);
+        for (uint32_t h = 0; h < 64; h++) sinks[h] = rand_unit() * (trial & 1 ? 8.0f : 0.5f);
+        if (trial % 3u == 0) sinks[trial] = 0.0f;
+        if (trial % 3u == 1) sinks[trial] = -0.0f;
+        for (uint32_t i = 0; i < 64 * 512; i++) {
+            const float v = rand_unit() * (trial & 2 ? 4.0f : 1.0f);
+            s->q[i] = (i % 97u) == trial ? -0.0f : (i % 89u) == trial ? 0.0f : v;
+        }
+        for (uint32_t i = 0; i < rows * 512; i++) {
+            const float v = rand_unit() * (trial & 4 ? 16.0f : 1.0f);
+            s->attended_kv[i] = (i % 61u) == trial ? -0.0f : v;
+        }
+        /* Head 0 sees zero scores and rows 1/2 repeat row 0. */
+        memset(s->q, trial & 1 ? 0x80 : 0, 512 * sizeof(float));
+        for (uint32_t r = 1; r < rows && r < 3; r++)
+            memcpy(s->attended_kv + r * 512u, s->attended_kv, 512 * sizeof(float));
+        ds41_cpu_f16_round(s->q, s->q, 64u * 512u);
+        ds41_cpu_f16_round(s->attended_kv, s->attended_kv, rows * 512u);
+        serial_heads(expected, s->q, s->attended_kv, sinks, rows);
+        const uint32_t threads[] = {1, 3, 8};
+        g_requested_threads = threads[trial % 3u];
+        ds4_threads_init();
+        ds41_cpu_attention_heads(s, sinks, rows);
+        ds4_threads_shutdown();
+        assert(!memcmp(s->heads, expected, sizeof(expected)));
+    }
+    g_requested_threads = 0;
     /* A sink contributes to the denominator, never to the value sum. */
     memset(s->q, 0, sizeof(s->q));
     for (uint32_t i = 0; i < 33 * 512; i++) s->attended_kv[i] = 1;
     sinks[0] = logf(2);
-    ds41_cpu_attention_context c = {s->q, s->attended_kv, sinks, s->heads, 33};
-    ds41_cpu_attention_worker(&c, 0, 1);
+    ds41_cpu_attention_heads(s, sinks, 33);
     for (uint32_t d = 0; d < 512; d++) assert(fabsf(s->heads[d] - 33.0f / 35.0f) < 1e-6f);
     sinks[0] = 10000;
-    ds41_cpu_attention_worker(&c, 0, 1);
+    ds41_cpu_attention_heads(s, sinks, 33);
     for (uint32_t d = 0; d < 512; d++) assert(s->heads[d] == 0);
+}
+
+/* The F16C staging round trip against the scalar converters on a sweep of
+ * every exponent with many mantissas, plus the subnormal and overflow edges. */
+static void check_f16_round(void) {
+    static float in[1u << 16], out[1u << 16];
+    for (uint64_t base = 0; base < (1ull << 32); base += (1ull << 16) * 61ull) {
+        uint32_t n = 0;
+        for (uint32_t i = 0; i < (1u << 16); i++) {
+            const uint32_t bits = (uint32_t)(base + (uint64_t)i * 61ull);
+            float x;
+            memcpy(&x, &bits, sizeof(x));
+            if (!isnan(x)) in[n++] = x;
+        }
+        ds41_cpu_f16_round(out, in, n);
+        for (uint32_t i = 0; i < n; i++) {
+            const float e = f16_to_f32(f32_to_f16(in[i]));
+            assert(!memcmp(&out[i], &e, sizeof(e)));
+        }
+    }
+    const float edges[] = {65504.0f, 65519.996f, 65520.0f, 65536.0f, 0x1p-24f, 0x1p-25f,
+                           0x1.000002p-25f, 0x1.8p-24f, 0x1.4p-24f, 0x1.fffffep-15f,
+                           0x1p-14f, -0x1p-25f, -0.0f, 0.0f, INFINITY, -INFINITY,
+                           0x1p-149f, -0x1p-126f, 3.0e38f, 1.00048828125f, 1.000732421875f};
+    const uint32_t n = sizeof(edges) / sizeof(*edges);
+    ds41_cpu_f16_round(out, edges, n);
+    for (uint32_t i = 0; i < n; i++) {
+        const float e = f16_to_f32(f32_to_f16(edges[i]));
+        assert(!memcmp(&out[i], &e, sizeof(e)));
+    }
 }
 
 int main(void) {
@@ -181,6 +273,7 @@ int main(void) {
     check_ring(s);
     check_index_scores(s);
     check_softmax(s);
+    check_f16_round();
     ds41_cpu_attention_free(s);
     puts("V4.1 CPU attention: pair carry, top-k, candidate mask, ring, index scores and sink softmax PASS");
     return 0;
