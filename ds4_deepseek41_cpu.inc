@@ -17,13 +17,14 @@
  * pool work is counted where it is waited for. Bytes are the weights read. */
 enum {
     DS41_PROF_GLUE, DS41_PROF_EREAD, DS41_PROF_ENGRAM, DS41_PROF_HC,
-    DS41_PROF_Q, DS41_PROF_KV, DS41_PROF_COMP, DS41_PROF_INDEX, DS41_PROF_ATTN,
-    DS41_PROF_OUT, DS41_PROF_ROUTER, DS41_PROF_SHARED, DS41_PROF_ROUTED,
-    DS41_PROF_HEAD, DS41_PROF_N
+    DS41_PROF_Q, DS41_PROF_KV, DS41_PROF_COMP, DS41_PROF_INDEX, DS41_PROF_STAGE,
+    DS41_PROF_ATTN, DS41_PROF_OUT, DS41_PROF_ROUTER, DS41_PROF_SHARED,
+    DS41_PROF_ROUTED, DS41_PROF_HEAD, DS41_PROF_N
 };
 static const char *const ds41_prof_name[DS41_PROF_N] = {
     "glue", "engram_read", "engram", "hc", "attn_q", "attn_kv", "compress",
-    "indexer", "attention", "attn_out", "router", "shared", "routed", "head"
+    "indexer", "stage", "attention", "attn_out", "router", "shared", "routed",
+    "head"
 };
 static bool ds41_prof_on;
 static int ds41_prof_phase;

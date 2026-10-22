@@ -339,10 +339,11 @@ static bool ds41_cpu_attention_forward(ds41_cpu_attention_state *s,
     ds41_cpu_quantize(s->kv, 512, 1, DS41_CPU_FP8_E8M0);
     memcpy(s->window[il] + (size_t)(pos % 128u) * 512u, s->kv, sizeof(s->kv));
     if (!ds41_cpu_attention_select(s, m, l, il, pos, norm)) return false;
-    ds41_prof(DS41_PROF_ATTN);
+    ds41_prof(DS41_PROF_STAGE);
     const uint32_t attended = n_comp < 512u ? n_comp : 512u;
     const uint32_t n_raw = pos < 127u ? pos + 1u : 128u;
     ds41_cpu_attention_stage(s, il, pos, owner, n_raw, attended);
+    ds41_prof(DS41_PROF_ATTN);
     ds41_cpu_attention_heads(s, tensor_data(m, l->attn_sinks), n_raw + attended);
     ds41_cpu_bf16_rows(s->heads, 64u * 512u);
     ds41_cpu_rope(s->heads, 512, 64, pos, ratio != 0, true);
