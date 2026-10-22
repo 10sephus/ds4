@@ -931,10 +931,23 @@ static void ds41_cpu_batch_ffn_out_worker(void *vctx, uint64_t t0, uint64_t t1) 
     }
 }
 
-/* The KV side of the chunk's attention in position order: RoPE and
- * quantization of each token's KV into the layer's raw window and, on the
- * KV source layers, the compressor pooling, the compressed row and its
- * indexer key, as ds41_cpu_attention_cache does them token by token. */
+/* RoPE and quantization of each token's KV row, which depend on the token
+ * and its position only. */
+static void ds41_cpu_batch_kv_rope_worker(void *vctx, uint64_t t0, uint64_t t1) {
+    ds41_cpu_batch_ctx *c = vctx;
+    const uint32_t ratio = ds4_layer_compress_ratio(c->il);
+    for (uint64_t t = t0; t < t1; t++) {
+        float *kv = c->b->kv + t * 512u;
+        ds41_cpu_rope(kv, 512, 1, c->s->pos + (uint32_t)t, ratio != 0, false);
+        ds41_cpu_quantize(kv, 512, 1, DS41_CPU_FP8_E8M0);
+    }
+}
+
+/* The KV side of the chunk's attention: RoPE and quantization of each
+ * token's KV (in parallel), then in position order its copy into the
+ * layer's raw window and, on the KV source layers, the compressor pooling,
+ * the compressed row and its indexer key, as ds41_cpu_attention_cache does
+ * them token by token. */
 static bool ds41_cpu_batch_attention_kv(ds41_cpu_batch_ctx *c, uint32_t n) {
     ds41_cpu_state *s = c->s;
     ds41_cpu_batch *b = c->b;
@@ -943,11 +956,10 @@ static bool ds41_cpu_batch_attention_kv(ds41_cpu_batch_ctx *c, uint32_t n) {
     const bool kv_source = ds41_kv_source(il);
     /* The raw rows before the chunk, which the chunk's rows overwrite. */
     memcpy(b->prev_window, as->window[il], 128u * 512u * sizeof(float));
+    ds4_parallel_for_min_rows(n, ds41_cpu_batch_kv_rope_worker, c, 1);
     for (uint32_t i = 0; i < n; i++) {
         const uint32_t pos = s->pos + i;
-        float *kv = b->kv + (size_t)i * 512u;
-        ds41_cpu_rope(kv, 512, 1, pos, ratio != 0, false);
-        ds41_cpu_quantize(kv, 512, 1, DS41_CPU_FP8_E8M0);
+        const float *kv = b->kv + (size_t)i * 512u;
         memcpy(as->window[il] + (size_t)(pos % 128u) * 512u, kv, 512u * sizeof(float));
         if (!kv_source) continue;
         memcpy(as->pool_kv, b->ckv + (size_t)i * 512u, sizeof(as->pool_kv));
