@@ -525,7 +525,7 @@ static void check_out_graph(test_layer *tl, const ds4_layer_weights *l) {
 static void check_q8_batch(void) {
     const uint64_t dims[] = {32, 64, 256, 1280};
     const uint64_t rows[] = {16, 48, 512};
-    const uint32_t tokens[] = {1, 2, 3, 5, 33, 70};
+    const uint32_t tokens[] = {1, 2, 3, 5, 33, 70, 135};
     for (size_t d = 0; d < sizeof(dims) / sizeof(*dims); d++) {
         for (size_t r = 0; r < sizeof(rows) / sizeof(*rows); r++) {
             for (size_t tk = 0; tk < sizeof(tokens) / sizeof(*tokens); tk++) {
@@ -655,9 +655,9 @@ static void check_routed_batch(uint32_t embd, uint32_t hidden, float clamp) {
     down.bytes = dbytes;
     down.dim[0] = hidden; down.dim[1] = embd;
     ds4_layer_weights l = {.ffn_gate_exps = &gate, .ffn_up_exps = &up, .ffn_down_exps = &down};
-    /* Up to 77 tokens: experts with more than one pass of tokens, and
+    /* Up to 160 tokens: experts with more than one pass of tokens, and
      * token groups of every size. */
-    const uint32_t tokens[] = {1, 2, 3, 5, 9, 17, 40, 77};
+    const uint32_t tokens[] = {1, 2, 3, 5, 9, 17, 40, 77, 160};
     for (size_t tk = 0; tk < sizeof(tokens) / sizeof(*tokens); tk++) {
         const uint32_t nt = tokens[tk];
         float *x = malloc((size_t)nt * embd * sizeof(float));

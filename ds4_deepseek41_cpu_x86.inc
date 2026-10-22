@@ -423,7 +423,7 @@ static void ds41_cpu_down_worker(void *vctx, uint64_t first, uint64_t last) {
  * are those of the one-token kernels above, in the same order, so each
  * output is bitwise the decode result.  Tokens advance in groups only to
  * give the core independent addition chains. */
-#define DS41_CPU_PASS 32u
+#define DS41_CPU_PASS 64u
 
 static inline __m512 ds41_cpu_bf16_16(__m512 v) {
     const __m512i bits = _mm512_castps_si512(v);
