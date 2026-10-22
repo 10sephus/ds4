@@ -253,7 +253,11 @@ static void test_reader(void) {
     }
     const size_t count = 2u * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM;
     float *output[2] = {malloc((count + 1u) * sizeof(float)), malloc((count + 1u) * sizeof(float))};
-    ds4_engram_reader *readers[2] = {ds4_engram_reader_create(), ds4_engram_reader_create()};
+    assert(!ds4_engram_reader_create(0) && errno == EINVAL);
+    assert(!ds4_engram_reader_create(DS4_ENGRAM_COLS + 1u) && errno == EINVAL);
+    /* Uneven column slices, as well as one column per thread. */
+    ds4_engram_reader *readers[2] = {ds4_engram_reader_create(5),
+                                     ds4_engram_reader_create(DS4_ENGRAM_COLS)};
     assert(output[0] && output[1] && readers[0] && readers[1]);
     assert(!ds4_engram_reader_wait(readers[0], 0) && errno == EINVAL);
     assert(!ds4_engram_reader_wait(readers[0], 2) && errno == EINVAL);

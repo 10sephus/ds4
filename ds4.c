@@ -42892,7 +42892,7 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
     DS41_CARRY_ROWS(DS41_CARRY_ALLOC)
 #undef DS41_CARRY_ALLOC
 #ifndef __APPLE__
-    g->engram_reader = ds4_engram_reader_create();
+    g->engram_reader = ds4_engram_reader_create(4);
 #endif
     ds41_graph_reset(g);
     fprintf(stderr, "ds4: V4.1 static context buffers %.2f MiB (ctx=%u), Engram disk-only\n",

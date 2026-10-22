@@ -60,12 +60,14 @@ bool ds4_engram_read(const ds4_engram_table *table, const uint32_t *rows,
 bool ds4_engram_read_batch(const ds4_engram_table *table, const uint32_t *rows,
                            size_t tokens, size_t stride, float *out);
 
-/* One reusable reader for a token's two tables. Tables/IDs are copied at
- * start; descriptors and output must remain valid until wait(reader, 1) or
- * free, even if wait(reader, 0) reports an error. No table data is cached.
- * One caller owns the reader. Creation failure permits synchronous fallback. */
+/* One reusable reader for a token's two tables. Each of 1..COLS threads reads
+ * its slice of the first table's columns, then of the second. Tables/IDs are
+ * copied at start; descriptors and output must remain valid until
+ * wait(reader, 1) or free, even if wait(reader, 0) reports an error. No table
+ * data is cached. One caller owns the reader. Creation failure permits
+ * synchronous fallback. */
 typedef struct ds4_engram_reader ds4_engram_reader;
-ds4_engram_reader *ds4_engram_reader_create(void);
+ds4_engram_reader *ds4_engram_reader_create(unsigned readers);
 bool ds4_engram_reader_start(ds4_engram_reader *reader,
     const ds4_engram_table tables[2], const uint32_t ids[2][DS4_ENGRAM_COLS], float *out);
 bool ds4_engram_reader_wait(ds4_engram_reader *reader, unsigned table);
