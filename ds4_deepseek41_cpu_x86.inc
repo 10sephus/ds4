@@ -485,50 +485,78 @@ static bool ds41_cpu_matvec_q8_pair(float *out0, float *out1, const ds4_model *m
 #endif
 }
 
-static void ds41_cpu_routed_moe(float *out, float *mid, const ds4_model *m,
-                               const ds4_layer_weights *l, const float *x,
-                               const int *selected, const float *weights) {
 #if defined(__AVX512F__) && defined(__AVX512BW__)
+/* The layouts the routed row kernels cover: Q4_K experts, or the Q2 models'
+ * IQ2_XXS gate/up and Q2_K down, both one row per SIMD lane. */
+static bool ds41_cpu_routed_rows(const ds4_layer_weights *l) {
     const bool q4 = l->ffn_gate_exps && l->ffn_up_exps && l->ffn_down_exps &&
         l->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
         l->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
         l->ffn_down_exps->type == DS4_TENSOR_Q4_K;
-    /* Q2 models: IQ2_XXS gate/up and Q2_K down, also one row per lane. */
     const bool q2 = l->ffn_gate_exps && l->ffn_up_exps && l->ffn_down_exps &&
         l->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
         l->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
         l->ffn_down_exps->type == DS4_TENSOR_Q2_K;
-    if ((q4 || q2) &&
+    return (q4 || q2) &&
         DS4_N_EXPERT_USED > 0 && DS4_N_EXPERT_USED <= DS4_MAX_EXPERT_USED &&
         DS4_N_EMBD > 0 && DS4_N_FF_EXP > 0 &&
         DS4_N_EMBD % QK_K == 0 && DS4_N_FF_EXP % QK_K == 0 &&
         DS4_N_EMBD / QK_K <= INT32_MAX / (15 * (int)sizeof(block_q4_K)) &&
-        DS4_N_FF_EXP / QK_K <= INT32_MAX / (15 * (int)sizeof(block_q4_K))) {
-        glm_routed_moe_f32_mid_ctx mc = {
-            .mid = mid, .x = x, .in_dim = DS4_N_EMBD, .out_dim = DS4_N_FF_EXP,
-            .gate_type = l->ffn_gate_exps->type, .up_type = l->ffn_up_exps->type,
-            .n_expert = DS4_N_EXPERT_USED, .clamp = DS4_SWIGLU_CLAMP_EXP,
-        };
-        glm_routed_moe_f32_down_ctx dc = {
-            .out = out, .mid = mid, .in_dim = DS4_N_FF_EXP, .out_dim = DS4_N_EMBD,
-            .down_type = l->ffn_down_exps->type, .n_expert = DS4_N_EXPERT_USED,
-        };
-        for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
-            uint64_t gi, go, ui, uo, di, dout;
-            if (selected[slot] < 0 || (uint32_t)selected[slot] >= DS4_N_EXPERT)
-                ds4_die("V4.1 CPU routed-MoE selected expert is outside range");
-            mc.gate_base[slot] = tensor_expert_bytes(m, l->ffn_gate_exps,
-                (uint32_t)selected[slot], &gi, &go, &mc.gate_row_bytes[slot]);
-            mc.up_base[slot] = tensor_expert_bytes(m, l->ffn_up_exps,
-                (uint32_t)selected[slot], &ui, &uo, &mc.up_row_bytes[slot]);
-            dc.down_base[slot] = tensor_expert_bytes(m, l->ffn_down_exps,
-                (uint32_t)selected[slot], &di, &dout, &dc.down_row_bytes[slot]);
-            if (gi != mc.in_dim || ui != mc.in_dim || go != mc.out_dim ||
-                uo != mc.out_dim || di != dc.in_dim || dout != dc.out_dim)
-                ds4_die("V4.1 CPU routed-MoE found unexpected expert dimensions");
-            mc.expert_weight[slot] = weights[slot];
-        }
-        if (q2) pthread_once(&ds41_iq2xxs_once, ds41_iq2xxs_tables_init);
+        DS4_N_FF_EXP / QK_K <= INT32_MAX / (15 * (int)sizeof(block_q4_K));
+}
+
+/* Gate/up into mid (expert weights applied), then the down rows into out. */
+static void ds41_cpu_routed_init(glm_routed_moe_f32_mid_ctx *mc,
+                                glm_routed_moe_f32_down_ctx *dc,
+                                const ds4_layer_weights *l, const float *x,
+                                float *mid, float *out) {
+    *mc = (glm_routed_moe_f32_mid_ctx){
+        .mid = mid, .x = x, .in_dim = DS4_N_EMBD, .out_dim = DS4_N_FF_EXP,
+        .gate_type = l->ffn_gate_exps->type, .up_type = l->ffn_up_exps->type,
+        .n_expert = DS4_N_EXPERT_USED, .clamp = DS4_SWIGLU_CLAMP_EXP,
+    };
+    *dc = (glm_routed_moe_f32_down_ctx){
+        .out = out, .mid = mid, .in_dim = DS4_N_FF_EXP, .out_dim = DS4_N_EMBD,
+        .down_type = l->ffn_down_exps->type, .n_expert = DS4_N_EXPERT_USED,
+    };
+    /* The IQ2_XXS pair kernel's code table, before any dispatch runs the
+     * mid rows; the dispatch publishes it to the workers. */
+    if (l->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS)
+        pthread_once(&ds41_iq2xxs_once, ds41_iq2xxs_tables_init);
+}
+
+/* Point the contexts at the rows of the selected experts. */
+static void ds41_cpu_routed_bind(glm_routed_moe_f32_mid_ctx *mc,
+                                glm_routed_moe_f32_down_ctx *dc,
+                                const ds4_model *m, const ds4_layer_weights *l,
+                                const int *selected, const float *weights) {
+    for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
+        uint64_t gi, go, ui, uo, di, dout;
+        if (selected[slot] < 0 || (uint32_t)selected[slot] >= DS4_N_EXPERT)
+            ds4_die("V4.1 CPU routed-MoE selected expert is outside range");
+        mc->gate_base[slot] = tensor_expert_bytes(m, l->ffn_gate_exps,
+            (uint32_t)selected[slot], &gi, &go, &mc->gate_row_bytes[slot]);
+        mc->up_base[slot] = tensor_expert_bytes(m, l->ffn_up_exps,
+            (uint32_t)selected[slot], &ui, &uo, &mc->up_row_bytes[slot]);
+        dc->down_base[slot] = tensor_expert_bytes(m, l->ffn_down_exps,
+            (uint32_t)selected[slot], &di, &dout, &dc->down_row_bytes[slot]);
+        if (gi != mc->in_dim || ui != mc->in_dim || go != mc->out_dim ||
+            uo != mc->out_dim || di != dc->in_dim || dout != dc->out_dim)
+            ds4_die("V4.1 CPU routed-MoE found unexpected expert dimensions");
+        mc->expert_weight[slot] = weights[slot];
+    }
+}
+#endif
+
+static void ds41_cpu_routed_moe(float *out, float *mid, const ds4_model *m,
+                               const ds4_layer_weights *l, const float *x,
+                               const int *selected, const float *weights) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    if (ds41_cpu_routed_rows(l)) {
+        glm_routed_moe_f32_mid_ctx mc;
+        glm_routed_moe_f32_down_ctx dc;
+        ds41_cpu_routed_init(&mc, &dc, l, x, mid, out);
+        ds41_cpu_routed_bind(&mc, &dc, m, l, selected, weights);
         /* Every expert is its own NUMA group, so each node takes the first
          * or second half of every selected expert's gate and up rows, the
          * halves --numa-place all put on it, instead of three whole experts
