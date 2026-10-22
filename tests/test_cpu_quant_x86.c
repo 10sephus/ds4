@@ -510,6 +510,185 @@ static void check_f16_rows(void) {
 }
 
 
+/* Pooled F16 matvecs claim whole 8-row groups, and the fused decode
+ * projections mix Q8_0 rows and F16 groups of several matrices in one
+ * dispatch: every row must still equal its own row dot bitwise, whatever
+ * the thread count, NUMA mode or partial last group. */
+static void check_f16_dispatch(void) {
+    enum { DIM = 1027, ROWS_MAX = 1024 };
+    const unsigned rows[] = {1, 7, 24, 64, 256, 1000, ROWS_MAX};
+    const size_t n_w = sizeof(rows) / sizeof(*rows);
+    size_t bytes = 0;
+    for (size_t k = 0; k < n_w; k++) bytes += (size_t)rows[k] * DIM * 2;
+    uint16_t *map = malloc(bytes);
+    float *x = malloc(DIM * sizeof(float));
+    float *expected = malloc(ROWS_MAX * sizeof(float)), *actual = malloc(4 * ROWS_MAX * sizeof(float));
+    CHECK(map && x && expected && actual);
+    ds4_model m = {0};
+    m.map = (const uint8_t *)map;
+    m.size = bytes;
+    ds4_tensor w[sizeof(rows) / sizeof(*rows)];
+    size_t off = 0;
+    for (size_t k = 0; k < n_w; k++) {
+        memset(&w[k], 0, sizeof(w[k]));
+        w[k].ndim = 2; w[k].dim[0] = DIM; w[k].dim[1] = rows[k]; w[k].type = 1;
+        w[k].elements = (uint64_t)DIM * rows[k]; w[k].bytes = w[k].elements * 2; w[k].abs_offset = off;
+        for (uint64_t i = 0; i < w[k].elements; i++) map[off / 2 + i] = f16_random_weight();
+        off += w[k].bytes;
+    }
+    for (unsigned i = 0; i < DIM; i++) x[i] = (float)(int32_t)quant_random() / 2147483648.0f;
+
+    ds4_numa_init();
+    const bool numa = g_numa.on;
+    const uint32_t threads[] = {1, 3, 16};
+    for (int mode = numa; mode >= 0; mode--) {
+        g_numa.on = mode;
+        for (size_t t = 0; t < sizeof(threads) / sizeof(*threads); t++) {
+            g_requested_threads = threads[t];
+            ds4_threads_init();
+            for (size_t k = 0; k < n_w; k++) {
+                const uint16_t *data = map + w[k].abs_offset / 2;
+                for (unsigned r = 0; r < rows[k]; r++) expected[r] = dot_f16_row(data + (uint64_t)r * DIM, x, DIM);
+                memset(actual, 0xff, ROWS_MAX * sizeof(float));
+                matvec_f16(actual, &m, &w[k], x);
+                f16_rows_equal("F16 grouped matvec", expected, actual, rows[k]);
+            }
+            for (size_t k0 = 0; k0 + 4 <= n_w; k0++) {
+                const ds4_tensor *ws[4] = {&w[k0], &w[k0 + 1], &w[k0 + 2], &w[k0 + 3]};
+                float *outs[4] = {actual, actual + ROWS_MAX, actual + 2 * ROWS_MAX, actual + 3 * ROWS_MAX};
+                for (uint32_t n = 1; n <= 4; n++) {
+                    memset(actual, 0xff, 4 * ROWS_MAX * sizeof(float));
+                    matvec_f16_multi(outs, &m, ws, n, x);
+                    for (uint32_t j = 0; j < n; j++) {
+                        const uint16_t *data = map + ws[j]->abs_offset / 2;
+                        for (unsigned r = 0; r < ws[j]->dim[1]; r++) {
+                            expected[r] = dot_f16_row(data + (uint64_t)r * DIM, x, DIM);
+                        }
+                        f16_rows_equal("F16 multi matvec", expected, outs[j], (unsigned)ws[j]->dim[1]);
+                    }
+                }
+            }
+            ds4_threads_shutdown();
+        }
+    }
+    g_numa.on = numa;
+    g_requested_threads = 0;
+    free(actual);
+    free(expected);
+    free(x);
+    free(map);
+}
+
+/* The fused decode projections of attn_norm (q_a and kv in Q8_0, compressor
+ * rows in F16) against dot_q8_0_row and dot_f16_row per row, for ratio 0, 4
+ * and 128 layers. */
+static void check_attn_input_projections(void) {
+    const ds4_shape saved = g_ds4_shape;
+    g_ds4_shape = DS4_SHAPE_FLASH;
+    const uint64_t in = DS4_N_EMBD, blocks = in / 32;
+    const uint64_t q8_rows[2] = {DS4_N_LORA_Q, DS4_N_HEAD_DIM};
+    const uint64_t f16_rows[6] = {2 * DS4_N_HEAD_DIM, 2 * DS4_N_HEAD_DIM,
+                                  2 * DS4_N_INDEXER_HEAD_DIM, 2 * DS4_N_INDEXER_HEAD_DIM,
+                                  DS4_N_HEAD_DIM, DS4_N_HEAD_DIM};
+    uint64_t bytes = 0;
+    for (int k = 0; k < 2; k++) bytes += q8_rows[k] * blocks * 34;
+    for (int k = 0; k < 6; k++) bytes += f16_rows[k] * in * 2;
+    uint8_t *map = malloc(bytes);
+    CHECK(map);
+    ds4_model m = {0};
+    m.map = map;
+    m.size = bytes;
+    ds4_tensor t[8];
+    uint64_t off = 0;
+    for (int k = 0; k < 8; k++) {
+        const bool f16 = k >= 2;
+        const uint64_t r = f16 ? f16_rows[k - 2] : q8_rows[k];
+        memset(&t[k], 0, sizeof(t[k]));
+        t[k].ndim = 2; t[k].dim[0] = in; t[k].dim[1] = r; t[k].type = f16 ? 1 : 8;
+        t[k].elements = in * r; t[k].bytes = f16 ? in * r * 2 : r * blocks * 34; t[k].abs_offset = off;
+        if (f16) {
+            uint16_t *p = (uint16_t *)(map + off);
+            for (uint64_t i = 0; i < in * r; i++) p[i] = f16_random_weight();
+        } else {
+            for (uint64_t b = 0; b < r * blocks; b++) {
+                uint8_t *blk = map + off + b * 34;
+                const uint16_t d = f32_to_f16(0.0005f + (float)(quant_random() & 1023) * 1.0e-5f);
+                memcpy(blk, &d, 2);
+                for (int i = 0; i < 32; i++) blk[2 + i] = (uint8_t)quant_random();
+            }
+        }
+        off += t[k].bytes;
+    }
+    float *x = malloc(in * sizeof(float));
+    CHECK(x);
+    for (uint64_t i = 0; i < in; i++) x[i] = (float)(int32_t)quant_random() / 1073741824.0f;
+    int8_t *xq = malloc(in);
+    float *xs = malloc(blocks * sizeof(float)), *expected = malloc(2 * DS4_N_HEAD_DIM * sizeof(float));
+    CHECK(xq && xs && expected);
+    quantize_q8_0_activation(x, xq, xs, in);
+
+    ds4_cpu_decode_scratch sc;
+    memset(&sc, 0, sizeof(sc));
+    const uint64_t comp = 2 * (DS4_N_HEAD_DIM + DS4_N_INDEXER_HEAD_DIM);
+    sc.qr = malloc(DS4_N_LORA_Q * sizeof(float));
+    sc.kv_raw = malloc(DS4_N_HEAD_DIM * sizeof(float));
+    sc.comp_kv_cur = malloc(comp * sizeof(float));
+    sc.comp_sc_cur = malloc(comp * sizeof(float));
+    sc.q8_cap = in;
+    sc.q8_xq = malloc(in);
+    sc.q8_xscale = malloc(blocks * sizeof(float));
+    CHECK(sc.qr && sc.kv_raw && sc.comp_kv_cur && sc.comp_sc_cur && sc.q8_xq && sc.q8_xscale);
+
+    const uint32_t threads[] = {1, 5, 16};
+    for (size_t ti = 0; ti < sizeof(threads) / sizeof(*threads); ti++) {
+        g_requested_threads = threads[ti];
+        ds4_threads_init();
+        for (int ri = 0; ri < 3; ri++) {
+            const uint32_t ratio = ri == 0 ? 0 : ri == 1 ? 4 : 128;
+            ds4_layer_weights L;
+            memset(&L, 0, sizeof(L));
+            L.attn_q_a = &t[0];
+            L.attn_kv = &t[1];
+            if (ratio == 4) {
+                L.attn_compressor_kv = &t[2]; L.attn_compressor_gate = &t[3];
+                L.indexer_compressor_kv = &t[4]; L.indexer_compressor_gate = &t[5];
+            } else if (ratio == 128) {
+                L.attn_compressor_kv = &t[6]; L.attn_compressor_gate = &t[7];
+            }
+            memset(sc.qr, 0xff, DS4_N_LORA_Q * sizeof(float));
+            memset(sc.kv_raw, 0xff, DS4_N_HEAD_DIM * sizeof(float));
+            memset(sc.comp_kv_cur, 0xff, comp * sizeof(float));
+            memset(sc.comp_sc_cur, 0xff, comp * sizeof(float));
+            bool comp_done = false;
+            CHECK(attn_input_projections_decode(&m, &L, ratio, x, &sc, &comp_done));
+            CHECK(comp_done == (ratio != 0));
+            float *q8_out[2] = {sc.qr, sc.kv_raw};
+            for (int k = 0; k < 2; k++) {
+                const uint8_t *data = map + t[k].abs_offset;
+                for (uint64_t r = 0; r < q8_rows[k]; r++) {
+                    expected[r] = dot_q8_0_row(data + r * blocks * 34, xq, xs, in, blocks);
+                }
+                f16_rows_equal("fused Q8_0 projection", expected, q8_out[k], (unsigned)q8_rows[k]);
+            }
+            const ds4_tensor *fw[4] = {L.attn_compressor_kv, L.attn_compressor_gate,
+                                       L.indexer_compressor_kv, L.indexer_compressor_gate};
+            float *f16_out[4] = {sc.comp_kv_cur, sc.comp_sc_cur,
+                                 sc.comp_kv_cur + 2 * DS4_N_HEAD_DIM, sc.comp_sc_cur + 2 * DS4_N_HEAD_DIM};
+            for (int k = 0; k < (ratio == 4 ? 4 : ratio ? 2 : 0); k++) {
+                const uint16_t *data = (const uint16_t *)(map + fw[k]->abs_offset);
+                for (uint64_t r = 0; r < fw[k]->dim[1]; r++) expected[r] = dot_f16_row(data + r * in, x, in);
+                f16_rows_equal("fused F16 projection", expected, f16_out[k], (unsigned)fw[k]->dim[1]);
+            }
+        }
+        ds4_threads_shutdown();
+    }
+    g_requested_threads = 0;
+    g_ds4_shape = saved;
+    free(sc.q8_xscale); free(sc.q8_xq); free(sc.comp_sc_cur); free(sc.comp_kv_cur);
+    free(sc.kv_raw); free(sc.qr);
+    free(expected); free(xs); free(xq); free(x); free(map);
+}
+
 /* Verbatim copies of the scalar Q8_0/Q8_K activation quantizers and Q8_0 row
  * dot: the SIMD block paths must reproduce them bit for bit. */
 static void q8_0_quantize_oracle(const float *x, int8_t *xq, float *scale, uint64_t n) {
@@ -1706,6 +1885,9 @@ int main(void) {
     check_f16_conversion();
     puts("CPU F16C conversion and F16 row-group matvec bitwise oracles PASS");
 #endif
+    check_f16_dispatch();
+    check_attn_input_projections();
+    puts("CPU grouped F16 dispatch and fused decode projections bitwise PASS");
     check_x16_kernels();
 #if DS4_MOE_X16
     puts("CPU AVX-512 VNNI x16 expert kernels bitwise PASS");
