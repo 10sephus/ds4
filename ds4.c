@@ -10735,12 +10735,15 @@ static uint64_t matmul_q8_0_tiles_rows(
 }
 #endif
 
-/* About 256 KB of tiles per item, and items of 32 rows unless that leaves
- * fewer than four items per thread. */
+/* About 256 KB of tiles per item, but at most four tile blocks: every tile
+ * block reads the weight rows again, and attn_output_b (in_dim 8192, one
+ * tile per 256 KB) streamed its 36 MB of rows once per tile.  Items have 32
+ * rows unless that leaves fewer than four items per thread. */
 static q8_0_tile_grid q8_0_tile_grid_make(uint64_t out_dim, uint64_t n_tiles, uint64_t blocks) {
     ds4_threads_init();
     q8_0_tile_grid g;
     g.tile_block = (256 * 1024) / (blocks * (512 + 16 * sizeof(float)));
+    if (g.tile_block < (n_tiles + 3) / 4) g.tile_block = (n_tiles + 3) / 4;
     if (g.tile_block < 1) g.tile_block = 1;
     g.n_tb = n_tiles ? (n_tiles + g.tile_block - 1) / g.tile_block : 1;
     g.row_block = 32;
