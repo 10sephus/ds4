@@ -9025,12 +9025,71 @@ static inline float dot_f16_row(const uint16_t *row, const float *x, uint64_t n)
 #endif
 }
 
+/* Up to DS4_F16_ROWS consecutive rows of a dense F16 matrix against x, each
+ * output bitwise equal to dot_f16_row on that row. */
+#define DS4_F16_ROWS 8
+static void dot_f16_rows(float *out, const uint16_t *rows, uint64_t n_rows, const float *x, uint64_t n) {
+#if defined(DS4_NO_GPU) && defined(__AVX2__) && defined(__F16C__)
+    /* VCVTPH2PS and VMULPS yield the same IEEE single products as the scalar
+     * conversion and multiply (a signalling NaN weight is quieted by the
+     * conversion here and by the multiply there).  Transposing each 8x8 block
+     * of products turns the eight serial per-row sums into one vertical add
+     * per column, still in index order within every lane, so the eight
+     * independent chains hide the add latency.  Unused lanes of a short
+     * group recompute row 0; such groups are latency-bound anyway. */
+    const uint16_t *row[DS4_F16_ROWS];
+    for (unsigned r = 0; r < DS4_F16_ROWS; r++) row[r] = rows + (r < n_rows ? r : 0) * n;
+
+    __m256 acc = _mm256_setzero_ps();
+    uint64_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        const __m256 xv = _mm256_loadu_ps(x + i);
+        __m256 p[DS4_F16_ROWS];
+        for (unsigned r = 0; r < DS4_F16_ROWS; r++) {
+            const __m128i hv = _mm_loadu_si128((const __m128i *)(row[r] + i));
+            p[r] = _mm256_mul_ps(_mm256_cvtph_ps(hv), xv);
+        }
+        const __m256 t0 = _mm256_unpacklo_ps(p[0], p[1]), t1 = _mm256_unpackhi_ps(p[0], p[1]);
+        const __m256 t2 = _mm256_unpacklo_ps(p[2], p[3]), t3 = _mm256_unpackhi_ps(p[2], p[3]);
+        const __m256 t4 = _mm256_unpacklo_ps(p[4], p[5]), t5 = _mm256_unpackhi_ps(p[4], p[5]);
+        const __m256 t6 = _mm256_unpacklo_ps(p[6], p[7]), t7 = _mm256_unpackhi_ps(p[6], p[7]);
+        const __m256 s0 = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(1, 0, 1, 0));
+        const __m256 s1 = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(3, 2, 3, 2));
+        const __m256 s2 = _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(1, 0, 1, 0));
+        const __m256 s3 = _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(3, 2, 3, 2));
+        const __m256 s4 = _mm256_shuffle_ps(t4, t6, _MM_SHUFFLE(1, 0, 1, 0));
+        const __m256 s5 = _mm256_shuffle_ps(t4, t6, _MM_SHUFFLE(3, 2, 3, 2));
+        const __m256 s6 = _mm256_shuffle_ps(t5, t7, _MM_SHUFFLE(1, 0, 1, 0));
+        const __m256 s7 = _mm256_shuffle_ps(t5, t7, _MM_SHUFFLE(3, 2, 3, 2));
+        /* s0 holds columns 0 (low half) and 4 (high half) of rows 0-3, s4 the
+         * same columns of rows 4-7: columns 0-3 come first, then 4-7. */
+        acc = _mm256_add_ps(acc, _mm256_permute2f128_ps(s0, s4, 0x20));
+        acc = _mm256_add_ps(acc, _mm256_permute2f128_ps(s1, s5, 0x20));
+        acc = _mm256_add_ps(acc, _mm256_permute2f128_ps(s2, s6, 0x20));
+        acc = _mm256_add_ps(acc, _mm256_permute2f128_ps(s3, s7, 0x20));
+        acc = _mm256_add_ps(acc, _mm256_permute2f128_ps(s0, s4, 0x31));
+        acc = _mm256_add_ps(acc, _mm256_permute2f128_ps(s1, s5, 0x31));
+        acc = _mm256_add_ps(acc, _mm256_permute2f128_ps(s2, s6, 0x31));
+        acc = _mm256_add_ps(acc, _mm256_permute2f128_ps(s3, s7, 0x31));
+    }
+
+    float sum[DS4_F16_ROWS];
+    _mm256_storeu_ps(sum, acc);
+    for (; i < n; i++) {
+        for (unsigned r = 0; r < DS4_F16_ROWS; r++) sum[r] += f16_to_f32(row[r][i]) * x[i];
+    }
+    for (unsigned r = 0; r < n_rows; r++) out[r] = sum[r];
+#else
+    for (uint64_t r = 0; r < n_rows; r++) out[r] = dot_f16_row(rows + r * n, x, n);
+#endif
+}
+
 static void matvec_f16_worker(void *vctx, uint64_t row0, uint64_t row1) {
     matvec_f16_ctx *ctx = vctx;
 
-    for (uint64_t o = row0; o < row1; o++) {
-        const uint16_t *row = ctx->data + o * ctx->in_dim;
-        ctx->out[o] = dot_f16_row(row, ctx->x, ctx->in_dim);
+    for (uint64_t o = row0; o < row1; o += DS4_F16_ROWS) {
+        const uint64_t n_rows = row1 - o < DS4_F16_ROWS ? row1 - o : DS4_F16_ROWS;
+        dot_f16_rows(ctx->out + o, ctx->data + o * ctx->in_dim, n_rows, ctx->x, ctx->in_dim);
     }
 }
 
@@ -9052,15 +9111,17 @@ static void matvec_f16(float *out, const ds4_model *m, const ds4_tensor *w, cons
     ds4_parallel_for_min_rows(out_dim, matvec_f16_worker, &ctx, min_rows);
 }
 
+/* Same matvec on the calling thread, for callers already inside a worker. */
 static void matvec_f16_serial(float *out, const ds4_model *m, const ds4_tensor *w, const float *x) {
     if (w->type != 1 || w->ndim != 2) ds4_die("expected a 2D F16 tensor");
 
-    const uint64_t in_dim = w->dim[0];
-    const uint64_t out_dim = w->dim[1];
-    const uint16_t *data = tensor_data(m, w);
-    for (uint64_t o = 0; o < out_dim; o++) {
-        out[o] = dot_f16_row(data + o * in_dim, x, in_dim);
-    }
+    matvec_f16_ctx ctx = {
+        .out = out,
+        .data = tensor_data(m, w),
+        .x = x,
+        .in_dim = w->dim[0],
+    };
+    matvec_f16_worker(&ctx, 0, w->dim[1]);
 }
 
 typedef struct {

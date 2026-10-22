@@ -359,6 +359,100 @@ static void check_indexer(void) {
     g_ds4_shape = saved;
 }
 
+
+#if defined(DS4_NO_GPU) && defined(__AVX2__) && defined(__F16C__)
+/* VCVTPH2PS must reproduce the scalar f16_to_f32 bits for every half pattern:
+ * zeros, subnormals, normals, infinities and quiet NaNs.  A signalling NaN is
+ * the one exception: hardware sets its quiet bit while the scalar routine
+ * keeps the raw payload.  The scalar multiply quiets it the same way before
+ * anything is accumulated, which check_f16_rows verifies on the dot output. */
+static void check_f16_conversion(void) {
+    unsigned signalling = 0;
+    for (uint32_t base = 0; base < 65536; base += 8) {
+        uint16_t h[8];
+        float f[8];
+        for (unsigned k = 0; k < 8; k++) h[k] = (uint16_t)(base + k);
+        _mm256_storeu_ps(f, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)h)));
+        for (unsigned k = 0; k < 8; k++) {
+            const float e = f16_to_f32(h[k]);
+            uint32_t expected, actual;
+            memcpy(&expected, &e, sizeof(expected));
+            memcpy(&actual, &f[k], sizeof(actual));
+            if ((h[k] & 0x7c00u) == 0x7c00u && (h[k] & 0x03ffu) != 0 && !(h[k] & 0x0200u)) {
+                expected |= 0x00400000u;
+                signalling++;
+            }
+            if (expected != actual) {
+                fprintf(stderr, "f16 %04x: %08x != %08x\n", h[k], expected, actual);
+                exit(1);
+            }
+        }
+    }
+    CHECK(signalling == 2 * 511);
+}
+#endif
+
+/* Normal magnitudes 2^-8..2^7 with some signed zeros and subnormals. */
+static uint16_t f16_random_weight(void) {
+    const uint32_t r = quant_random();
+    switch (r % 16) {
+    case 0: return (uint16_t)(r & 0x8000u);
+    case 1: return (uint16_t)(r & 0x83ffu);
+    default: return (uint16_t)((r & 0x83ffu) | ((7 + (r >> 20) % 16) << 10));
+    }
+}
+
+static void f16_rows_equal(const char *name, const float *expected, const float *actual, unsigned n) {
+    for (unsigned r = 0; r < n; r++) {
+        uint32_t a, b;
+        memcpy(&a, &expected[r], sizeof(a));
+        memcpy(&b, &actual[r], sizeof(b));
+        if (a != b) {
+            fprintf(stderr, "%s row %u: %08x != %08x (%g != %g)\n", name, r, a, b, expected[r], actual[r]);
+            exit(1);
+        }
+    }
+}
+
+/* The F16 matvec worker must reproduce dot_f16_row bitwise for every group
+ * shape: odd row counts, in_dim tails, and row ranges starting mid-group.
+ * Guard pages end each matrix so the 8-lane loads are proven in bounds. */
+static void check_f16_rows(void) {
+    const unsigned dims[] = {1, 7, 8, 9, 15, 16, 17, 31, 33, 64, 100, 1027};
+    const unsigned counts[] = {1, 3, 5, 7, 8, 9, 13, 24, 29};
+    const uint16_t specials[] = {0x7c00, 0xfc00, 0x7e00, 0xfe55, 0x7c01, 0xfdff, 0x0001, 0x83ff};
+    float expected[32], actual[32];
+    for (unsigned d = 0; d < sizeof(dims) / sizeof(*dims); d++) {
+        const unsigned dim = dims[d];
+        quant_buffer xb = quant_alloc(dim * sizeof(float));
+        float *x = (float *)xb.data;
+        for (unsigned i = 0; i < dim; i++) x[i] = (float)(int32_t)quant_random() / 2147483648.0f;
+        for (unsigned c = 0; c < sizeof(counts) / sizeof(*counts); c++) {
+            const unsigned count = counts[c];
+            quant_buffer wb = quant_alloc((size_t)count * dim * sizeof(uint16_t));
+            uint16_t *w = (uint16_t *)wb.data;
+            matvec_f16_ctx ctx = {.out = actual, .data = w, .x = x, .in_dim = dim};
+            for (unsigned pass = 0; pass < 1 + sizeof(specials) / sizeof(*specials); pass++) {
+                for (unsigned i = 0; i < count * dim; i++) w[i] = f16_random_weight();
+                /* One special value per row at a varying position: infinities
+                 * and NaNs must propagate with identical bits (the signalling
+                 * NaN payloads 0x7c01 and 0xfdff are quieted in both paths). */
+                if (pass) {
+                    for (unsigned r = 0; r < count; r++) w[r * dim + (r * 7 + pass) % dim] = specials[pass - 1];
+                }
+                for (unsigned r = 0; r < count; r++) expected[r] = dot_f16_row(w + r * dim, x, dim);
+                for (unsigned row0 = 0; row0 < count; row0 += 3) {
+                    memset(actual, 0xff, sizeof(actual));
+                    matvec_f16_worker(&ctx, row0, count);
+                    f16_rows_equal("F16 rows", expected + row0, actual + row0, count - row0);
+                }
+            }
+            quant_free(wb);
+        }
+        quant_free(xb);
+    }
+}
+
 int main(void) {
     check_integer_dots();
     check_indexer();
@@ -369,6 +463,11 @@ int main(void) {
     puts("Block FP oracle skipped: existing ARM DOTPROD accumulation order differs");
 #else
     check_block_dots();
+    check_f16_rows();
+#if defined(DS4_NO_GPU) && defined(__AVX2__) && defined(__F16C__)
+    check_f16_conversion();
+    puts("CPU F16C conversion and F16 row-group matvec bitwise oracles PASS");
+#endif
 #if defined(DS4_NO_GPU) && defined(__AVX2__)
     puts("CPU AVX2 IQ2_XXS/Q2_K integer and bitwise block oracles PASS");
 #elif defined(__ARM_NEON)
