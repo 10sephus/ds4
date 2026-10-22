@@ -16879,6 +16879,41 @@ static bool *indexer_allowed_decode_one_decode_scratch(
     return allowed;
 }
 
+/* Per-token norms of the batched prefill projections, one token per row.
+ * Every token runs the same scalar code as before, so the split is exact. */
+typedef struct {
+    float *out;
+    const float *x;
+    const float *weight;
+    uint64_t dim;       /* row length, or head size when n_head != 0 */
+    uint32_t n_head;    /* 0: rms_norm_weight rows, else head_rms_norm_inplace */
+} prefill_norm_ctx;
+
+static void prefill_norm_worker(void *vctx, uint64_t t0, uint64_t t1) {
+    prefill_norm_ctx *ctx = vctx;
+    for (uint64_t t = t0; t < t1; t++) {
+        if (ctx->n_head) {
+            head_rms_norm_inplace(ctx->out + t * ctx->n_head * ctx->dim,
+                                  ctx->n_head, (uint32_t)ctx->dim, DS4_RMS_EPS);
+        } else {
+            rms_norm_weight(ctx->out + t * ctx->dim, ctx->x + t * ctx->dim,
+                            ctx->weight, ctx->dim, DS4_RMS_EPS);
+        }
+    }
+}
+
+static void prefill_rms_norm_rows(float *out, const float *x, const float *weight,
+                                  uint64_t dim, uint32_t n_tok) {
+    prefill_norm_ctx ctx = { .out = out, .x = x, .weight = weight, .dim = dim };
+    ds4_parallel_for_min_rows(n_tok, prefill_norm_worker, &ctx, 2);
+}
+
+static void prefill_head_rms_norm_rows(float *x, uint32_t n_head, uint32_t head_dim,
+                                       uint32_t n_tok) {
+    prefill_norm_ctx ctx = { .out = x, .dim = head_dim, .n_head = n_head };
+    ds4_parallel_for_min_rows(n_tok, prefill_norm_worker, &ctx, 2);
+}
+
 /* Batched prefill attention for a fresh prompt.  It projects Q/KV for all
  * tokens, streams them through the same raw/compressed cache updates decode
  * performs, then runs every token's attention in parallel.  Continued prefill
@@ -16947,31 +16982,14 @@ static void layer_attention_raw_swa_batch(
 
     t0 = profile ? now_sec() : 0.0;
     matmul_q8_0_batch(qr, model, layer->attn_q_a, attn_norm, n_tok);
-    for (uint32_t t = 0; t < n_tok; t++) {
-        rms_norm_weight(qr_norm + (uint64_t)t * q_rank,
-                        qr + (uint64_t)t * q_rank,
-                        q_a_norm,
-                        q_rank,
-                        DS4_RMS_EPS);
-    }
+    prefill_rms_norm_rows(qr_norm, qr, q_a_norm, q_rank, n_tok);
     matmul_q8_0_batch(q, model, layer->attn_q_b, qr_norm, n_tok);
-    for (uint32_t t = 0; t < n_tok; t++) {
-        head_rms_norm_inplace(q + (uint64_t)t * q_dim,
-                              DS4_N_HEAD,
-                              DS4_N_HEAD_DIM,
-                              DS4_RMS_EPS);
-    }
+    prefill_head_rms_norm_rows(q, DS4_N_HEAD, DS4_N_HEAD_DIM, n_tok);
     if (profile) t_q = now_sec() - t0;
 
     t0 = profile ? now_sec() : 0.0;
     matmul_q8_0_batch(kv_raw, model, layer->attn_kv, attn_norm, n_tok);
-    for (uint32_t t = 0; t < n_tok; t++) {
-        rms_norm_weight(kv + (uint64_t)t * DS4_N_HEAD_DIM,
-                        kv_raw + (uint64_t)t * DS4_N_HEAD_DIM,
-                        kv_norm,
-                        DS4_N_HEAD_DIM,
-                        DS4_RMS_EPS);
-    }
+    prefill_rms_norm_rows(kv, kv_raw, kv_norm, DS4_N_HEAD_DIM, n_tok);
     if (profile) t_kv = now_sec() - t0;
 
     t0 = profile ? now_sec() : 0.0;
