@@ -9461,11 +9461,23 @@ typedef struct {
     uint64_t rank;
 } matvec_q8_0_grouped_ctx;
 
+/* 16-token activation tiles for the x86 batched Q8_0 GEMM below.  Tile i of
+ * a group holds tokens 16i..16i+15: xq is [tile][block][8 groups of 4][16
+ * tokens][4 bytes] with +128 applied, xs is [tile][block][16 tokens].  Empty
+ * (n_tiles = 0) below 16 tokens or without AVX-512 VNNI; tokens past the last
+ * full tile take the generic per-row path. */
+typedef struct {
+    uint8_t *xq;
+    float   *xs;
+    uint64_t n_tiles;   /* per group */
+} q8_0_tiles;
+
 typedef struct {
     float *out;
     const uint8_t *data;
     const int8_t *xq;
     const float *xscale;
+    q8_0_tiles tiles;
     uint64_t n_tok;
     uint64_t n_groups;
     uint64_t group_dim;
@@ -9478,6 +9490,7 @@ typedef struct {
     const uint8_t *data;
     const int8_t *xq;
     const float *xscale;
+    q8_0_tiles tiles;
     uint64_t n_tok;
     uint64_t in_dim;
     uint64_t out_dim;
@@ -9491,6 +9504,7 @@ typedef struct {
     const uint8_t *data1;
     const int8_t *xq;
     const float *xscale;
+    q8_0_tiles tiles;
     uint64_t n_tok;
     uint64_t in_dim;
     uint64_t out_dim;
@@ -9885,6 +9899,205 @@ static void quantize_q8_0_activation_batch(
     ds4_parallel_for(n_tok, quantize_q8_0_batch_worker, &ctx);
 }
 
+static void q8_0_tiles_free(q8_0_tiles *tiles) {
+    free(tiles->xq);
+    free(tiles->xs);
+}
+
+#if defined(DS4_NO_GPU) && defined(__AVX512VNNI__)
+/* Batched Q8_0 GEMM for prefill: 4 weight rows x 16 tokens per pass with
+ * vpdpbusd, bitwise identical to dot_q8_0_row.  The generic dot computes per
+ * block
+ *
+ *     acc = acc + ((f16_to_f32(ws) * xs) * (float)dot)
+ *
+ * with dot an exact int32 sum of 32 int8 products.  Integer sums may be
+ * reordered freely; vpdpbusd needs an unsigned operand, so the packed
+ * activations carry +128 and the integer accumulator starts at -128 * sum(w),
+ * which cancels the offset exactly.  The float steps are then issued per
+ * token lane in block order with separate mul and add (never fmadd; the CPU
+ * objects are built with -ffp-contract=off). */
+
+typedef struct {
+    q8_0_tiles tiles;
+    const int8_t *xq;
+    const float *xscale;
+    uint64_t n_groups;
+    uint64_t in_dim;
+    uint64_t blocks;
+} q8_0_tiles_pack_ctx;
+
+/* Work item = (group, tile).  Activations are [token][group][block] as the
+ * quantizers lay them out; elements past in_dim pack as zero. */
+static void q8_0_tiles_pack_worker(void *vctx, uint64_t i0, uint64_t i1) {
+    q8_0_tiles_pack_ctx *ctx = vctx;
+    const uint64_t blocks = ctx->blocks;
+
+    for (uint64_t idx = i0; idx < i1; idx++) {
+        const uint64_t group = idx / ctx->tiles.n_tiles;
+        const uint64_t tile = idx - group * ctx->tiles.n_tiles;
+        uint8_t *xq16 = ctx->tiles.xq + idx * blocks * 512;
+        float *xs16 = ctx->tiles.xs + idx * blocks * 16;
+
+        for (unsigned j = 0; j < 16; j++) {
+            const uint64_t src = ((tile * 16 + j) * ctx->n_groups + group) * blocks;
+            const int8_t *xq = ctx->xq + src * 32;
+            const float *xs = ctx->xscale + src;
+            for (uint64_t b = 0; b < blocks; b++) {
+                xs16[b * 16 + j] = xs[b];
+                for (unsigned k = 0; k < 8; k++) {
+                    uint8_t *dst = xq16 + ((b * 8 + k) * 16 + j) * 4;
+                    for (unsigned i = 0; i < 4; i++) {
+                        const uint64_t e = b * 32 + k * 4 + i;
+                        dst[i] = (uint8_t)(e < ctx->in_dim ? xq[e] : 0) ^ 0x80u;
+                    }
+                }
+            }
+        }
+    }
+}
+
+static q8_0_tiles q8_0_tiles_pack(
+        const int8_t *xq,
+        const float  *xscale,
+        uint64_t      n_tok,
+        uint64_t      n_groups,
+        uint64_t      in_dim,
+        uint64_t      blocks) {
+    q8_0_tiles_pack_ctx ctx = {
+        .tiles = { .n_tiles = n_tok / 16 },
+        .xq = xq,
+        .xscale = xscale,
+        .n_groups = n_groups,
+        .in_dim = in_dim,
+        .blocks = blocks,
+    };
+    const uint64_t total = n_groups * ctx.tiles.n_tiles;
+    if (total == 0) return ctx.tiles;
+
+    ctx.tiles.xq = xmalloc(total * blocks * 512);
+    ctx.tiles.xs = xmalloc(total * blocks * 16 * sizeof(float));
+    ds4_parallel_for_min_rows(total, q8_0_tiles_pack_worker, &ctx, 1);
+    return ctx.tiles;
+}
+
+/* Per (row, block) constants of the tile kernel: the block scale as f32 and
+ * the integer accumulator start that cancels the +128 activation offset. */
+typedef struct {
+    float   ws;
+    int32_t dot0;
+} q8_0_row_tab;
+
+/* F16C conversion, bit-identical to the software f16_to_f32 for all 65536
+ * patterns (tests/test_cpu_quant_x86.c): VCVTPH2PS would quiet signaling
+ * NaNs, so inf and NaN take the software path. */
+static inline float q8_0_scale_f32(uint16_t bits) {
+#if defined(__F16C__)
+    if ((bits & 0x7c00u) != 0x7c00u) return _cvtsh_ss(bits);
+#endif
+    return f16_to_f32(bits);
+}
+
+static void q8_0_row_tab_build(q8_0_row_tab *tab, const uint8_t *row, uint64_t blocks) {
+    for (uint64_t b = 0; b < blocks; b++) {
+        uint16_t scale_bits;
+        memcpy(&scale_bits, row + b * 34, sizeof(scale_bits));
+        const int8_t *qs = (const int8_t *)(row + b * 34 + 2);
+        int32_t sum = 0;
+        for (unsigned i = 0; i < 32; i++) sum += qs[i];
+        tab[b].ws = q8_0_scale_f32(scale_bits);
+        tab[b].dot0 = -128 * sum;
+    }
+}
+
+/* 4 weight rows x one 16-token tile; out[r][j] equals
+ * dot_q8_0_row(rows[r], token j) bit for bit. */
+static void q8_0_gemm_4x16(
+        const uint8_t *const      rows[4],
+        const q8_0_row_tab *const tabs[4],
+        const uint8_t            *xq16,
+        const float              *xs16,
+        uint64_t                  blocks,
+        float                     out[4][16]) {
+    __m512 acc[4];
+    for (unsigned r = 0; r < 4; r++) acc[r] = _mm512_setzero_ps();
+
+    for (uint64_t b = 0; b < blocks; b++) {
+        __m512i xv[8];
+        for (unsigned k = 0; k < 8; k++) {
+            xv[k] = _mm512_loadu_si512((const void *)(xq16 + (b * 8 + k) * 64));
+        }
+        const __m512 xs = _mm512_loadu_ps(xs16 + b * 16);
+
+        for (unsigned r = 0; r < 4; r++) {
+            const uint8_t *qs = rows[r] + b * 34 + 2;
+            __m512i dot = _mm512_set1_epi32(tabs[r][b].dot0);
+            for (unsigned k = 0; k < 8; k++) {
+                int32_t w4;
+                memcpy(&w4, qs + k * 4, sizeof(w4));
+                dot = _mm512_dpbusd_epi32(dot, xv[k], _mm512_set1_epi32(w4));
+            }
+            const __m512 t1 = _mm512_mul_ps(_mm512_set1_ps(tabs[r][b].ws), xs);
+            const __m512 t2 = _mm512_mul_ps(t1, _mm512_cvtepi32_ps(dot));
+            acc[r] = _mm512_add_ps(acc[r], t2);
+        }
+    }
+    for (unsigned r = 0; r < 4; r++) _mm512_storeu_ps(out[r], acc[r]);
+}
+
+/* Rows [r0, r1) of a Q8_0 matrix (row r at data + r * blocks * 34) against
+ * every full tile of one group, writing out[t * out_stride + r].  Row blocks
+ * are sized to stay in L2 while the tiles stream past, so each weight row is
+ * read from DRAM once per matmul.  The last 4-row group may run past r1 on a
+ * duplicate of the last row; those results are not stored.  Returns the
+ * first token not covered by a tile. */
+static uint64_t matmul_q8_0_tiles_rows(
+        float            *out,
+        uint64_t          out_stride,
+        const uint8_t    *data,
+        uint64_t          r0,
+        uint64_t          r1,
+        const q8_0_tiles *tiles,
+        uint64_t          tile0,
+        uint64_t          blocks) {
+    if (tiles->n_tiles == 0) return 0;
+
+    const uint64_t row_bytes = blocks * 34;
+    uint64_t block_rows = (256 * 1024 / row_bytes) & ~(uint64_t)3;
+    if (block_rows < 4) block_rows = 4;
+    q8_0_row_tab *tab = xmalloc(block_rows * blocks * sizeof(*tab));
+
+    for (uint64_t rb = r0; rb < r1; rb += block_rows) {
+        const uint64_t n = r1 - rb < block_rows ? r1 - rb : block_rows;
+        for (uint64_t i = 0; i < n; i++) {
+            q8_0_row_tab_build(tab + i * blocks, data + (rb + i) * row_bytes, blocks);
+        }
+        for (uint64_t tile = 0; tile < tiles->n_tiles; tile++) {
+            const uint8_t *xq16 = tiles->xq + (tile0 + tile) * blocks * 512;
+            const float *xs16 = tiles->xs + (tile0 + tile) * blocks * 16;
+            for (uint64_t r = 0; r < n; r += 4) {
+                const uint8_t *rows[4];
+                const q8_0_row_tab *tabs[4];
+                float res[4][16];
+                for (unsigned i = 0; i < 4; i++) {
+                    const uint64_t ri = r + i < n ? r + i : n - 1;
+                    rows[i] = data + (rb + ri) * row_bytes;
+                    tabs[i] = tab + ri * blocks;
+                }
+                q8_0_gemm_4x16(rows, tabs, xq16, xs16, blocks, res);
+                for (unsigned i = 0; i < 4 && r + i < n; i++) {
+                    for (unsigned j = 0; j < 16; j++) {
+                        out[(tile * 16 + j) * out_stride + rb + r + i] = res[i][j];
+                    }
+                }
+            }
+        }
+    }
+    free(tab);
+    return tiles->n_tiles * 16;
+}
+#endif
+
 static void matvec_q8_0_worker(void *vctx, uint64_t r0, uint64_t r1) {
     matvec_q8_0_ctx *ctx = vctx;
 
@@ -9922,6 +10135,17 @@ static void matvec_q8_0_grouped_worker(void *vctx, uint64_t r0, uint64_t r1) {
 
 static void matmul_q8_0_grouped_batch_worker(void *vctx, uint64_t r0, uint64_t r1) {
     matmul_q8_0_grouped_batch_ctx *ctx = vctx;
+    uint64_t t0 = 0;
+#if defined(DS4_NO_GPU) && defined(__AVX512VNNI__)
+    /* A row range may span groups, and each group has its own tiles. */
+    for (uint64_t g0 = r0; g0 < r1;) {
+        const uint64_t group = g0 / ctx->rank;
+        const uint64_t g1 = (group + 1) * ctx->rank < r1 ? (group + 1) * ctx->rank : r1;
+        t0 = matmul_q8_0_tiles_rows(ctx->out, ctx->n_groups * ctx->rank, ctx->data, g0, g1,
+                                    &ctx->tiles, group * ctx->tiles.n_tiles, ctx->blocks);
+        g0 = g1;
+    }
+#endif
 
     for (uint64_t idx = r0; idx < r1; idx++) {
         const uint64_t group = idx / ctx->rank;
@@ -9929,7 +10153,7 @@ static void matmul_q8_0_grouped_batch_worker(void *vctx, uint64_t r0, uint64_t r
         const uint64_t tensor_row = group * ctx->rank + row_in_group;
         const uint8_t *row = ctx->data + tensor_row * ctx->blocks * 34;
 
-        uint64_t t = 0;
+        uint64_t t = t0;
         for (; t + 1 < ctx->n_tok; t += 2) {
             const uint64_t xbase0 = (t * ctx->n_groups + group) * ctx->blocks;
             const uint64_t xbase1 = ((t + 1) * ctx->n_groups + group) * ctx->blocks;
@@ -9957,10 +10181,15 @@ static void matmul_q8_0_grouped_batch_worker(void *vctx, uint64_t r0, uint64_t r
 
 static void matmul_q8_0_batch_worker(void *vctx, uint64_t r0, uint64_t r1) {
     matmul_q8_0_batch_ctx *ctx = vctx;
+    uint64_t t0 = 0;
+#if defined(DS4_NO_GPU) && defined(__AVX512VNNI__)
+    t0 = matmul_q8_0_tiles_rows(ctx->out, ctx->out_dim, ctx->data, r0, r1,
+                                &ctx->tiles, 0, ctx->blocks);
+#endif
 
     for (uint64_t r = r0; r < r1; r++) {
         const uint8_t *row = ctx->data + r * ctx->blocks * 34;
-        uint64_t t = 0;
+        uint64_t t = t0;
         for (; t + 1 < ctx->n_tok; t += 2) {
             dot_q8_0_row_2(row,
                            ctx->xq + t * ctx->blocks * 32,
@@ -9985,11 +10214,18 @@ static void matmul_q8_0_batch_worker(void *vctx, uint64_t r0, uint64_t r1) {
 
 static void matmul_q8_0_pair_batch_worker(void *vctx, uint64_t r0, uint64_t r1) {
     matmul_q8_0_pair_batch_ctx *ctx = vctx;
+    uint64_t t0 = 0;
+#if defined(DS4_NO_GPU) && defined(__AVX512VNNI__)
+    matmul_q8_0_tiles_rows(ctx->out0, ctx->out_dim, ctx->data0, r0, r1,
+                           &ctx->tiles, 0, ctx->blocks);
+    t0 = matmul_q8_0_tiles_rows(ctx->out1, ctx->out_dim, ctx->data1, r0, r1,
+                                &ctx->tiles, 0, ctx->blocks);
+#endif
 
     for (uint64_t r = r0; r < r1; r++) {
         const uint8_t *row0 = ctx->data0 + r * ctx->blocks * 34;
         const uint8_t *row1 = ctx->data1 + r * ctx->blocks * 34;
-        uint64_t t = 0;
+        uint64_t t = t0;
         for (; t + 1 < ctx->n_tok; t += 2) {
             const int8_t *xq0 = ctx->xq + t * ctx->blocks * 32;
             const float *xscale0 = ctx->xscale + t * ctx->blocks;
@@ -10148,7 +10384,11 @@ static void matmul_q8_0_batch_prequant(
         .out_dim = w->dim[1],
         .blocks = (w->dim[0] + 31) / 32,
     };
+#if defined(DS4_NO_GPU) && defined(__AVX512VNNI__)
+    ctx.tiles = q8_0_tiles_pack(xq, xscale, n_tok, 1, ctx.in_dim, ctx.blocks);
+#endif
     ds4_parallel_for(ctx.out_dim, matmul_q8_0_batch_worker, &ctx);
+    q8_0_tiles_free(&ctx.tiles);
 }
 
 static void matmul_q8_0_pair_batch_prequant(
@@ -10179,7 +10419,11 @@ static void matmul_q8_0_pair_batch_prequant(
         .out_dim = w0->dim[1],
         .blocks = (w0->dim[0] + 31) / 32,
     };
+#if defined(DS4_NO_GPU) && defined(__AVX512VNNI__)
+    ctx.tiles = q8_0_tiles_pack(xq, xscale, n_tok, 1, ctx.in_dim, ctx.blocks);
+#endif
     ds4_parallel_for(ctx.out_dim, matmul_q8_0_pair_batch_worker, &ctx);
+    q8_0_tiles_free(&ctx.tiles);
 }
 
 /* Batched Q8_0 matmul for prefill: quantize all token activations, then scan
@@ -10455,15 +10699,8 @@ static void matmul_q8_0_grouped_batch(
     int8_t *xq = xmalloc((size_t)n_tok * n_groups * blocks * 32);
     float *xscale = xmalloc((size_t)n_tok * n_groups * blocks * sizeof(xscale[0]));
 
-    for (uint64_t t = 0; t < n_tok; t++) {
-        for (uint32_t g = 0; g < n_groups; g++) {
-            const uint64_t xbase = (t * n_groups + g) * blocks;
-            quantize_q8_0_activation(x + t * n_groups * group_dim + (uint64_t)g * group_dim,
-                                     xq + xbase * 32,
-                                     xscale + xbase,
-                                     group_dim);
-        }
-    }
+    /* The [token][group] activations quantize as n_tok * n_groups rows. */
+    quantize_q8_0_activation_batch(x, xq, xscale, n_tok * n_groups, group_dim);
 
     matmul_q8_0_grouped_batch_ctx ctx = {
         .out = out,
@@ -10476,7 +10713,11 @@ static void matmul_q8_0_grouped_batch(
         .blocks = blocks,
         .rank = rank,
     };
+#if defined(DS4_NO_GPU) && defined(__AVX512VNNI__)
+    ctx.tiles = q8_0_tiles_pack(xq, xscale, n_tok, n_groups, group_dim, blocks);
+#endif
     ds4_parallel_for((uint64_t)n_groups * rank, matmul_q8_0_grouped_batch_worker, &ctx);
+    q8_0_tiles_free(&ctx.tiles);
 
     free(xscale);
     free(xq);

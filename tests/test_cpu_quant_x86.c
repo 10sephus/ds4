@@ -726,6 +726,154 @@ static void check_f16c_scales(void) {
 }
 #endif
 
+#if defined(DS4_NO_GPU) && defined(__AVX512VNNI__)
+/* The tile GEMM converts Q8_0 block scales with F16C; every half pattern,
+ * including subnormals, infinities and both NaN kinds, must match the
+ * software conversion bit for bit. */
+static void check_q8_0_scale_f32(void) {
+    for (uint32_t h = 0; h < 65536; h++) {
+        const float expected = f16_to_f32((uint16_t)h);
+        const float actual = q8_0_scale_f32((uint16_t)h);
+        if (memcmp(&expected, &actual, sizeof(expected)) != 0) {
+            fprintf(stderr, "q8_0_scale_f32(%04x) differs from f16_to_f32\n", h);
+            exit(1);
+        }
+    }
+}
+
+/* Weight rows: random quants, block scales cycling through the special
+ * halves so a 4-row group mixes subnormal, huge, inf and NaN scales. */
+static void q8_0_fill_rows(uint8_t *data, uint64_t rows, uint64_t blocks, unsigned salt) {
+    static const uint16_t half[] = {0, 0x8000, 1, 0x8001, 0x03ff, 0x8400, 0x1801, 0x9a17,
+                                    0x3555, 0xba31, 0x7bff, 0xfbff, 0x7c00, 0x7c01, 0x7e00};
+    for (uint64_t r = 0; r < rows; r++) {
+        for (uint64_t b = 0; b < blocks; b++) {
+            uint8_t *block = data + (r * blocks + b) * 34;
+            const uint16_t scale = half[(r + 3 * b + salt) % (sizeof(half) / sizeof(*half))];
+            memcpy(block, &scale, sizeof(scale));
+            for (unsigned i = 0; i < 32; i++) block[2 + i] = (uint8_t)quant_random();
+        }
+    }
+}
+
+/* Activations: pattern 0 comes from the real quantizer, the others are
+ * adversarial quants (all 127, all -128, alternating, lane pattern, random)
+ * with cycling block scales, and garbage past in_dim inside the last block
+ * because neither path may read it. */
+static void q8_0_fill_activations(int8_t *xq, float *xscale, const float *x, unsigned pattern,
+                                  uint64_t n_tok, uint64_t in_dim, uint64_t blocks) {
+    static const float scales[] = {0.0f, -0.0f, 0x1p-140f, 0x1p-20f, 0.375f, -1.13f, 17.3f, 3.0e38f};
+    if (pattern == 0) {
+        quantize_q8_0_activation_batch(x, xq, xscale, n_tok, in_dim);
+        return;
+    }
+    for (uint64_t t = 0; t < n_tok; t++) {
+        for (uint64_t b = 0; b < blocks; b++) {
+            xscale[t * blocks + b] = scales[(t + b + pattern) % 8];
+        }
+        for (uint64_t i = 0; i < blocks * 32; i++) {
+            const int8_t v = i < in_dim ? quant_byte(pattern - 1, (unsigned)(i + 5 * t))
+                                        : (int8_t)quant_random();
+            xq[t * blocks * 32 + i] = v;
+        }
+    }
+}
+
+static void q8_0_expect_batch(const char *name, const float *out, const uint8_t *data,
+                              const int8_t *xq, const float *xscale, uint64_t n_tok,
+                              uint64_t out_stride, uint64_t col0, uint64_t rows,
+                              uint64_t in_dim, uint64_t blocks, unsigned pattern) {
+    for (uint64_t t = 0; t < n_tok; t++) {
+        for (uint64_t r = 0; r < rows; r++) {
+            const float expected = dot_q8_0_row(data + r * blocks * 34, xq + t * blocks * 32,
+                                                xscale + t * blocks, in_dim, blocks);
+            const float actual = out[t * out_stride + col0 + r];
+            /* The adversarial scales make an inf * 0 accumulator meet a quieted
+             * sNaN block product; which of the two NaNs survives the add is the
+             * operand order the compiler chose for a commutative add, not a
+             * property of either kernel (the 8-block row dot and the tile
+             * kernel pick differently), so two NaNs count as equal. */
+            if (expected != expected && actual != actual) continue;
+            quant_equal(name, expected, actual, (unsigned)blocks, pattern);
+        }
+    }
+}
+
+/* Whole batched matmuls (tile packing, row blocks, duplicate tail rows,
+ * tail tokens and groups) against one dot_q8_0_row per (row, token). */
+static void check_q8_0_batch(void) {
+    const uint64_t dims[] = {32, 64, 96, 100, 130, 200, 1024, 4096};
+    const uint64_t rows[] = {1, 3, 4, 5, 13, 64, 513};
+    const uint64_t toks[] = {1, 15, 16, 17, 32, 37, 48};
+    for (size_t d = 0; d < sizeof(dims) / sizeof(*dims); d++) {
+        const uint64_t in_dim = dims[d], blocks = (in_dim + 31) / 32;
+        for (size_t rr = 0; rr < sizeof(rows) / sizeof(*rows); rr++) {
+            const uint64_t n_rows = rows[rr];
+            if (n_rows > 64 && in_dim != 1024) continue;   /* one parallel shape is enough */
+            const size_t bytes = (size_t)n_rows * blocks * 34;
+            quant_buffer w0 = quant_alloc(2 * bytes);
+            q8_0_fill_rows(w0.data, 2 * n_rows, blocks, (unsigned)(d + rr));
+            const ds4_model m = {.map = w0.data, .size = 2 * bytes};
+            const ds4_tensor a = {.type = DS4_TENSOR_Q8_0, .ndim = 2, .dim = {in_dim, n_rows},
+                                  .elements = in_dim * n_rows, .bytes = bytes};
+            ds4_tensor b = a;
+            b.abs_offset = bytes;
+            for (size_t tt = 0; tt < sizeof(toks) / sizeof(*toks); tt++) {
+                const uint64_t n_tok = toks[tt];
+                quant_buffer xb = quant_alloc(n_tok * in_dim * sizeof(float));
+                quant_buffer qb = quant_alloc(n_tok * blocks * 32);
+                quant_buffer sb = quant_alloc(n_tok * blocks * sizeof(float));
+                quant_buffer o0 = quant_alloc(n_tok * n_rows * sizeof(float));
+                quant_buffer o1 = quant_alloc(n_tok * n_rows * sizeof(float));
+                float *x = (float *)xb.data, *out0 = (float *)o0.data, *out1 = (float *)o1.data;
+                int8_t *xq = (int8_t *)qb.data;
+                float *xscale = (float *)sb.data;
+                for (uint64_t i = 0; i < n_tok * in_dim; i++) {
+                    x[i] = (float)((int)(quant_random() % 2001) - 1000) * 0.00117f;
+                }
+                for (unsigned p = 0; p < 6; p++) {
+                    q8_0_fill_activations(xq, xscale, x, p, n_tok, in_dim, blocks);
+                    matmul_q8_0_batch_prequant(out0, &m, &a, xq, xscale, n_tok);
+                    q8_0_expect_batch("Q8_0 batch", out0, w0.data, xq, xscale, n_tok,
+                                      n_rows, 0, n_rows, in_dim, blocks, p);
+                    matmul_q8_0_pair_batch_prequant(out0, out1, &m, &a, &b, xq, xscale, n_tok);
+                    q8_0_expect_batch("Q8_0 pair 0", out0, w0.data, xq, xscale, n_tok,
+                                      n_rows, 0, n_rows, in_dim, blocks, p);
+                    q8_0_expect_batch("Q8_0 pair 1", out1, w0.data + bytes, xq, xscale, n_tok,
+                                      n_rows, 0, n_rows, in_dim, blocks, p);
+                }
+                /* Grouped: two groups of n_rows rows, activations [token][group]. */
+                quant_buffer gx = quant_alloc(n_tok * 2 * in_dim * sizeof(float));
+                quant_buffer gq = quant_alloc(n_tok * 2 * blocks * 32);
+                quant_buffer gs = quant_alloc(n_tok * 2 * blocks * sizeof(float));
+                quant_buffer go = quant_alloc(n_tok * 2 * n_rows * sizeof(float));
+                float *gxf = (float *)gx.data, *gout = (float *)go.data;
+                const ds4_tensor g = {.type = DS4_TENSOR_Q8_0, .ndim = 2, .dim = {in_dim, 2 * n_rows},
+                                      .elements = in_dim * 2 * n_rows, .bytes = 2 * bytes};
+                for (uint64_t i = 0; i < n_tok * 2 * in_dim; i++) {
+                    gxf[i] = (float)((int)(quant_random() % 2001) - 1000) * 0.00117f;
+                }
+                quantize_q8_0_activation_batch(gxf, (int8_t *)gq.data, (float *)gs.data,
+                                               n_tok * 2, in_dim);
+                matmul_q8_0_grouped_batch(gout, &m, &g, gxf, n_tok, 2, in_dim, n_rows);
+                for (unsigned group = 0; group < 2; group++) {
+                    for (uint64_t t = 0; t < n_tok; t++) {
+                        const uint64_t src = t * 2 + group;
+                        q8_0_expect_batch("Q8_0 grouped", gout + t * 2 * n_rows + group * n_rows,
+                                          w0.data + group * bytes, (int8_t *)gq.data + src * blocks * 32,
+                                          (float *)gs.data + src * blocks, 1, 0, 0, n_rows,
+                                          in_dim, blocks, group);
+                    }
+                }
+                quant_free(go); quant_free(gs); quant_free(gq); quant_free(gx);
+                quant_free(o1); quant_free(o0); quant_free(sb); quant_free(qb); quant_free(xb);
+            }
+            quant_free(w0);
+        }
+    }
+}
+#endif
+
 
 /* The pool hands rows out in chunks claimed by whichever thread is free, so
  * check that every row of every dispatch is claimed exactly once and never in
@@ -1282,6 +1430,17 @@ int main(void) {
     puts("CPU indexer row-parallel scoring and top-k selection oracle PASS");
     check_attention_lanes();
     puts("CPU lane-wise decode attention bitwise oracle: 1/3/8 threads PASS");
+#if defined(DS4_NO_GPU) && defined(__AVX512VNNI__)
+    check_q8_0_scale_f32();
+    const uint32_t threads[] = {1, 3, 16};
+    for (size_t i = 0; i < sizeof(threads) / sizeof(*threads); i++) {
+        g_requested_threads = threads[i];
+        check_q8_0_batch();
+        ds4_threads_shutdown();
+    }
+    g_requested_threads = 0;
+    puts("CPU AVX-512 VNNI Q8_0 tile GEMM bitwise against dot_q8_0_row PASS");
+#endif
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     puts("CPU ARM DOTPROD Q2_K integer oracle PASS");
     puts("Block FP oracle skipped: existing ARM DOTPROD accumulation order differs");
