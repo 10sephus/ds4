@@ -5,6 +5,7 @@
 
 #if defined(__clang__)
 #pragma float_control(precise, on, push)
+#pragma clang fp contract(off)
 #elif defined(__GNUC__)
 #pragma GCC push_options
 #pragma GCC optimize ("no-fast-math", "fp-contract=off")
