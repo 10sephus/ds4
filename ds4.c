@@ -1146,7 +1146,6 @@ typedef struct {
     float *index_comp;
     float *comp_kv_cur;
     float *comp_sc_cur;
-    float *comp_pooled;
 
     bool *index_allowed;
     float *index_q;
@@ -14927,7 +14926,6 @@ static void cpu_decode_scratch_init(ds4_cpu_decode_scratch *scratch, uint32_t ct
     scratch->index_comp = xmalloc((size_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float));
     scratch->comp_kv_cur = xmalloc((size_t)2u * DS4_N_HEAD_DIM * sizeof(float));
     scratch->comp_sc_cur = xmalloc((size_t)2u * DS4_N_HEAD_DIM * sizeof(float));
-    scratch->comp_pooled = xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(float));
 
     scratch->index_allowed = xmalloc((size_t)comp_cap * sizeof(bool));
     scratch->index_q = xmalloc((size_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
@@ -14994,7 +14992,6 @@ static void cpu_decode_scratch_free(ds4_cpu_decode_scratch *scratch) {
     free(scratch->index_qt);
     free(scratch->index_q);
     free(scratch->index_allowed);
-    free(scratch->comp_pooled);
     free(scratch->comp_sc_cur);
     free(scratch->comp_kv_cur);
     free(scratch->index_comp);
@@ -15201,30 +15198,14 @@ static void compressor_pool_decode_state(
     }
 }
 
-/* Streaming compressor update for one token.  It projects kv/score rows,
- * updates the rolling state, and emits a compressed KV row on ratio boundaries. */
-static bool compressor_decode_one(
-        float                   * out_comp,
-        const ds4_model         * model,
-        const ds4_tensor        * wkv,
-        const ds4_tensor        * wgate,
-        const ds4_tensor        * ape,
-        const ds4_tensor        * norm,
-        const float             * x,
-        float                   * state_kv,
-        float                   * state_score,
-        uint32_t                  head_dim,
-        uint32_t                  compress_ratio,
-        uint32_t                  il,
-        uint32_t                  pos) {
-    const uint32_t coff = compress_ratio == 4 ? 2u : 1u;
-    const uint32_t width = coff * head_dim;
-    const uint32_t pos_mod = pos % compress_ratio;
-    const uint32_t row = compress_ratio == 4 ? compress_ratio + pos_mod : pos_mod;
-    const bool should_compress = ((pos + 1) % compress_ratio) == 0;
-
-    float *kv_cur = xmalloc((size_t)width * sizeof(kv_cur[0]));
-    float *sc_cur = xmalloc((size_t)width * sizeof(sc_cur[0]));
+/* Project one token's compressor inputs: kv_cur = W_kv x, sc_cur = W_gate x. */
+static void compressor_project_one(
+        float            * kv_cur,
+        float            * sc_cur,
+        const ds4_model  * model,
+        const ds4_tensor * wkv,
+        const ds4_tensor * wgate,
+        const float      * x) {
     if (wkv->type == 8 &&
         wgate->type == 8 &&
         wkv->ndim == 2 &&
@@ -15244,6 +15225,89 @@ static bool compressor_decode_one(
         matvec_any(kv_cur, model, wkv, x);
         matvec_any(sc_cur, model, wgate, x);
     }
+}
+
+typedef struct {
+    float          * out;
+    const uint16_t * w;
+    const float    * x;
+    uint64_t         in_dim;
+    uint32_t         width;
+    uint32_t         n_tok;
+} compressor_project_batch_ctx;
+
+static void compressor_project_batch_worker(void *vctx, uint64_t r0, uint64_t r1) {
+    const compressor_project_batch_ctx *ctx = vctx;
+    for (uint64_t o = r0; o < r1; o++) {
+        const uint16_t *row = ctx->w + o * ctx->in_dim;
+        for (uint32_t t = 0; t < ctx->n_tok; t++) {
+            ctx->out[(uint64_t)t * ctx->width + o] =
+                dot_f16_row(row, ctx->x + (uint64_t)t * ctx->in_dim, ctx->in_dim);
+        }
+    }
+}
+
+/* Prefill compressor projections for all tokens at once, row-outer so each
+ * F16 weight row is read once instead of once per token and the thread pool
+ * is dispatched once per matrix instead of twice per token.  Every element is
+ * the same dot_f16_row() call the per-token path makes, so the rows are
+ * bit-identical.  Other weight types keep the per-token projection. */
+static void compressor_project_batch(
+        float            * kv_all,
+        float            * sc_all,
+        const ds4_model  * model,
+        const ds4_tensor * wkv,
+        const ds4_tensor * wgate,
+        const float      * x,
+        uint32_t           n_tok) {
+    const uint64_t in_dim = wkv->dim[0];
+    const uint32_t width = (uint32_t)wkv->dim[1];
+    if (wkv->type != 1 || wgate->type != 1 || wkv->ndim != 2 || wgate->ndim != 2 ||
+        wgate->dim[0] != in_dim || wgate->dim[1] != width) {
+        for (uint32_t t = 0; t < n_tok; t++) {
+            compressor_project_one(kv_all + (uint64_t)t * width,
+                                   sc_all + (uint64_t)t * width,
+                                   model, wkv, wgate, x + (uint64_t)t * in_dim);
+        }
+        return;
+    }
+
+    compressor_project_batch_ctx ctx = {
+        .out = kv_all,
+        .w = tensor_data(model, wkv),
+        .x = x,
+        .in_dim = in_dim,
+        .width = width,
+        .n_tok = n_tok,
+    };
+    ds4_parallel_for_min_rows(width, compressor_project_batch_worker, &ctx, 1);
+    ctx.out = sc_all;
+    ctx.w = tensor_data(model, wgate);
+    ds4_parallel_for_min_rows(width, compressor_project_batch_worker, &ctx, 1);
+}
+
+/* Streaming compressor update for one token given its projected rows.  It
+ * adds the position embedding, stores both rows in the rolling state and, on
+ * ratio boundaries, pools the window into out_comp, normalizes it in place,
+ * ropes and quantizes it, returning true when a compressed row was emitted. */
+static bool compressor_update_one(
+        float            * out_comp,
+        const ds4_model  * model,
+        const ds4_tensor * ape,
+        const ds4_tensor * norm,
+        const float      * kv_cur,
+        float            * sc_cur,
+        float            * state_kv,
+        float            * state_score,
+        uint32_t           head_dim,
+        uint32_t           compress_ratio,
+        uint32_t           il,
+        uint32_t           pos) {
+    const uint32_t coff = compress_ratio == 4 ? 2u : 1u;
+    const uint32_t width = coff * head_dim;
+    const uint32_t pos_mod = pos % compress_ratio;
+    const uint32_t row = compress_ratio == 4 ? compress_ratio + pos_mod : pos_mod;
+    const bool should_compress = ((pos + 1) % compress_ratio) == 0;
 
     for (uint32_t j = 0; j < width; j++) {
         sc_cur[j] += tensor_2d_value(model, ape, j, pos_mod);
@@ -15252,21 +15316,17 @@ static bool compressor_decode_one(
     memcpy(state_kv + (uint64_t)row * width, kv_cur, (size_t)width * sizeof(kv_cur[0]));
     memcpy(state_score + (uint64_t)row * width, sc_cur, (size_t)width * sizeof(sc_cur[0]));
 
-    free(sc_cur);
-    free(kv_cur);
-
     if (!should_compress) {
         return false;
     }
 
-    float *pooled = xmalloc((size_t)head_dim * sizeof(pooled[0]));
-    compressor_pool_decode_state(pooled, state_kv, state_score, head_dim, compress_ratio);
+    compressor_pool_decode_state(out_comp, state_kv, state_score, head_dim, compress_ratio);
 
     double ss = 0.0;
-    for (uint32_t i = 0; i < head_dim; i++) ss += (double)pooled[i] * pooled[i];
+    for (uint32_t i = 0; i < head_dim; i++) ss += (double)out_comp[i] * out_comp[i];
     const float rms = 1.0f / sqrtf((float)(ss / (double)head_dim) + DS4_RMS_EPS);
     for (uint32_t i = 0; i < head_dim; i++) {
-        out_comp[i] = pooled[i] * rms * tensor_1d_value(model, norm, i);
+        out_comp[i] = out_comp[i] * rms * tensor_1d_value(model, norm, i);
     }
 
     const uint32_t comp_pos = pos + 1 - compress_ratio;
@@ -15296,8 +15356,37 @@ static bool compressor_decode_one(
         }
     }
 
-    free(pooled);
     return true;
+}
+
+/* Streaming compressor update for one token.  It projects kv/score rows,
+ * updates the rolling state, and emits a compressed KV row on ratio boundaries. */
+static bool compressor_decode_one(
+        float                   * out_comp,
+        const ds4_model         * model,
+        const ds4_tensor        * wkv,
+        const ds4_tensor        * wgate,
+        const ds4_tensor        * ape,
+        const ds4_tensor        * norm,
+        const float             * x,
+        float                   * state_kv,
+        float                   * state_score,
+        uint32_t                  head_dim,
+        uint32_t                  compress_ratio,
+        uint32_t                  il,
+        uint32_t                  pos) {
+    const uint32_t width = (compress_ratio == 4 ? 2u : 1u) * head_dim;
+    float *kv_cur = xmalloc((size_t)width * sizeof(kv_cur[0]));
+    float *sc_cur = xmalloc((size_t)width * sizeof(sc_cur[0]));
+
+    compressor_project_one(kv_cur, sc_cur, model, wkv, wgate, x);
+    const bool emitted = compressor_update_one(out_comp, model, ape, norm, kv_cur, sc_cur,
+                                               state_kv, state_score,
+                                               head_dim, compress_ratio, il, pos);
+
+    free(sc_cur);
+    free(kv_cur);
+    return emitted;
 }
 
 static bool compressor_decode_one_decode_scratch(
@@ -15315,12 +15404,7 @@ static bool compressor_decode_one_decode_scratch(
         uint32_t                 il,
         uint32_t                 pos,
         ds4_cpu_decode_scratch * scratch) {
-    const uint32_t coff = compress_ratio == 4 ? 2u : 1u;
-    const uint32_t width = coff * head_dim;
-    const uint32_t pos_mod = pos % compress_ratio;
-    const uint32_t row = compress_ratio == 4 ? compress_ratio + pos_mod : pos_mod;
-    const bool should_compress = ((pos + 1) % compress_ratio) == 0;
-
+    const uint32_t width = (compress_ratio == 4 ? 2u : 1u) * head_dim;
     if (width > 2u * DS4_N_HEAD_DIM) ds4_die("compressor scratch width is outside the fixed model layout");
     float *kv_cur = scratch->comp_kv_cur;
     float *sc_cur = scratch->comp_sc_cur;
@@ -15336,55 +15420,9 @@ static bool compressor_decode_one_decode_scratch(
         matvec_any_decode_scratch(sc_cur, model, wgate, x, scratch);
     }
 
-    for (uint32_t j = 0; j < width; j++) {
-        sc_cur[j] += tensor_2d_value(model, ape, j, pos_mod);
-    }
-
-    memcpy(state_kv + (uint64_t)row * width, kv_cur, (size_t)width * sizeof(kv_cur[0]));
-    memcpy(state_score + (uint64_t)row * width, sc_cur, (size_t)width * sizeof(sc_cur[0]));
-
-    if (!should_compress) {
-        return false;
-    }
-
-    float *pooled = scratch->comp_pooled;
-    compressor_pool_decode_state(pooled, state_kv, state_score, head_dim, compress_ratio);
-
-    double ss = 0.0;
-    for (uint32_t i = 0; i < head_dim; i++) ss += (double)pooled[i] * pooled[i];
-    const float rms = 1.0f / sqrtf((float)(ss / (double)head_dim) + DS4_RMS_EPS);
-    for (uint32_t i = 0; i < head_dim; i++) {
-        out_comp[i] = pooled[i] * rms * tensor_1d_value(model, norm, i);
-    }
-
-    const uint32_t comp_pos = pos + 1 - compress_ratio;
-    rope_tail_layer_inplace(out_comp, 1, head_dim, DS4_N_ROT, comp_pos, il, false);
-    if (head_dim == DS4_N_HEAD_DIM) {
-        dsv4_fp8_kv_quantize_row_inplace_cpu(out_comp, head_dim, DS4_N_ROT);
-    } else if (head_dim == DS4_N_INDEXER_HEAD_DIM) {
-        dsv4_indexer_qat_row_inplace_cpu(out_comp, head_dim);
-    }
-
-    if (compress_ratio == 4) {
-        for (uint32_t r = 0; r < compress_ratio; r++) {
-            memcpy(state_kv + (uint64_t)r * width,
-                   state_kv + (uint64_t)(compress_ratio + r) * width,
-                   (size_t)width * sizeof(state_kv[0]));
-            memcpy(state_score + (uint64_t)r * width,
-                   state_score + (uint64_t)(compress_ratio + r) * width,
-                   (size_t)width * sizeof(state_score[0]));
-        }
-        for (uint32_t r = 0; r < compress_ratio; r++) {
-            memcpy(state_kv + (uint64_t)(compress_ratio + r) * width,
-                   state_kv + (uint64_t)r * width,
-                   (size_t)width * sizeof(state_kv[0]));
-            memcpy(state_score + (uint64_t)(compress_ratio + r) * width,
-                   state_score + (uint64_t)r * width,
-                   (size_t)width * sizeof(state_score[0]));
-        }
-    }
-
-    return true;
+    return compressor_update_one(out_comp, model, ape, norm, kv_cur, sc_cur,
+                                 state_kv, state_score,
+                                 head_dim, compress_ratio, il, pos);
 }
 
 /* Attention over raw SWA rows plus optional compressed rows.  Ratio-4 layers
@@ -16246,17 +16284,40 @@ static void layer_attention_raw_swa_batch(
 
     t0 = profile ? now_sec() : 0.0;
     const uint32_t ratio = cache->compress_ratio;
+    const uint32_t comp_width = (ratio == 4 ? 2u : 1u) * DS4_N_HEAD_DIM;
+    const uint32_t index_width = 2u * DS4_N_INDEXER_HEAD_DIM;
     uint32_t *comp_counts = xcalloc((size_t)n_tok, sizeof(comp_counts[0]));
     uint8_t *allowed_mask = ratio == 4 ? xcalloc((size_t)n_tok, sizeof(allowed_mask[0])) : NULL;
     uint8_t *allowed_bits = NULL;
     const uint64_t allowed_stride = ratio == 4 ? ((uint64_t)cache->comp_cap + 7u) / 8u : 0;
-    float *comp = ratio != 0 ? xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(comp[0])) : NULL;
-    float *index_comp = ratio == 4 ? xmalloc((size_t)DS4_N_INDEXER_HEAD_DIM * sizeof(index_comp[0])) : NULL;
+    float *comp = NULL, *comp_rows = NULL, *comp_scores = NULL;
+    float *index_comp = NULL, *index_rows = NULL, *index_scores = NULL;
 
     double tx = profile ? now_sec() : 0.0;
     rope_tail_layer_batch_inplace(q, q_dim, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, 0, il, false, n_tok);
     rope_tail_layer_batch_inplace(kv, DS4_N_HEAD_DIM, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, 0, il, false, n_tok);
     if (profile) t_tl_rope_cache += now_sec() - tx;
+
+    if (ratio != 0) {
+        tx = profile ? now_sec() : 0.0;
+        comp = xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(comp[0]));
+        comp_rows = xmalloc((size_t)n_tok * comp_width * sizeof(comp_rows[0]));
+        comp_scores = xmalloc((size_t)n_tok * comp_width * sizeof(comp_scores[0]));
+        compressor_project_batch(comp_rows, comp_scores, model,
+                                 layer->attn_compressor_kv,
+                                 layer->attn_compressor_gate,
+                                 attn_norm, n_tok);
+        if (ratio == 4) {
+            index_comp = xmalloc((size_t)DS4_N_INDEXER_HEAD_DIM * sizeof(index_comp[0]));
+            index_rows = xmalloc((size_t)n_tok * index_width * sizeof(index_rows[0]));
+            index_scores = xmalloc((size_t)n_tok * index_width * sizeof(index_scores[0]));
+            compressor_project_batch(index_rows, index_scores, model,
+                                     layer->indexer_compressor_kv,
+                                     layer->indexer_compressor_gate,
+                                     attn_norm, n_tok);
+        }
+        if (profile) t_tl_compress += now_sec() - tx;
+    }
 
     for (uint32_t t = 0; t < n_tok; t++) {
         float *kv_t = kv + (uint64_t)t * DS4_N_HEAD_DIM;
@@ -16273,12 +16334,11 @@ static void layer_attention_raw_swa_batch(
         if (ratio == 0) continue;
 
         tx = profile ? now_sec() : 0.0;
-        if (compressor_decode_one(comp, model,
-                                  layer->attn_compressor_kv,
-                                  layer->attn_compressor_gate,
+        if (compressor_update_one(comp, model,
                                   layer->attn_compressor_ape,
                                   layer->attn_compressor_norm,
-                                  attn_norm + (uint64_t)t * DS4_N_EMBD,
+                                  comp_rows + (uint64_t)t * comp_width,
+                                  comp_scores + (uint64_t)t * comp_width,
                                   cache->attn_state_kv,
                                   cache->attn_state_score,
                                   DS4_N_HEAD_DIM,
@@ -16289,12 +16349,11 @@ static void layer_attention_raw_swa_batch(
         }
 
         if (ratio == 4) {
-            if (compressor_decode_one(index_comp, model,
-                                      layer->indexer_compressor_kv,
-                                      layer->indexer_compressor_gate,
+            if (compressor_update_one(index_comp, model,
                                       layer->indexer_compressor_ape,
                                       layer->indexer_compressor_norm,
-                                      attn_norm + (uint64_t)t * DS4_N_EMBD,
+                                      index_rows + (uint64_t)t * index_width,
+                                      index_scores + (uint64_t)t * index_width,
                                       cache->index_state_kv,
                                       cache->index_state_score,
                                       DS4_N_INDEXER_HEAD_DIM,
@@ -16373,7 +16432,11 @@ static void layer_attention_raw_swa_batch(
         }
     }
 
+    free(index_scores);
+    free(index_rows);
     free(index_comp);
+    free(comp_scores);
+    free(comp_rows);
     free(comp);
     free(allowed_bits);
     free(allowed_mask);

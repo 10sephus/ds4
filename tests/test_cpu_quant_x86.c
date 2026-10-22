@@ -1132,6 +1132,58 @@ static void check_f16_round_trip(void) {
     }
 }
 
+/* Batched compressor projections must reproduce the per-token dot bit for bit,
+ * for F16 weights (batched kernel) and for other types (per-token fallback). */
+static void check_compressor_project_batch(void) {
+    const uint64_t in_dim = 70;
+    const uint32_t width = 9, n_tok = 5;
+    const size_t half_bytes = (size_t)in_dim * width * sizeof(uint16_t);
+    const size_t f32_bytes = (size_t)in_dim * width * sizeof(float);
+    quant_buffer wb = quant_alloc(2 * half_bytes + 2 * f32_bytes);
+    uint16_t *wkv = (uint16_t *)wb.data, *wgate = wkv + in_dim * width;
+    float *fkv = (float *)(wb.data + 2 * half_bytes), *fgate = fkv + in_dim * width;
+    for (uint64_t i = 0; i < in_dim * width; i++) {
+        wkv[i] = quant_half_finite(); wgate[i] = quant_half_finite();
+        fkv[i] = quant_float(); fgate[i] = quant_float();
+    }
+    float *x = xmalloc((size_t)n_tok * in_dim * sizeof(x[0]));
+    for (uint64_t i = 0; i < (uint64_t)n_tok * in_dim; i++) x[i] = quant_float();
+    float *kv_all = xmalloc((size_t)n_tok * width * sizeof(kv_all[0]));
+    float *sc_all = xmalloc((size_t)n_tok * width * sizeof(sc_all[0]));
+    float *expected = xmalloc((size_t)width * sizeof(expected[0]));
+
+    ds4_model m = {.map = wb.data, .size = wb.size};
+    ds4_tensor tkv = {.type = DS4_TENSOR_F16, .ndim = 2, .dim = {in_dim, width},
+                      .abs_offset = 0, .elements = in_dim * width, .bytes = half_bytes};
+    ds4_tensor tgate = tkv;
+    tgate.abs_offset = half_bytes;
+    compressor_project_batch(kv_all, sc_all, &m, &tkv, &tgate, x, n_tok);
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t o = 0; o < width; o++) {
+            quant_bits_equal("F16 compressor kv", dot_f16_row(wkv + o * in_dim, x + t * in_dim, in_dim),
+                             kv_all[t * width + o], t * width + o);
+            quant_bits_equal("F16 compressor gate", dot_f16_row(wgate + o * in_dim, x + t * in_dim, in_dim),
+                             sc_all[t * width + o], t * width + o);
+        }
+    }
+
+    ds4_tensor fkv_t = {.type = DS4_TENSOR_F32, .ndim = 2, .dim = {in_dim, width},
+                        .abs_offset = 2 * half_bytes, .elements = in_dim * width, .bytes = f32_bytes};
+    ds4_tensor fgate_t = fkv_t;
+    fgate_t.abs_offset = 2 * half_bytes + f32_bytes;
+    compressor_project_batch(kv_all, sc_all, &m, &fkv_t, &fgate_t, x, n_tok);
+    for (uint32_t t = 0; t < n_tok; t++) {
+        matvec_any(expected, &m, &fkv_t, x + t * in_dim);
+        for (uint32_t o = 0; o < width; o++)
+            quant_bits_equal("F32 compressor kv", expected[o], kv_all[t * width + o], t * width + o);
+        matvec_any(expected, &m, &fgate_t, x + t * in_dim);
+        for (uint32_t o = 0; o < width; o++)
+            quant_bits_equal("F32 compressor gate", expected[o], sc_all[t * width + o], t * width + o);
+    }
+    free(expected); free(sc_all); free(kv_all); free(x);
+    quant_free(wb);
+}
+
 /* Prefix prefill attention must match the per-token attention each token
  * would run against its raw window and the compressed rows pushed so far,
  * with and without an indexer mask. */
@@ -1209,8 +1261,9 @@ static void check_prefix_attention(void) {
 int main(void) {
     check_thread_pool();
     check_f16_round_trip();
+    check_compressor_project_batch();
     check_prefix_attention();
-    puts("CPU prefix attention bitwise oracle PASS");
+    puts("CPU prefill compressor batch and prefix attention bitwise oracles PASS");
     check_integer_dots();
     check_iq2_tables();
 #if defined(DS4_NO_GPU) && defined(__AVX2__) && defined(__F16C__)
