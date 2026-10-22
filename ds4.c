@@ -10092,12 +10092,26 @@ typedef struct {
     uint64_t rank;
 } matmul_q8_0_grouped_batch_ctx;
 
+/* Work items of the tiled Q8_0 batch matmuls: row_block weight rows against
+ * tile_block activation tiles, which stay in L2 together.  The pool's own
+ * claims are sized for matvecs (one to three rows of the small projections
+ * at 40 threads), and every claim streamed all the tiles of the prompt past
+ * its few rows, so those matmuls were bound by L3 bandwidth.  Items run
+ * row-block major: the NUMA halves of the items are the halves of the rows. */
+typedef struct {
+    uint64_t row_block;   /* rows per item, a multiple of 4 */
+    uint64_t tile_block;  /* tiles per item */
+    uint64_t n_tb;        /* tile blocks per row block */
+    uint64_t n_items;
+} q8_0_tile_grid;
+
 typedef struct {
     float *out;
     const uint8_t *data;
     const int8_t *xq;
     const float *xscale;
     q8_0_tiles tiles;
+    q8_0_tile_grid grid;
     uint64_t n_tok;
     uint64_t in_dim;
     uint64_t out_dim;
@@ -10112,6 +10126,7 @@ typedef struct {
     const int8_t *xq;
     const float *xscale;
     q8_0_tiles tiles;
+    q8_0_tile_grid grid;
     uint64_t n_tok;
     uint64_t in_dim;
     uint64_t out_dim;
@@ -10658,7 +10673,7 @@ static void q8_0_gemm_4x16(
  * read from DRAM once per matmul.  The last 4-row group may run past r1 on a
  * duplicate of the last row; those results are not stored.  Returns the
  * first token not covered by a tile. */
-static uint64_t matmul_q8_0_tiles_rows(
+static uint64_t matmul_q8_0_tiles_range(
         float            *out,
         uint64_t          out_stride,
         const uint8_t    *data,
@@ -10666,6 +10681,8 @@ static uint64_t matmul_q8_0_tiles_rows(
         uint64_t          r1,
         const q8_0_tiles *tiles,
         uint64_t          tile0,
+        uint64_t          tile_lo,
+        uint64_t          tile_hi,
         uint64_t          blocks) {
     if (tiles->n_tiles == 0) return 0;
 
@@ -10679,7 +10696,7 @@ static uint64_t matmul_q8_0_tiles_rows(
         for (uint64_t i = 0; i < n; i++) {
             q8_0_row_tab_build(tab + i * blocks, data + (rb + i) * row_bytes, blocks);
         }
-        for (uint64_t tile = 0; tile < tiles->n_tiles; tile++) {
+        for (uint64_t tile = tile_lo; tile < tile_hi; tile++) {
             const uint8_t *xq16 = tiles->xq + (tile0 + tile) * blocks * 512;
             const float *xs16 = tiles->xs + (tile0 + tile) * blocks * 16;
             for (uint64_t r = 0; r < n; r += 4) {
@@ -10703,7 +10720,37 @@ static uint64_t matmul_q8_0_tiles_rows(
     free(tab);
     return tiles->n_tiles * 16;
 }
+
+static uint64_t matmul_q8_0_tiles_rows(
+        float            *out,
+        uint64_t          out_stride,
+        const uint8_t    *data,
+        uint64_t          r0,
+        uint64_t          r1,
+        const q8_0_tiles *tiles,
+        uint64_t          tile0,
+        uint64_t          blocks) {
+    return matmul_q8_0_tiles_range(out, out_stride, data, r0, r1, tiles, tile0,
+                                   0, tiles->n_tiles, blocks);
+}
 #endif
+
+/* About 256 KB of tiles per item, and items of 32 rows unless that leaves
+ * fewer than four items per thread. */
+static q8_0_tile_grid q8_0_tile_grid_make(uint64_t out_dim, uint64_t n_tiles, uint64_t blocks) {
+    ds4_threads_init();
+    q8_0_tile_grid g;
+    g.tile_block = (256 * 1024) / (blocks * (512 + 16 * sizeof(float)));
+    if (g.tile_block < 1) g.tile_block = 1;
+    g.n_tb = n_tiles ? (n_tiles + g.tile_block - 1) / g.tile_block : 1;
+    g.row_block = 32;
+    const uint64_t want = 4u * g_pool.n_threads;
+    while (g.row_block > 4 && (out_dim + g.row_block - 1) / g.row_block * g.n_tb < want) {
+        g.row_block /= 2;
+    }
+    g.n_items = (out_dim + g.row_block - 1) / g.row_block * g.n_tb;
+    return g;
+}
 
 static void matvec_q8_0_worker(void *vctx, uint64_t r0, uint64_t r1) {
     matvec_q8_0_ctx *ctx = vctx;
@@ -10786,13 +10833,15 @@ static void matmul_q8_0_grouped_batch_worker(void *vctx, uint64_t r0, uint64_t r
     }
 }
 
-static void matmul_q8_0_batch_worker(void *vctx, uint64_t r0, uint64_t r1) {
-    matmul_q8_0_batch_ctx *ctx = vctx;
+static void matmul_q8_0_batch_rows(matmul_q8_0_batch_ctx *ctx, uint64_t r0, uint64_t r1, uint64_t tb) {
     uint64_t t0 = 0;
 #if defined(DS4_NO_GPU) && defined(__AVX512VNNI__)
-    t0 = matmul_q8_0_tiles_rows(ctx->out, ctx->out_dim, ctx->data, r0, r1,
-                                &ctx->tiles, 0, ctx->blocks);
+    const uint64_t lo = tb * ctx->grid.tile_block;
+    const uint64_t hi = lo + ctx->grid.tile_block < ctx->tiles.n_tiles ? lo + ctx->grid.tile_block : ctx->tiles.n_tiles;
+    t0 = matmul_q8_0_tiles_range(ctx->out, ctx->out_dim, ctx->data, r0, r1,
+                                 &ctx->tiles, 0, lo, hi, ctx->blocks);
 #endif
+    if (tb != 0) return;   /* the tokens past the tiles go with tile block 0 */
 
     for (uint64_t r = r0; r < r1; r++) {
         const uint8_t *row = ctx->data + r * ctx->blocks * 34;
@@ -10819,15 +10868,27 @@ static void matmul_q8_0_batch_worker(void *vctx, uint64_t r0, uint64_t r1) {
     }
 }
 
-static void matmul_q8_0_pair_batch_worker(void *vctx, uint64_t r0, uint64_t r1) {
-    matmul_q8_0_pair_batch_ctx *ctx = vctx;
+static void matmul_q8_0_batch_worker(void *vctx, uint64_t i0, uint64_t i1) {
+    matmul_q8_0_batch_ctx *ctx = vctx;
+    for (uint64_t item = i0; item < i1; item++) {
+        const uint64_t rb = item / ctx->grid.n_tb;
+        const uint64_t r0 = rb * ctx->grid.row_block;
+        const uint64_t r1 = r0 + ctx->grid.row_block < ctx->out_dim ? r0 + ctx->grid.row_block : ctx->out_dim;
+        matmul_q8_0_batch_rows(ctx, r0, r1, item - rb * ctx->grid.n_tb);
+    }
+}
+
+static void matmul_q8_0_pair_batch_rows(matmul_q8_0_pair_batch_ctx *ctx, uint64_t r0, uint64_t r1, uint64_t tb) {
     uint64_t t0 = 0;
 #if defined(DS4_NO_GPU) && defined(__AVX512VNNI__)
-    matmul_q8_0_tiles_rows(ctx->out0, ctx->out_dim, ctx->data0, r0, r1,
-                           &ctx->tiles, 0, ctx->blocks);
-    t0 = matmul_q8_0_tiles_rows(ctx->out1, ctx->out_dim, ctx->data1, r0, r1,
-                                &ctx->tiles, 0, ctx->blocks);
+    const uint64_t lo = tb * ctx->grid.tile_block;
+    const uint64_t hi = lo + ctx->grid.tile_block < ctx->tiles.n_tiles ? lo + ctx->grid.tile_block : ctx->tiles.n_tiles;
+    matmul_q8_0_tiles_range(ctx->out0, ctx->out_dim, ctx->data0, r0, r1,
+                            &ctx->tiles, 0, lo, hi, ctx->blocks);
+    t0 = matmul_q8_0_tiles_range(ctx->out1, ctx->out_dim, ctx->data1, r0, r1,
+                                 &ctx->tiles, 0, lo, hi, ctx->blocks);
 #endif
+    if (tb != 0) return;
 
     for (uint64_t r = r0; r < r1; r++) {
         const uint8_t *row0 = ctx->data0 + r * ctx->blocks * 34;
@@ -10852,6 +10913,16 @@ static void matmul_q8_0_pair_batch_worker(void *vctx, uint64_t r0, uint64_t r1) 
                               ctx->out0 + t * ctx->out_dim + r,
                               ctx->out1 + t * ctx->out_dim + r);
         }
+    }
+}
+
+static void matmul_q8_0_pair_batch_worker(void *vctx, uint64_t i0, uint64_t i1) {
+    matmul_q8_0_pair_batch_ctx *ctx = vctx;
+    for (uint64_t item = i0; item < i1; item++) {
+        const uint64_t rb = item / ctx->grid.n_tb;
+        const uint64_t r0 = rb * ctx->grid.row_block;
+        const uint64_t r1 = r0 + ctx->grid.row_block < ctx->out_dim ? r0 + ctx->grid.row_block : ctx->out_dim;
+        matmul_q8_0_pair_batch_rows(ctx, r0, r1, item - rb * ctx->grid.n_tb);
     }
 }
 
@@ -10994,7 +11065,8 @@ static void matmul_q8_0_batch_prequant(
 #if defined(DS4_NO_GPU) && defined(__AVX512VNNI__)
     ctx.tiles = q8_0_tiles_pack(xq, xscale, n_tok, 1, ctx.in_dim, ctx.blocks);
 #endif
-    ds4_parallel_for(ctx.out_dim, matmul_q8_0_batch_worker, &ctx);
+    ctx.grid = q8_0_tile_grid_make(ctx.out_dim, ctx.tiles.n_tiles, ctx.blocks);
+    ds4_parallel_for_min_rows(ctx.grid.n_items, matmul_q8_0_batch_worker, &ctx, 2);
     q8_0_tiles_free(&ctx.tiles);
 }
 
@@ -11029,7 +11101,8 @@ static void matmul_q8_0_pair_batch_prequant(
 #if defined(DS4_NO_GPU) && defined(__AVX512VNNI__)
     ctx.tiles = q8_0_tiles_pack(xq, xscale, n_tok, 1, ctx.in_dim, ctx.blocks);
 #endif
-    ds4_parallel_for(ctx.out_dim, matmul_q8_0_pair_batch_worker, &ctx);
+    ctx.grid = q8_0_tile_grid_make(ctx.out_dim, ctx.tiles.n_tiles, ctx.blocks);
+    ds4_parallel_for_min_rows(ctx.grid.n_items, matmul_q8_0_pair_batch_worker, &ctx, 2);
     q8_0_tiles_free(&ctx.tiles);
 }
 
