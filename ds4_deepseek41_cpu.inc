@@ -522,14 +522,13 @@ static void ds41_cpu_ffn_graph_stages(ds41_cpu_ffn_graph *g, ds41_cpu_state *s,
     /* Independent stages first: a thread waits at the first stage whose
      * inputs are not ready.  The gate/up rows of each expert are their own
      * NUMA group, so each node reads the half of every expert placed on it.
-     * Only the router declares its weights for claims ahead: when the FFN
-     * runs behind the attention output, the threads waiting for the FFN
-     * norm stream it, and with it the routed experts' critical path. */
+     * No stage declares its weights for claims ahead: the router rows are
+     * serial double sums that the kernel, not the stream, paces, and the
+     * experts are known only after it. */
     const ds4_pool_stage st[8] = {
         ds41_cpu_hc_norm_stage(&g->hc),
         { .fn = matvec_f32_worker, .ctx = &g->router, .n_rows = DS4_N_EXPERT,
-          .group_rows = DS4_N_EXPERT, .finish = ds41_cpu_ffn_route, .finish_ctx = g,
-          .weights = (const uint8_t *)g->router.data, .row_bytes = 5120 * sizeof(float) },
+          .group_rows = DS4_N_EXPERT, .finish = ds41_cpu_ffn_route, .finish_ctx = g },
         { .fn = ds41_cpu_q8_pair_worker, .ctx = &g->shared_gate_up, .n_rows = 2 * mid_tiles,
           .group_rows = mid_tiles, .finish = ds41_cpu_ffn_shared_mid, .finish_ctx = s },
         { .fn = ds41_cpu_mid_worker, .ctx = &g->mid, .n_rows = DS4_N_EXPERT_USED * mid_tiles,

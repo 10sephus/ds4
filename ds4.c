@@ -2222,6 +2222,7 @@ typedef struct {
 typedef struct {
     pthread_t threads[DS4_MAX_THREADS];
     uint8_t thread_node[DS4_MAX_THREADS];   /* home NUMA node per thread */
+    uint32_t node_threads[2];               /* threads per home node */
     pthread_mutex_t mutex;
     pthread_cond_t work_cond;
     pthread_cond_t done_cond;
@@ -2406,7 +2407,10 @@ typedef struct {
 
 /* Claim, on the home cursor, rows of the first stage from k on whose
  * weights are known.  They are an ordinary claim: the thread runs them when
- * it reaches that stage, before claiming more. */
+ * it reaches that stage, before claiming more.  At most half of a thread's
+ * share of the node's claims, so that the rows claimed ahead never outlast
+ * the other threads' work, even where the kernel and not the stream sets
+ * the pace. */
 static void ds4_stage_claim_ahead(ds4_pool_stage *stages, uint32_t n_stages, uint32_t k,
                                   int node, ds4_stage_ahead *a) {
     for (uint32_t j = k; j < n_stages; j++) {
@@ -2416,6 +2420,9 @@ static void ds4_stage_claim_ahead(ds4_pool_stage *stages, uint32_t n_stages, uin
         if (__atomic_load_n(&s->cursor[node].v, __ATOMIC_RELAXED) >= end) continue;
         uint64_t claims = DS4_STAGE_AHEAD_BYTES / (s->chunk * s->row_bytes);
         if (claims < 1) claims = 1;
+        const uint64_t share = end / s->chunk / g_pool.node_threads[node] / 2;
+        if (claims > share) claims = share;
+        if (claims == 0) continue;
         const uint64_t v = __atomic_fetch_add(&s->cursor[node].v, claims * s->chunk, __ATOMIC_RELAXED);
         if (v >= end) continue;
         uint64_t n;
@@ -2637,6 +2644,8 @@ static void ds4_threads_init(void) {
     } else {
         memset(g_pool.thread_node, 0, sizeof(g_pool.thread_node));
     }
+    g_pool.node_threads[0] = n_node0;
+    g_pool.node_threads[1] = n_threads - n_node0;
 
     pthread_mutex_init(&g_pool.mutex, NULL);
     pthread_cond_init(&g_pool.work_cond, NULL);
