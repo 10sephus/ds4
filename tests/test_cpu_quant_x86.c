@@ -1094,8 +1094,123 @@ static void check_attention_lanes(void) {
     quant_free(cb); quant_free(rb); quant_free(sb); quant_free(qb);
 }
 
+static float quant_float(void) {
+    return (float)((int)(quant_random() % 2001) - 1000) * 0.00137f;
+}
+
+/* Any half except Inf/NaN, subnormals included. */
+static uint16_t quant_half_finite(void) {
+    uint16_t h = (uint16_t)quant_random();
+    if ((h & 0x7c00u) == 0x7c00u) h ^= 0x4000u;
+    return h;
+}
+
+static void quant_bits_equal(const char *name, float expected, float actual, unsigned where) {
+    uint32_t a, b;
+    memcpy(&a, &expected, sizeof(a)); memcpy(&b, &actual, sizeof(b));
+    if (a != b) {
+        fprintf(stderr, "%s at %u: %08x != %08x (%g != %g)\n", name, where, a, b, expected, actual);
+        exit(1);
+    }
+}
+
+/* The raw KV cache stores F16-rounded rows and prefill rounds its batch copy
+ * the same way before pushing, so a second round trip must change nothing. */
+static void check_f16_round_trip(void) {
+    for (uint32_t h = 0; h < 0x10000u; h++) {
+        if ((h & 0x7c00u) == 0x7c00u && (h & 0x03ffu) != 0) continue; /* NaN payloads collapse */
+        const float f = f16_to_f32((uint16_t)h);
+        CHECK(f32_to_f16(f) == (uint16_t)h);
+        quant_bits_equal("f16 round trip", f, f16_to_f32(f32_to_f16(f)), h);
+    }
+    for (unsigned i = 0; i < 200000; i++) {
+        uint32_t bits = quant_random();
+        float x;
+        memcpy(&x, &bits, sizeof(x));
+        const float once = f16_to_f32(f32_to_f16(x));
+        quant_bits_equal("f16 double round trip", once, f16_to_f32(f32_to_f16(once)), i);
+    }
+}
+
+/* Prefix prefill attention must match the per-token attention each token
+ * would run against its raw window and the compressed rows pushed so far,
+ * with and without an indexer mask. */
+static void check_prefix_attention(void) {
+    const ds4_shape saved = g_ds4_shape;
+    g_ds4_shape = DS4_SHAPE_FLASH;
+    g_ds4_shape.n_head = 3;
+    g_ds4_shape.n_head_dim = 40;
+    const uint32_t n_head = DS4_N_HEAD, head_dim = DS4_N_HEAD_DIM;
+    const uint32_t n_tok = 23, raw_cap = 6, n_comp_rows = 9, comp_cap = 16;
+    const uint64_t q_dim = (uint64_t)n_head * head_dim;
+    const uint64_t allowed_stride = (comp_cap + 7u) / 8u;
+
+    quant_buffer sb = quant_alloc(n_head * sizeof(float));
+    float *sinks = (float *)sb.data;
+    for (uint32_t h = 0; h < n_head; h++) sinks[h] = quant_float();
+    ds4_model m = {.map = sb.data, .size = sb.size};
+    ds4_tensor sinks_t = {.type = DS4_TENSOR_F32, .ndim = 1, .dim = {n_head},
+                          .elements = n_head, .bytes = n_head * sizeof(float)};
+    ds4_layer_weights layer = {.attn_sinks = &sinks_t};
+
+    float *q = xmalloc((size_t)n_tok * q_dim * sizeof(q[0]));
+    float *kv = xmalloc((size_t)n_tok * head_dim * sizeof(kv[0]));
+    float *comp = xmalloc((size_t)n_comp_rows * head_dim * sizeof(comp[0]));
+    float *batch = xmalloc((size_t)n_tok * q_dim * sizeof(batch[0]));
+    float *one = xmalloc(q_dim * sizeof(one[0]));
+    uint32_t *comp_counts = xmalloc((size_t)n_tok * sizeof(comp_counts[0]));
+    uint8_t *mask = xmalloc(n_tok);
+    uint8_t *bits = xmalloc((size_t)n_tok * allowed_stride);
+    bool *allowed = xmalloc(n_comp_rows * sizeof(allowed[0]));
+    for (uint64_t i = 0; i < (uint64_t)n_tok * q_dim; i++) q[i] = quant_float();
+    for (uint64_t i = 0; i < (uint64_t)n_tok * head_dim; i++) kv[i] = quant_float();
+    for (uint64_t i = 0; i < (uint64_t)n_comp_rows * head_dim; i++) comp[i] = quant_float();
+    for (uint32_t t = 0; t < n_tok; t++) {
+        comp_counts[t] = (t + 1) / 3 < n_comp_rows ? (t + 1) / 3 : n_comp_rows;
+        mask[t] = (uint8_t)(t % 3 == 1);
+        for (uint64_t b = 0; b < allowed_stride; b++) bits[t * allowed_stride + b] = (uint8_t)quant_random();
+    }
+
+    for (unsigned masked = 0; masked < 2; masked++) {
+        layer_attention_prefix_batch(batch, &m, &layer, q, kv, comp, comp_counts,
+                                     masked ? mask : NULL, masked ? bits : NULL,
+                                     allowed_stride, n_tok, raw_cap);
+        for (uint32_t t = 0; t < n_tok; t++) {
+            const uint32_t raw_count = t + 1 < raw_cap ? t + 1 : raw_cap;
+            const bool use_mask = masked && mask[t];
+            for (uint32_t c = 0; c < comp_counts[t]; c++)
+                allowed[c] = (bits[t * allowed_stride + (c >> 3)] >> (c & 7u)) & 1u;
+            layer_attention_mixed_one(one, &m, &layer, q + t * q_dim,
+                                      kv + (uint64_t)(t + 1 - raw_count) * head_dim, raw_count,
+                                      comp, comp_counts[t], use_mask ? allowed : NULL);
+            for (uint64_t i = 0; i < q_dim; i++)
+                quant_bits_equal(masked ? "masked prefix attention" : "prefix attention",
+                                 one[i], batch[t * q_dim + i], (unsigned)(t * q_dim + i));
+        }
+    }
+
+    /* Raw-only layers: no compressed rows, the per-token path is rows_one. */
+    memset(comp_counts, 0, (size_t)n_tok * sizeof(comp_counts[0]));
+    layer_attention_prefix_batch(batch, &m, &layer, q, kv, NULL, comp_counts, NULL, NULL, 0, n_tok, raw_cap);
+    for (uint32_t t = 0; t < n_tok; t++) {
+        const uint32_t raw_count = t + 1 < raw_cap ? t + 1 : raw_cap;
+        layer_attention_rows_one(one, &m, &layer, q + t * q_dim,
+                                 kv + (uint64_t)(t + 1 - raw_count) * head_dim, raw_count);
+        for (uint64_t i = 0; i < q_dim; i++)
+            quant_bits_equal("raw prefix attention", one[i], batch[t * q_dim + i], (unsigned)(t * q_dim + i));
+    }
+
+    free(allowed); free(bits); free(mask); free(comp_counts);
+    free(one); free(batch); free(comp); free(kv); free(q);
+    quant_free(sb);
+    g_ds4_shape = saved;
+}
+
 int main(void) {
     check_thread_pool();
+    check_f16_round_trip();
+    check_prefix_attention();
+    puts("CPU prefix attention bitwise oracle PASS");
     check_integer_dots();
     check_iq2_tables();
 #if defined(DS4_NO_GPU) && defined(__AVX2__) && defined(__F16C__)

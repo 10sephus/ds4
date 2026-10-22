@@ -15742,8 +15742,10 @@ static void layer_attention_prefix_batch_worker(void *vctx, uint64_t r0, uint64_
     float *score = max_total <= 2048 ? score_stack : xmalloc((size_t)max_total * sizeof(score[0]));
 
     for (uint64_t idx = r0; idx < r1; idx++) {
-        const uint32_t t = (uint32_t)(idx / DS4_N_HEAD);
-        const uint32_t h = (uint32_t)(idx - (uint64_t)t * DS4_N_HEAD);
+        /* Head-outer: a static split then hands every thread the same mix of
+         * short and long token windows.  Each (t, h) output is independent. */
+        const uint32_t t = (uint32_t)(idx % ctx->n_tok);
+        const uint32_t h = (uint32_t)(idx / ctx->n_tok);
         const uint32_t raw_count = t + 1 < ctx->raw_cap ? t + 1 : ctx->raw_cap;
         const uint32_t raw_start = t + 1 - raw_count;
         const uint32_t comp_count = ctx->comp_counts ? ctx->comp_counts[t] : 0;
@@ -16147,8 +16149,11 @@ static void layer_attention_raw_swa_one(
     free(attn_cur);
 }
 
-/* Batched prefill attention.  It projects Q/KV for all tokens, streams them
- * through the same raw/compressed cache updates, then runs prefix attention. */
+/* Batched prefill attention for a fresh prompt.  It projects Q/KV for all
+ * tokens, streams them through the same raw/compressed cache updates decode
+ * performs, then runs every token's attention in parallel.  Continued prefill
+ * extends an existing cache token by token through the decode path, so the
+ * layer cache is empty here and token t sits at position t. */
 static void layer_attention_raw_swa_batch(
         float                   * after_attn_hc,
         const ds4_model         * model,
@@ -16157,9 +16162,11 @@ static void layer_attention_raw_swa_batch(
         const float             * inp_hc,
         uint32_t                  n_tok,
         uint32_t                  il,
-        uint32_t                  pos0,
         const float             * steering_dirs,
         float                     steering_scale) {
+    if (cache->n_raw != 0 || cache->n_comp != 0) {
+        ds4_die("CPU batched prefill attention expects an empty layer cache");
+    }
     const bool profile = getenv("DS4_PREFILL_PROFILE_DETAIL") != NULL;
     const double t_start = profile ? now_sec() : 0.0;
     double t_hc_norm = 0.0;
@@ -16185,7 +16192,7 @@ static void layer_attention_raw_swa_batch(
     float *q = xmalloc((size_t)n_tok * q_dim * sizeof(q[0]));
     float *kv_raw = xmalloc((size_t)n_tok * DS4_N_HEAD_DIM * sizeof(kv_raw[0]));
     float *kv = xmalloc((size_t)n_tok * DS4_N_HEAD_DIM * sizeof(kv[0]));
-    float *heads = NULL;
+    float *heads = xmalloc((size_t)n_tok * q_dim * sizeof(heads[0]));
     float *attn_out = xmalloc((size_t)n_tok * DS4_N_EMBD * sizeof(attn_out[0]));
     float *post = xmalloc((size_t)n_tok * n_hc * sizeof(post[0]));
     float *comb = xmalloc((size_t)n_tok * n_hc * n_hc * sizeof(comb[0]));
@@ -16239,133 +16246,73 @@ static void layer_attention_raw_swa_batch(
 
     t0 = profile ? now_sec() : 0.0;
     const uint32_t ratio = cache->compress_ratio;
-    const bool prefer_parallel_attn = getenv("DS4_PARALLEL_ATTN_ROWS") != NULL;
-    const bool prefix_batch_attn =
-        prefer_parallel_attn &&
-        getenv("DS4_NO_PARALLEL_ATTN_ROWS") == NULL &&
-        cache->n_raw == 0 &&
-        pos0 == 0;
-    if (!prefix_batch_attn) {
-        heads = xmalloc((size_t)n_tok * q_dim * sizeof(heads[0]));
-    }
-    uint32_t batch_rope_max = 4096;
-    const char *batch_rope_max_env = getenv("DS4_BATCHED_ROPE_MAX");
-    if (batch_rope_max_env && batch_rope_max_env[0]) {
-        long v = strtol(batch_rope_max_env, NULL, 10);
-        if (v >= 0 && v <= 65536) batch_rope_max = (uint32_t)v;
-    }
-    const bool batch_prefix_rope =
-        prefix_batch_attn &&
-        getenv("DS4_NO_BATCHED_ROPE") == NULL &&
-        n_tok <= batch_rope_max;
-    uint32_t *comp_counts = prefix_batch_attn ?
-        xcalloc((size_t)n_tok, sizeof(comp_counts[0])) : NULL;
-    uint8_t *allowed_mask = prefix_batch_attn && ratio == 4 ?
-        xcalloc((size_t)n_tok, sizeof(allowed_mask[0])) : NULL;
+    uint32_t *comp_counts = xcalloc((size_t)n_tok, sizeof(comp_counts[0]));
+    uint8_t *allowed_mask = ratio == 4 ? xcalloc((size_t)n_tok, sizeof(allowed_mask[0])) : NULL;
     uint8_t *allowed_bits = NULL;
     const uint64_t allowed_stride = ratio == 4 ? ((uint64_t)cache->comp_cap + 7u) / 8u : 0;
-    float *comp_scratch = NULL;
-    float *index_comp_scratch = NULL;
+    float *comp = ratio != 0 ? xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(comp[0])) : NULL;
+    float *index_comp = ratio == 4 ? xmalloc((size_t)DS4_N_INDEXER_HEAD_DIM * sizeof(index_comp[0])) : NULL;
 
-    if (ratio != 0) {
-        comp_scratch = xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(comp_scratch[0]));
-
-        if (ratio == 4) {
-            index_comp_scratch = xmalloc((size_t)DS4_N_INDEXER_HEAD_DIM * sizeof(index_comp_scratch[0]));
-        }
-    }
-
-    if (batch_prefix_rope) {
-        double tx = profile ? now_sec() : 0.0;
-        rope_tail_layer_batch_inplace(q,
-                                      q_dim,
-                                      DS4_N_HEAD,
-                                      DS4_N_HEAD_DIM,
-                                      DS4_N_ROT,
-                                      pos0,
-                                      il,
-                                      false,
-                                      n_tok);
-        rope_tail_layer_batch_inplace(kv,
-                                      DS4_N_HEAD_DIM,
-                                      DS4_N_HEAD_KV,
-                                      DS4_N_HEAD_DIM,
-                                      DS4_N_ROT,
-                                      pos0,
-                                      il,
-                                      false,
-                                      n_tok);
-        if (profile) t_tl_rope_cache += now_sec() - tx;
-    }
+    double tx = profile ? now_sec() : 0.0;
+    rope_tail_layer_batch_inplace(q, q_dim, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, 0, il, false, n_tok);
+    rope_tail_layer_batch_inplace(kv, DS4_N_HEAD_DIM, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, 0, il, false, n_tok);
+    if (profile) t_tl_rope_cache += now_sec() - tx;
 
     for (uint32_t t = 0; t < n_tok; t++) {
-        const uint32_t pos = pos0 + t;
-        float *q_t = q + (uint64_t)t * q_dim;
         float *kv_t = kv + (uint64_t)t * DS4_N_HEAD_DIM;
-        bool *comp_allowed = NULL;
 
-        double tx = profile ? now_sec() : 0.0;
-        if (!batch_prefix_rope) {
-            rope_tail_layer_inplace(q_t, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, false);
-            rope_tail_layer_inplace(kv_t, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, false);
-        }
+        tx = profile ? now_sec() : 0.0;
         dsv4_fp8_kv_quantize_row_inplace_cpu(kv_t, DS4_N_HEAD_DIM, DS4_N_ROT);
-
+        /* The raw cache holds F16-rounded rows.  Round the batch row the same
+         * way so the prefix attention below reads exactly what decode reads
+         * back from the cache (the push's own rounding is then a no-op). */
+        for (uint32_t i = 0; i < DS4_N_HEAD_DIM; i++) kv_t[i] = f16_to_f32(f32_to_f16(kv_t[i]));
         kv_cache_push_raw(cache, kv_t);
         if (profile) t_tl_rope_cache += now_sec() - tx;
 
-        if (ratio != 0) {
+        if (ratio == 0) continue;
+
+        tx = profile ? now_sec() : 0.0;
+        if (compressor_decode_one(comp, model,
+                                  layer->attn_compressor_kv,
+                                  layer->attn_compressor_gate,
+                                  layer->attn_compressor_ape,
+                                  layer->attn_compressor_norm,
+                                  attn_norm + (uint64_t)t * DS4_N_EMBD,
+                                  cache->attn_state_kv,
+                                  cache->attn_state_score,
+                                  DS4_N_HEAD_DIM,
+                                  ratio,
+                                  il,
+                                  t)) {
+            kv_cache_push_comp(cache->attn_comp_kv, &cache->n_comp, cache->comp_cap, DS4_N_HEAD_DIM, comp);
+        }
+
+        if (ratio == 4) {
+            if (compressor_decode_one(index_comp, model,
+                                      layer->indexer_compressor_kv,
+                                      layer->indexer_compressor_gate,
+                                      layer->indexer_compressor_ape,
+                                      layer->indexer_compressor_norm,
+                                      attn_norm + (uint64_t)t * DS4_N_EMBD,
+                                      cache->index_state_kv,
+                                      cache->index_state_score,
+                                      DS4_N_INDEXER_HEAD_DIM,
+                                      ratio,
+                                      il,
+                                      t)) {
+                kv_cache_push_comp(cache->index_comp_kv, &cache->n_index_comp, cache->comp_cap, DS4_N_INDEXER_HEAD_DIM, index_comp);
+            }
+            if (profile) t_tl_compress += now_sec() - tx;
+
             tx = profile ? now_sec() : 0.0;
-            float *comp = comp_scratch;
-            const bool have_comp = compressor_decode_one(comp, model,
-                                                         layer->attn_compressor_kv,
-                                                         layer->attn_compressor_gate,
-                                                         layer->attn_compressor_ape,
-                                                         layer->attn_compressor_norm,
-                                                         attn_norm + (uint64_t)t * DS4_N_EMBD,
-                                                         cache->attn_state_kv,
-                                                         cache->attn_state_score,
-                                                         DS4_N_HEAD_DIM,
-                                                         ratio,
-                                                         il,
-                                                         pos);
-            if (have_comp) {
-                kv_cache_push_comp(cache->attn_comp_kv, &cache->n_comp, cache->comp_cap, DS4_N_HEAD_DIM, comp);
-            }
-
-            if (ratio == 4) {
-                float *index_comp = index_comp_scratch;
-                const bool have_index_comp = compressor_decode_one(index_comp, model,
-                                                                   layer->indexer_compressor_kv,
-                                                                   layer->indexer_compressor_gate,
-                                                                   layer->indexer_compressor_ape,
-                                                                   layer->indexer_compressor_norm,
-                                                                   attn_norm + (uint64_t)t * DS4_N_EMBD,
-                                                                   cache->index_state_kv,
-                                                                   cache->index_state_score,
-                                                                   DS4_N_INDEXER_HEAD_DIM,
-                                                                   ratio,
-                                                                   il,
-                                                                   pos);
-                if (have_index_comp) {
-                    kv_cache_push_comp(cache->index_comp_kv, &cache->n_index_comp, cache->comp_cap, DS4_N_INDEXER_HEAD_DIM, index_comp);
-                }
-                if (profile) t_tl_compress += now_sec() - tx;
-
-                tx = profile ? now_sec() : 0.0;
-                comp_allowed = indexer_allowed_decode_one(model, layer,
-                                                          attn_norm + (uint64_t)t * DS4_N_EMBD,
-                                                          qr_norm + (uint64_t)t * q_rank,
-                                                          cache->index_comp_kv,
-                                                          cache->n_index_comp,
-                                                          il, pos);
-                if (profile) t_tl_indexer += now_sec() - tx;
-            } else {
-                if (profile) t_tl_compress += now_sec() - tx;
-            }
-
-            if (comp_counts) comp_counts[t] = cache->n_comp;
-            if (prefix_batch_attn && comp_allowed) {
+            bool *comp_allowed = indexer_allowed_decode_one(model, layer,
+                                                            attn_norm + (uint64_t)t * DS4_N_EMBD,
+                                                            qr_norm + (uint64_t)t * q_rank,
+                                                            cache->index_comp_kv,
+                                                            cache->n_index_comp,
+                                                            il, t);
+            if (comp_allowed) {
                 if (!allowed_bits) {
                     allowed_bits = xcalloc((size_t)n_tok * allowed_stride, sizeof(allowed_bits[0]));
                 }
@@ -16374,80 +16321,31 @@ static void layer_attention_raw_swa_batch(
                 for (uint32_t c = 0; c < cache->n_comp; c++) {
                     if (comp_allowed[c]) bits[c >> 3] |= (uint8_t)(1u << (c & 7u));
                 }
+                free(comp_allowed);
             }
-
-            if (!prefix_batch_attn) {
-                tx = profile ? now_sec() : 0.0;
-                layer_attention_mixed_one(heads + (uint64_t)t * q_dim, model, layer, q_t,
-                                          cache->raw_kv, cache->n_raw,
-                                          cache->attn_comp_kv, cache->n_comp,
-                                          comp_allowed);
-                if (profile) t_tl_attn_rows += now_sec() - tx;
-            }
-        } else {
-            if (!prefix_batch_attn) {
-                tx = profile ? now_sec() : 0.0;
-                layer_attention_rows_one(heads + (uint64_t)t * q_dim, model, layer, q_t, cache->raw_kv, cache->n_raw);
-                if (profile) t_tl_attn_rows += now_sec() - tx;
-            }
+            if (profile) t_tl_indexer += now_sec() - tx;
+        } else if (profile) {
+            t_tl_compress += now_sec() - tx;
         }
 
-        if (!prefix_batch_attn) {
-            tx = profile ? now_sec() : 0.0;
-            rope_tail_layer_inplace(heads + (uint64_t)t * q_dim,
-                                    DS4_N_HEAD,
-                                    DS4_N_HEAD_DIM,
-                                    DS4_N_ROT,
-                                    pos,
-                                    il,
-                                    true);
-            if (profile) t_tl_inv_rope += now_sec() - tx;
-        }
-
-        free(comp_allowed);
+        comp_counts[t] = cache->n_comp;
     }
 
-    if (prefix_batch_attn) {
-        double tx = profile ? now_sec() : 0.0;
-        const float *comp_kv_for_prefix = cache->attn_comp_kv ? cache->attn_comp_kv : kv;
-        if (!heads) {
-            heads = xmalloc((size_t)n_tok * q_dim * sizeof(heads[0]));
-        }
-        layer_attention_prefix_batch(heads, model, layer,
-                                     q,
-                                     kv,
-                                     comp_kv_for_prefix,
-                                     comp_counts,
-                                     allowed_mask,
-                                     allowed_bits,
-                                     allowed_stride,
-                                     n_tok,
-                                     cache->cap_raw);
-        if (profile) t_tl_attn_rows += now_sec() - tx;
-        tx = profile ? now_sec() : 0.0;
-        if (batch_prefix_rope) {
-            rope_tail_layer_batch_inplace(heads,
-                                          q_dim,
-                                          DS4_N_HEAD,
-                                          DS4_N_HEAD_DIM,
-                                          DS4_N_ROT,
-                                          pos0,
-                                          il,
-                                          true,
-                                          n_tok);
-        } else {
-            for (uint32_t t = 0; t < n_tok; t++) {
-                rope_tail_layer_inplace(heads + (uint64_t)t * q_dim,
-                                        DS4_N_HEAD,
-                                        DS4_N_HEAD_DIM,
-                                        DS4_N_ROT,
-                                        pos0 + t,
-                                        il,
-                                        true);
-            }
-        }
-        if (profile) t_tl_inv_rope += now_sec() - tx;
-    }
+    tx = profile ? now_sec() : 0.0;
+    layer_attention_prefix_batch(heads, model, layer,
+                                 q,
+                                 kv,
+                                 cache->attn_comp_kv,
+                                 comp_counts,
+                                 allowed_mask,
+                                 allowed_bits,
+                                 allowed_stride,
+                                 n_tok,
+                                 cache->cap_raw);
+    if (profile) t_tl_attn_rows += now_sec() - tx;
+    tx = profile ? now_sec() : 0.0;
+    rope_tail_layer_batch_inplace(heads, q_dim, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, 0, il, true, n_tok);
+    if (profile) t_tl_inv_rope += now_sec() - tx;
     if (profile) t_token_loop = now_sec() - t0;
 
     t0 = profile ? now_sec() : 0.0;
@@ -16475,11 +16373,11 @@ static void layer_attention_raw_swa_batch(
         }
     }
 
+    free(index_comp);
+    free(comp);
     free(allowed_bits);
     free(allowed_mask);
     free(comp_counts);
-    free(index_comp_scratch);
-    free(comp_scratch);
     free(comb);
     free(post);
     free(attn_out);
@@ -16776,7 +16674,6 @@ static void prefill_layer_major_cpu(
                                           cur,
                                           (uint32_t)n_tok,
                                           il,
-                                          0,
                                           steering_dirs,
                                           steering_attn_scale);
 
