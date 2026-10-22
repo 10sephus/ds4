@@ -10124,7 +10124,7 @@ typedef struct {
  * its few rows, so those matmuls were bound by L3 bandwidth.  Items run
  * row-block major: the NUMA halves of the items are the halves of the rows. */
 typedef struct {
-    uint64_t row_block;   /* rows per item, a multiple of 4 */
+    uint64_t row_block;   /* rows per item, a multiple of 8 */
     uint64_t tile_block;  /* tiles per item */
     uint64_t n_tb;        /* tile blocks per row block */
     uint64_t n_items;
@@ -10552,7 +10552,7 @@ static void q8_0_tiles_free(q8_0_tiles *tiles) {
 }
 
 #if defined(DS4_NO_GPU) && defined(__AVX512VNNI__)
-/* Batched Q8_0 GEMM for prefill: 4 weight rows x 16 tokens per pass with
+/* Batched Q8_0 GEMM for prefill: 8 weight rows x 16 tokens per pass with
  * vpdpbusd, bitwise identical to dot_q8_0_row.  The generic dot computes per
  * block
  *
@@ -10651,12 +10651,15 @@ static q8_0_tiles q8_0_tiles_pack(
     return ctx.tiles;
 }
 
-/* Per (row, block) constants of the tile kernel: the block scale as f32 and
- * the integer accumulator start that cancels the +128 activation offset. */
+/* Per block of eight consecutive rows: the 32 weight bytes of each row, its
+ * block scale as f32 and the integer accumulator start that cancels the
+ * +128 activation offset, contiguous so the kernel streams one 320-byte
+ * record per block.  A group short of eight rows repeats its last row. */
 typedef struct {
-    float   ws;
-    int32_t dot0;
-} q8_0_row_tab;
+    uint8_t w[8][32];
+    float   ws[8];
+    int32_t dot0[8];
+} q8_0_tab8;
 
 /* F16C conversion, bit-identical to the software f16_to_f32 for all 65536
  * patterns (tests/test_cpu_quant_x86.c): VCVTPH2PS would quiet signaling
@@ -10668,59 +10671,64 @@ static inline float q8_0_scale_f32(uint16_t bits) {
     return f16_to_f32(bits);
 }
 
-static void q8_0_row_tab_build(q8_0_row_tab *tab, const uint8_t *row, uint64_t blocks) {
+static void q8_0_tab8_build(q8_0_tab8 *tab, const uint8_t *data, uint64_t row_bytes,
+                            uint64_t n_rows, uint64_t blocks) {
     for (uint64_t b = 0; b < blocks; b++) {
-        uint16_t scale_bits;
-        memcpy(&scale_bits, row + b * 34, sizeof(scale_bits));
-        const int8_t *qs = (const int8_t *)(row + b * 34 + 2);
-        int32_t sum = 0;
-        for (unsigned i = 0; i < 32; i++) sum += qs[i];
-        tab[b].ws = q8_0_scale_f32(scale_bits);
-        tab[b].dot0 = -128 * sum;
+        for (unsigned i = 0; i < 8; i++) {
+            const uint64_t r = i < n_rows ? i : n_rows - 1;
+            const uint8_t *blk = data + r * row_bytes + b * 34;
+            uint16_t scale_bits;
+            memcpy(&scale_bits, blk, sizeof(scale_bits));
+            memcpy(tab[b].w[i], blk + 2, 32);
+            int32_t sum = 0;
+            for (unsigned k = 0; k < 32; k++) sum += (int8_t)tab[b].w[i][k];
+            tab[b].ws[i] = q8_0_scale_f32(scale_bits);
+            tab[b].dot0[i] = -128 * sum;
+        }
     }
 }
 
-/* 4 weight rows x one 16-token tile; out[r][j] equals
- * dot_q8_0_row(rows[r], token j) bit for bit. */
-static void q8_0_gemm_4x16(
-        const uint8_t *const      rows[4],
-        const q8_0_row_tab *const tabs[4],
-        const uint8_t            *xq16,
-        const float              *xs16,
-        uint64_t                  blocks,
-        float                     out[4][16]) {
-    __m512 acc[4];
-    for (unsigned r = 0; r < 4; r++) acc[r] = _mm512_setzero_ps();
+/* Eight weight rows x one 16-token tile; out[r][j] equals
+ * dot_q8_0_row(rows[r], token j) bit for bit.  Eight independent vpdpbusd
+ * chains per block cover the instruction latency without relying on the
+ * out-of-order window to overlap blocks. */
+static void q8_0_gemm_8x16(
+        const q8_0_tab8 *tab,
+        const uint8_t   *xq16,
+        const float     *xs16,
+        uint64_t         blocks,
+        float            out[8][16]) {
+    __m512 acc[8];
+    for (unsigned r = 0; r < 8; r++) acc[r] = _mm512_setzero_ps();
 
     for (uint64_t b = 0; b < blocks; b++) {
-        __m512i xv[8];
+        const q8_0_tab8 *t = tab + b;
+        __m512i dot[8];
+        for (unsigned r = 0; r < 8; r++) dot[r] = _mm512_set1_epi32(t->dot0[r]);
         for (unsigned k = 0; k < 8; k++) {
-            xv[k] = _mm512_loadu_si512((const void *)(xq16 + (b * 8 + k) * 64));
+            const __m512i xv = _mm512_loadu_si512((const void *)(xq16 + (b * 8 + k) * 64));
+            for (unsigned r = 0; r < 8; r++) {
+                int32_t w4;
+                memcpy(&w4, t->w[r] + k * 4, sizeof(w4));
+                dot[r] = _mm512_dpbusd_epi32(dot[r], xv, _mm512_set1_epi32(w4));
+            }
         }
         const __m512 xs = _mm512_loadu_ps(xs16 + b * 16);
-
-        for (unsigned r = 0; r < 4; r++) {
-            const uint8_t *qs = rows[r] + b * 34 + 2;
-            __m512i dot = _mm512_set1_epi32(tabs[r][b].dot0);
-            for (unsigned k = 0; k < 8; k++) {
-                int32_t w4;
-                memcpy(&w4, qs + k * 4, sizeof(w4));
-                dot = _mm512_dpbusd_epi32(dot, xv[k], _mm512_set1_epi32(w4));
-            }
-            const __m512 t1 = _mm512_mul_ps(_mm512_set1_ps(tabs[r][b].ws), xs);
-            const __m512 t2 = _mm512_mul_ps(t1, _mm512_cvtepi32_ps(dot));
+        for (unsigned r = 0; r < 8; r++) {
+            const __m512 t1 = _mm512_mul_ps(_mm512_set1_ps(t->ws[r]), xs);
+            const __m512 t2 = _mm512_mul_ps(t1, _mm512_cvtepi32_ps(dot[r]));
             acc[r] = _mm512_add_ps(acc[r], t2);
         }
     }
-    for (unsigned r = 0; r < 4; r++) _mm512_storeu_ps(out[r], acc[r]);
+    for (unsigned r = 0; r < 8; r++) _mm512_storeu_ps(out[r], acc[r]);
 }
 
 /* Rows [r0, r1) of a Q8_0 matrix (row r at data + r * blocks * 34) against
  * every full tile of one group, writing out[t * out_stride + r].  Row blocks
  * are sized to stay in L2 while the tiles stream past, so each weight row is
- * read from DRAM once per matmul.  The last 4-row group may run past r1 on a
- * duplicate of the last row; those results are not stored.  Returns the
- * first token not covered by a tile. */
+ * read from DRAM once per matmul.  The last group of eight rows may run past
+ * r1 on duplicates of the last row; those results are not stored.  Returns
+ * the first token not covered by a tile. */
 static uint64_t matmul_q8_0_tiles_range(
         float            *out,
         uint64_t          out_stride,
@@ -10735,33 +10743,29 @@ static uint64_t matmul_q8_0_tiles_range(
     if (tiles->n_tiles == 0) return 0;
 
     const uint64_t row_bytes = blocks * 34;
-    uint64_t block_rows = (256 * 1024 / row_bytes) & ~(uint64_t)3;
-    if (block_rows < 4) block_rows = 4;
-    q8_0_row_tab *tab = xmalloc(block_rows * blocks * sizeof(*tab));
+    uint64_t block_rows = (256 * 1024 / row_bytes) & ~(uint64_t)7;
+    if (block_rows < 8) block_rows = 8;
+    q8_0_tab8 *tab = xmalloc(block_rows / 8 * blocks * sizeof(*tab));
 
     for (uint64_t rb = r0; rb < r1; rb += block_rows) {
         const uint64_t n = r1 - rb < block_rows ? r1 - rb : block_rows;
-        for (uint64_t i = 0; i < n; i++) {
-            q8_0_row_tab_build(tab + i * blocks, data + (rb + i) * row_bytes, blocks);
+        const uint64_t n_groups = (n + 7) / 8;
+        for (uint64_t g = 0; g < n_groups; g++) {
+            q8_0_tab8_build(tab + g * blocks, data + (rb + g * 8) * row_bytes, row_bytes,
+                            n - g * 8 < 8 ? n - g * 8 : 8, blocks);
         }
         for (uint64_t tile = tile_lo; tile < tile_hi; tile++) {
             const uint8_t *xq16 = tiles->xq + (tile0 + tile) * blocks * 512;
             const float *xs16 = tiles->xs + (tile0 + tile) * blocks * 16;
-            for (uint64_t r = 0; r < n; r += 4) {
-                const uint8_t *rows[4];
-                const q8_0_row_tab *tabs[4];
-                float res[4][16];
-                for (unsigned i = 0; i < 4; i++) {
-                    const uint64_t ri = r + i < n ? r + i : n - 1;
-                    rows[i] = data + (rb + ri) * row_bytes;
-                    tabs[i] = tab + ri * blocks;
-                }
-                q8_0_gemm_4x16(rows, tabs, xq16, xs16, blocks, res);
-                const uint64_t nj = tiles->n_tok - tile * 16 < 16 ?
-                                    tiles->n_tok - tile * 16 : 16;
-                for (unsigned i = 0; i < 4 && r + i < n; i++) {
+            const uint64_t nj = tiles->n_tok - tile * 16 < 16 ?
+                                tiles->n_tok - tile * 16 : 16;
+            for (uint64_t g = 0; g < n_groups; g++) {
+                float res[8][16];
+                q8_0_gemm_8x16(tab + g * blocks, xq16, xs16, blocks, res);
+                const uint64_t nr = n - g * 8 < 8 ? n - g * 8 : 8;
+                for (unsigned i = 0; i < nr; i++) {
                     for (unsigned j = 0; j < nj; j++) {
-                        out[(tile * 16 + j) * out_stride + rb + r + i] = res[i][j];
+                        out[(tile * 16 + j) * out_stride + rb + g * 8 + i] = res[i][j];
                     }
                 }
             }
@@ -10798,7 +10802,7 @@ static q8_0_tile_grid q8_0_tile_grid_make(uint64_t out_dim, uint64_t n_tiles, ui
     g.n_tb = n_tiles ? (n_tiles + g.tile_block - 1) / g.tile_block : 1;
     g.row_block = 32;
     const uint64_t want = 4u * g_pool.n_threads;
-    while (g.row_block > 4 && (out_dim + g.row_block - 1) / g.row_block * g.n_tb < want) {
+    while (g.row_block > 8 && (out_dim + g.row_block - 1) / g.row_block * g.n_tb < want) {
         g.row_block /= 2;
     }
     g.n_items = (out_dim + g.row_block - 1) / g.row_block * g.n_tb;
