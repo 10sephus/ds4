@@ -12,6 +12,32 @@
 
 #include "ds4_deepseek41_cpu_x86.inc"
 
+/* DS4_CPU_PROFILE splits each token into phases. ds41_prof(next) charges the
+ * main thread's wall time since the previous switch to the running phase, so
+ * pool work is counted where it is waited for. Bytes are the weights read. */
+enum {
+    DS41_PROF_GLUE, DS41_PROF_EREAD, DS41_PROF_ENGRAM, DS41_PROF_HC,
+    DS41_PROF_Q, DS41_PROF_KV, DS41_PROF_COMP, DS41_PROF_INDEX, DS41_PROF_ATTN,
+    DS41_PROF_OUT, DS41_PROF_ROUTER, DS41_PROF_SHARED, DS41_PROF_ROUTED,
+    DS41_PROF_HEAD, DS41_PROF_N
+};
+static const char *const ds41_prof_name[DS41_PROF_N] = {
+    "glue", "engram_read", "engram", "hc", "attn_q", "attn_kv", "compress",
+    "indexer", "attention", "attn_out", "router", "shared", "routed", "head"
+};
+static bool ds41_prof_on;
+static int ds41_prof_phase;
+static double ds41_prof_t, ds41_prof_sec[DS41_PROF_N];
+static uint64_t ds41_prof_bytes[DS41_PROF_N];
+
+static void ds41_prof(int phase) {
+    if (!ds41_prof_on) return;
+    const double t = now_sec();
+    ds41_prof_sec[ds41_prof_phase] += t - ds41_prof_t;
+    ds41_prof_t = t;
+    ds41_prof_phase = phase;
+}
+
 static bool ds41_cpu_matvec(float *out, const ds4_model *m,
                            const ds4_tensor *weight, const float *in, bool round) {
     if (!out || !m || !weight || !in || weight->ndim < 2 ||
@@ -28,6 +54,7 @@ static bool ds41_cpu_matvec(float *out, const ds4_model *m,
     case DS4_TENSOR_Q8_0: ds41_cpu_matvec_q8(out, m, &matrix, in); break;
     default: return false;
     }
+    if (ds41_prof_on) ds41_prof_bytes[ds41_prof_phase] += matrix.bytes;
     if (round) ds41_cpu_bf16_rows(out, (size_t)matrix.dim[1]);
     return true;
 }
@@ -207,10 +234,12 @@ static bool ds41_cpu_moe(ds41_cpu_state *s, const ds4_layer_weights *l) {
     if (!l->ffn_exp_probs_b || !l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps ||
         !glm_graph_gate_pair_type_supported(l->ffn_gate_exps->type, l->ffn_up_exps->type) ||
         !glm_graph_down_type_supported(l->ffn_down_exps->type)) return false;
+    ds41_prof(DS41_PROF_ROUTER);
     if (!ds41_cpu_matvec(probs, s->model, l->ffn_gate_inp, s->norm, false)) return false;
     for (uint32_t i = 0; i < DS4_N_EXPERT; i++)
         probs[i] = sqrtf(softplus_stable(probs[i]));
     layer_topk_selected_experts_from_probs(selected, expert_weight, s->model, l, probs);
+    ds41_prof(DS41_PROF_SHARED);
     if (!ds41_cpu_matvec(s->shared_gate, s->model, l->ffn_gate_shexp, s->norm, true) ||
         !ds41_cpu_matvec(s->shared_up, s->model, l->ffn_up_shexp, s->norm, true)) return false;
     swiglu(s->shared_mid, s->shared_gate, s->shared_up, 2304, DS4_SWIGLU_CLAMP_EXP);
@@ -218,9 +247,15 @@ static bool ds41_cpu_moe(ds41_cpu_state *s, const ds4_layer_weights *l) {
     if (!ds41_cpu_matvec(s->shared, s->model, l->ffn_down_shexp, s->shared_mid, true)) return false;
     /* The quantized routed-expert kernels retain F32 intermediates and apply
      * routing weights before down projection. Shared experts round to BF16. */
+    ds41_prof(DS41_PROF_ROUTED);
+    if (ds41_prof_on)
+        ds41_prof_bytes[DS41_PROF_ROUTED] += DS4_N_EXPERT_USED *
+            ((l->ffn_gate_exps->bytes + l->ffn_up_exps->bytes +
+              l->ffn_down_exps->bytes) / DS4_N_EXPERT);
     ds41_cpu_routed_moe(s->block, s->expert_mid, s->model, l,
                        s->norm, selected, expert_weight);
     for (uint32_t i = 0; i < 5120; i++) s->block[i] = ds41_cpu_bf16(s->block[i] + s->shared[i]);
+    ds41_prof(DS41_PROF_HC);
     return true;
 }
 
@@ -239,6 +274,11 @@ static bool ds41_cpu_forward(ds41_cpu_state *s, int token, float *logits,
         return ds41_cpu_error(error, cap, "V4.1 CPU token is outside vocabulary");
     const bool profile = getenv("DS4_CPU_PROFILE") != NULL;
     const double started = profile ? now_sec() : 0;
+    ds41_prof_on = profile;
+    ds41_prof_t = started;
+    ds41_prof_phase = DS41_PROF_EREAD;
+    memset(ds41_prof_sec, 0, sizeof(ds41_prof_sec));
+    memset(ds41_prof_bytes, 0, sizeof(ds41_prof_bytes));
     double engram_seconds = 0, attention_seconds = 0, moe_seconds = 0;
     uint32_t ids[2][DS4_ENGRAM_COLS];
     ds4_engram_history next_history = s->history;
@@ -249,6 +289,7 @@ static bool ds41_cpu_forward(ds41_cpu_state *s, int token, float *logits,
             return ds41_cpu_error(error, cap, "V4.1 Engram row read failed");
     }
     const double read_seconds = profile ? now_sec() - started : 0;
+    ds41_prof(DS41_PROF_GLUE);
     embed_token_any(s->model, s->weights, token, s->x);
     hc_from_plain_embedding(s->residual, s->x, 5120, 4);
     s->pre[0] = 1.0f;
@@ -258,6 +299,7 @@ static bool ds41_cpu_forward(ds41_cpu_state *s, int token, float *logits,
         if (il == 1 || il == 14) {
             const double phase = profile ? now_sec() : 0;
             const uint32_t i = il == 1 ? 0u : 1u;
+            ds41_prof(DS41_PROF_ENGRAM);
             if (!ds41_cpu_matvec(s->engram_kv, s->model, l->engram_kv, s->rows[i], true))
                 goto layer_fail;
             ds41_cpu_engram_add(s->residual, s->engram_kv,
@@ -265,6 +307,7 @@ static bool ds41_cpu_forward(ds41_cpu_state *s, int token, float *logits,
                                tensor_data(s->model, l->engram_k_norm), 5120, DS4_RMS_EPS);
             if (profile) engram_seconds += now_sec() - phase;
         }
+        ds41_prof(DS41_PROF_HC);
         if (!ds41_cpu_hc_mix(s, l, false)) goto layer_fail;
         /* The newly computed attention mixer is consumed by the next FFN.
          * Attention itself consumes the preceding layer's FFN preweights. */
@@ -274,6 +317,7 @@ static bool ds41_cpu_forward(ds41_cpu_state *s, int token, float *logits,
         if (!ds41_cpu_attention_forward(s->attention, s->model, l, il, s->pos, s->norm, s->block))
             goto layer_fail;
         if (profile) attention_seconds += now_sec() - phase;
+        ds41_prof(DS41_PROF_HC);
         ds41_cpu_hc_expand(s->after_attn, s->block, s->residual, s->attn_split);
         if (!ds41_cpu_hc_mix(s, l, true)) goto layer_fail;
         ds41_cpu_hc_sum(s->x, s->after_attn, s->attn_split);
@@ -289,6 +333,7 @@ layer_fail:
         if (error && cap) snprintf(error, cap, "V4.1 CPU layer %u failed at token position %u", il, s->pos);
         return false;
     }
+    ds41_prof(DS41_PROF_HEAD);
     const double head_started = profile ? now_sec() : 0;
     if (logits && !ds41_cpu_logits(s, logits)) {
         s->valid = false;
@@ -304,6 +349,13 @@ layer_fail:
                 s->pos - 1u, total, read_seconds, engram_seconds, attention_seconds,
                 moe_seconds, head_seconds, total - read_seconds - engram_seconds -
                 attention_seconds - moe_seconds - head_seconds);
+        ds41_prof(DS41_PROF_GLUE);
+        fprintf(stderr, "ds4: CPU phases pos=%u", s->pos - 1u);
+        for (int i = 0; i < DS41_PROF_N; i++)
+            fprintf(stderr, " %s=%.2f/%.3f", ds41_prof_name[i],
+                    ds41_prof_sec[i] * 1e3, ds41_prof_bytes[i] / 1e9);
+        fprintf(stderr, " ms/GB\n");
+        ds41_prof_on = false;
     }
     return true;
 }

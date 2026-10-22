@@ -202,7 +202,9 @@ static void ds41_cpu_attention_candidates(ds41_cpu_attention_state *s,
 static bool ds41_cpu_attention_select(ds41_cpu_attention_state *s,
                                       const ds4_model *m, const ds4_layer_weights *l,
                                       uint32_t il, uint32_t pos, const float *norm) {
+    ds41_prof(DS41_PROF_COMP);
     if (!ds41_cpu_attention_publish(s, m, l, il, pos, norm)) return false;
+    ds41_prof(DS41_PROF_INDEX);
     const uint32_t ratio = ds4_layer_compress_ratio(il);
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0;
     if (!n_comp || !ds41_index_source(il)) return true;
@@ -274,16 +276,21 @@ static bool ds41_cpu_attention_forward(ds41_cpu_attention_state *s,
     const uint32_t ratio = ds4_layer_compress_ratio(il);
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
+    ds41_prof(DS41_PROF_Q);
     if (!ds41_cpu_matvec(s->qr, m, l->attn_q_a, norm, true) ||
         !ds41_cpu_norm(s->qr, s->qr, m, l->attn_q_a_norm) ||
-        !ds41_cpu_matvec(s->q, m, l->attn_q_b, s->qr, true) ||
-        !ds41_cpu_matvec(s->kv, m, l->attn_kv, norm, true) ||
+        !ds41_cpu_matvec(s->q, m, l->attn_q_b, s->qr, true)) return false;
+    ds41_prof(DS41_PROF_KV);
+    if (!ds41_cpu_matvec(s->kv, m, l->attn_kv, norm, true) ||
         !ds41_cpu_norm(s->kv, s->kv, m, l->attn_kv_a_norm)) return false;
+    ds41_prof(DS41_PROF_Q);
     ds41_cpu_rope(s->q, 512, 64, pos, ratio != 0, false);
+    ds41_prof(DS41_PROF_KV);
     ds41_cpu_rope(s->kv, 512, 1, pos, ratio != 0, false);
     ds41_cpu_quantize(s->kv, 512, 1, DS41_CPU_FP8_E8M0);
     memcpy(s->window[il] + (size_t)(pos % 128u) * 512u, s->kv, sizeof(s->kv));
     if (!ds41_cpu_attention_select(s, m, l, il, pos, norm)) return false;
+    ds41_prof(DS41_PROF_ATTN);
     const uint32_t attended = n_comp < 512u ? n_comp : 512u;
     const uint32_t n_raw = pos < 127u ? pos + 1u : 128u;
     ds41_cpu_attention_stage(s, il, pos, owner, n_raw, attended);
@@ -293,6 +300,7 @@ static bool ds41_cpu_attention_forward(ds41_cpu_attention_state *s,
     ds4_parallel_for(64, ds41_cpu_attention_worker, &c);
     ds41_cpu_bf16_rows(s->heads, 64u * 512u);
     ds41_cpu_rope(s->heads, 512, 64, pos, ratio != 0, true);
+    ds41_prof(DS41_PROF_OUT);
     uint64_t row_bytes;
     if (!tensor_nbytes(l->attn_output_a->type, 4096u, &row_bytes)) return false;
     for (uint32_t group = 0; group < 8; group++) {
