@@ -4400,10 +4400,24 @@ static void dsv4_indexer_qat_row_inplace_cpu(float *x, uint32_t head_dim) {
     dsv4_fp4_act_quantize_row_inplace_cpu(x, head_dim);
 }
 
-static void dsv4_indexer_qat_rows_inplace_cpu(float *x, uint32_t rows, uint32_t head_dim) {
-    for (uint32_t r = 0; r < rows; r++) {
-        dsv4_indexer_qat_row_inplace_cpu(x + (uint64_t)r * head_dim, head_dim);
+typedef struct {
+    float    *x;
+    uint32_t  head_dim;
+} indexer_qat_rows_ctx;
+
+static void indexer_qat_rows_worker(void *vctx, uint64_t r0, uint64_t r1) {
+    const indexer_qat_rows_ctx *ctx = vctx;
+    for (uint64_t r = r0; r < r1; r++) {
+        dsv4_indexer_qat_row_inplace_cpu(ctx->x + r * ctx->head_dim, ctx->head_dim);
     }
+}
+
+/* Rows are independent, so the pool splits them: the FP4 round trip of a
+ * 64-head indexer query costs about 0.3 ms serially (eight nearest-value
+ * searches per element), more than everything else the indexer does. */
+static void dsv4_indexer_qat_rows_inplace_cpu(float *x, uint32_t rows, uint32_t head_dim) {
+    indexer_qat_rows_ctx ctx = { .x = x, .head_dim = head_dim };
+    ds4_parallel_for_min_rows(rows, indexer_qat_rows_worker, &ctx, 4);
 }
 
 #if defined(DS4_NO_GPU) && defined(__AVX512F__)
