@@ -9631,6 +9631,7 @@ typedef struct {
     const uint16_t *data;
     const float *x;
     uint64_t in_dim;
+    uint64_t out_dim;
 } matvec_f16_ctx;
 
 static inline float dot_f16_row(const uint16_t *row, const float *x, uint64_t n) {
@@ -9724,6 +9725,15 @@ static void matvec_f16_worker(void *vctx, uint64_t row0, uint64_t row1) {
     }
 }
 
+/* The same rows claimed as whole DS4_F16_ROWS groups.  dot_f16_rows costs a
+ * full group whatever its row count, so the one- to three-row chunks the pool
+ * hands out for a 256-1024 row matrix wasted most of every call. */
+static void matvec_f16_group_worker(void *vctx, uint64_t g0, uint64_t g1) {
+    matvec_f16_ctx *ctx = vctx;
+    const uint64_t row1 = g1 * DS4_F16_ROWS;
+    matvec_f16_worker(ctx, g0 * DS4_F16_ROWS, row1 < ctx->out_dim ? row1 : ctx->out_dim);
+}
+
 /* Dense F16 matvec for small control projections such as HC and router heads. */
 static void matvec_f16(float *out, const ds4_model *m, const ds4_tensor *w, const float *x) {
     if (w->type != 1 || w->ndim != 2) ds4_die("expected a 2D F16 tensor");
@@ -9735,11 +9745,13 @@ static void matvec_f16(float *out, const ds4_model *m, const ds4_tensor *w, cons
         .data = tensor_data(m, w),
         .x = x,
         .in_dim = in_dim,
+        .out_dim = out_dim,
     };
 
     const uint64_t ops = in_dim * out_dim;
-    const uint64_t min_rows = ops >= 262144 ? 1 : 512;
-    ds4_parallel_for_min_rows(out_dim, matvec_f16_worker, &ctx, min_rows);
+    const uint64_t groups = (out_dim + DS4_F16_ROWS - 1) / DS4_F16_ROWS;
+    const uint64_t min_groups = ops >= 262144 ? 1 : 512 / DS4_F16_ROWS;
+    ds4_parallel_for_min_rows(groups, matvec_f16_group_worker, &ctx, min_groups);
 }
 
 /* Same matvec on the calling thread, for callers already inside a worker. */
@@ -9751,6 +9763,7 @@ static void matvec_f16_serial(float *out, const ds4_model *m, const ds4_tensor *
         .data = tensor_data(m, w),
         .x = x,
         .in_dim = w->dim[0],
+        .out_dim = w->dim[1],
     };
     matvec_f16_worker(&ctx, 0, w->dim[1]);
 }
