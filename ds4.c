@@ -78601,18 +78601,21 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             s->checkpoint_valid = false;
         }
         s->mtp_draft_valid = false;
-        for (int i = s->checkpoint.len; i < prompt->len; i++) {
+        for (int i = s->checkpoint.len; i < prompt->len;) {
             if (ds4_session_cancelled(s)) {
                 snprintf(err, errlen, "interrupted");
                 return DS4_SESSION_SYNC_INTERRUPTED;
             }
-            if (!ds41_cpu_forward(g, prompt->v[i], s->logits, err, errlen)) {
+            const int n = prompt->len - i < (int)DS41_CPU_BATCH ?
+                prompt->len - i : (int)DS41_CPU_BATCH;
+            if (!ds41_cpu_prefill(g, prompt->v + i, (uint32_t)n, s->logits, err, errlen)) {
                 s->checkpoint_valid = false;
                 return 1;
             }
-            token_vec_push(&s->checkpoint, prompt->v[i]);
+            for (int j = 0; j < n; j++) token_vec_push(&s->checkpoint, prompt->v[i + j]);
+            i += n;
             s->checkpoint_valid = true;
-            if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i + 1, prompt->len);
+            if (s->progress) s->progress(s->progress_ud, "prefill_chunk", i, prompt->len);
         }
         s->greedy_splitkv_segment.len = 0;
         s->greedy_splitkv_anchor_valid = false;

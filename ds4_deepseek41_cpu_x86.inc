@@ -416,6 +416,283 @@ static void ds41_cpu_down_worker(void *vctx, uint64_t first, uint64_t last) {
         _mm512_storeu_ps(ctx->out + row, sum);
     }
 }
+
+/* Batched prefill kernels.  A tile's weights are decoded once per block and
+ * applied to many tokens.  For every (row, token) the products and additions
+ * are those of the one-token kernels above, in the same order, so each
+ * output is bitwise the decode result.  Tokens advance in pairs or quads
+ * only to give the core independent addition chains. */
+#define DS41_CPU_PASS 32u
+
+static inline __m512 ds41_cpu_bf16_16(__m512 v) {
+    const __m512i bits = _mm512_castps_si512(v);
+    const __m512i exp = _mm512_set1_epi32(0x7f800000);
+    const __mmask16 finite = _mm512_cmpneq_epi32_mask(_mm512_and_si512(bits, exp), exp);
+    const __m512i bias = _mm512_add_epi32(_mm512_set1_epi32(0x7fff), _mm512_and_si512(
+        _mm512_srli_epi32(bits, 16), _mm512_set1_epi32(1)));
+    return _mm512_castsi512_ps(_mm512_and_si512(_mm512_mask_add_epi32(bits, finite, bits, bias),
+                                                _mm512_set1_epi32((int)0xffff0000u)));
+}
+
+/* acc[t] += w[i] * x[t][off + i] for i in [0, n), in order of i. */
+static inline void ds41_cpu_apply16(__m512 *acc, const __m512 *w, const float *const *x,
+                                    uint32_t nt, uint64_t off, uint32_t n) {
+    uint32_t t = 0;
+    for (; t + 4 <= nt; t += 4) {
+        const float *x0 = x[t] + off, *x1 = x[t + 1] + off;
+        const float *x2 = x[t + 2] + off, *x3 = x[t + 3] + off;
+        __m512 a0 = acc[t], a1 = acc[t + 1], a2 = acc[t + 2], a3 = acc[t + 3];
+        for (uint32_t i = 0; i < n; i++) {
+            a0 = _mm512_add_ps(a0, _mm512_mul_ps(w[i], _mm512_set1_ps(x0[i])));
+            a1 = _mm512_add_ps(a1, _mm512_mul_ps(w[i], _mm512_set1_ps(x1[i])));
+            a2 = _mm512_add_ps(a2, _mm512_mul_ps(w[i], _mm512_set1_ps(x2[i])));
+            a3 = _mm512_add_ps(a3, _mm512_mul_ps(w[i], _mm512_set1_ps(x3[i])));
+        }
+        acc[t] = a0; acc[t + 1] = a1; acc[t + 2] = a2; acc[t + 3] = a3;
+    }
+    for (; t < nt; t++) {
+        const float *x0 = x[t] + off;
+        __m512 a0 = acc[t];
+        for (uint32_t i = 0; i < n; i++)
+            a0 = _mm512_add_ps(a0, _mm512_mul_ps(w[i], _mm512_set1_ps(x0[i])));
+        acc[t] = a0;
+    }
+}
+
+/* The same for two matrices that read the same inputs (gate and up). */
+static inline void ds41_cpu_apply16x2(__m512 *a, __m512 *b, const __m512 *wa,
+                                      const __m512 *wb, const float *const *x,
+                                      uint32_t nt, uint64_t off, uint32_t n) {
+    uint32_t t = 0;
+    for (; t + 2 <= nt; t += 2) {
+        const float *x0 = x[t] + off, *x1 = x[t + 1] + off;
+        __m512 a0 = a[t], b0 = b[t], a1 = a[t + 1], b1 = b[t + 1];
+        for (uint32_t i = 0; i < n; i++) {
+            const __m512 v0 = _mm512_set1_ps(x0[i]), v1 = _mm512_set1_ps(x1[i]);
+            a0 = _mm512_add_ps(a0, _mm512_mul_ps(wa[i], v0));
+            b0 = _mm512_add_ps(b0, _mm512_mul_ps(wb[i], v0));
+            a1 = _mm512_add_ps(a1, _mm512_mul_ps(wa[i], v1));
+            b1 = _mm512_add_ps(b1, _mm512_mul_ps(wb[i], v1));
+        }
+        a[t] = a0; b[t] = b0; a[t + 1] = a1; b[t + 1] = b1;
+    }
+    if (t < nt) {
+        const float *x0 = x[t] + off;
+        __m512 a0 = a[t], b0 = b[t];
+        for (uint32_t i = 0; i < n; i++) {
+            const __m512 v0 = _mm512_set1_ps(x0[i]);
+            a0 = _mm512_add_ps(a0, _mm512_mul_ps(wa[i], v0));
+            b0 = _mm512_add_ps(b0, _mm512_mul_ps(wb[i], v0));
+        }
+        a[t] = a0; b[t] = b0;
+    }
+}
+
+/* The 32 values d * q of a Q8_0 block of 16 rows, as ds41_cpu_q8_rows16. */
+static inline void ds41_cpu_q8_decode16(__m512 *w, const uint8_t *block, __m512i offsets) {
+    const __m512 d = ds41_cpu_half16(_mm512_i32gather_epi32(offsets, block, 1));
+    for (unsigned i = 0; i < 32; i += 4) {
+        const __m512i packed = _mm512_i32gather_epi32(offsets, block + 2 + i, 1);
+        w[i] = _mm512_mul_ps(d, _mm512_cvtepi32_ps(_mm512_srai_epi32(_mm512_slli_epi32(packed, 24), 24)));
+        w[i + 1] = _mm512_mul_ps(d, _mm512_cvtepi32_ps(_mm512_srai_epi32(_mm512_slli_epi32(packed, 16), 24)));
+        w[i + 2] = _mm512_mul_ps(d, _mm512_cvtepi32_ps(_mm512_srai_epi32(_mm512_slli_epi32(packed, 8), 24)));
+        w[i + 3] = _mm512_mul_ps(d, _mm512_cvtepi32_ps(_mm512_srai_epi32(packed, 24)));
+    }
+}
+
+/* The 32 values scale * signed grid byte of IQ2_XXS sub-block ib, as
+ * ds41_cpu_iq2xxs_rows16; d is 0.125 times the block scale. */
+static inline void ds41_cpu_iq2xxs_decode16(__m512 *w, const uint8_t *block, unsigned ib,
+                                            __m512 d, __m512i offsets) {
+    const __m512i byte = _mm512_set1_epi32(255), zero = _mm512_setzero_si512();
+    const long long *grid = (const long long *)iq2xxs_grid;
+    const uint8_t *q = block + offsetof(block_iq2_xxs, qs) + ib * 8u;
+    const __m512i aux0 = _mm512_i32gather_epi32(offsets, q, 1);
+    const __m512i aux1 = _mm512_i32gather_epi32(offsets, q + 4, 1);
+    const __m512 scale = _mm512_mul_ps(d, _mm512_cvtepi32_ps(_mm512_add_epi32(
+        _mm512_slli_epi32(_mm512_srli_epi32(aux1, 28), 1), _mm512_set1_epi32(1))));
+    for (unsigned l = 0; l < 4; l++) {
+        const __m512i idx = _mm512_and_si512(_mm512_srli_epi32(aux0, 8 * l), byte);
+        const __m512i lo = _mm512_i32gather_epi64(_mm512_castsi512_si256(idx), grid, 8);
+        const __m512i hi = _mm512_i32gather_epi64(_mm512_extracti64x4_epi64(idx, 1), grid, 8);
+        const __m512i w0 = _mm512_inserti64x4(_mm512_castsi256_si512(
+            _mm512_cvtepi64_epi32(lo)), _mm512_cvtepi64_epi32(hi), 1);
+        const __m512i w1 = _mm512_inserti64x4(_mm512_castsi256_si512(
+            _mm512_cvtepi64_epi32(_mm512_srli_epi64(lo, 32))),
+            _mm512_cvtepi64_epi32(_mm512_srli_epi64(hi, 32)), 1);
+        const __m512i s7 = _mm512_and_si512(_mm512_srli_epi32(aux1, 7 * l),
+                                            _mm512_set1_epi32(127));
+        __m512i parity = _mm512_xor_si512(s7, _mm512_srli_epi32(s7, 4));
+        parity = _mm512_xor_si512(parity, _mm512_srli_epi32(parity, 2));
+        parity = _mm512_xor_si512(parity, _mm512_srli_epi32(parity, 1));
+        const __m512i signs = _mm512_or_si512(s7, _mm512_slli_epi32(
+            _mm512_and_si512(parity, _mm512_set1_epi32(1)), 7));
+        for (unsigned j = 0; j < 8; j++) {
+            const __m512i g = _mm512_and_si512(
+                _mm512_srli_epi32(j < 4 ? w0 : w1, 8 * (j & 3u)), byte);
+            const __mmask16 neg = _mm512_test_epi32_mask(signs, _mm512_set1_epi32(1 << j));
+            w[l * 8u + j] = _mm512_mul_ps(scale, _mm512_cvtepi32_ps(
+                _mm512_mask_sub_epi32(g, neg, zero, g)));
+        }
+    }
+}
+
+/* The 16 values (d * (sc & 15)) * q - dmin * (sc >> 4) of Q2_K group g. */
+static inline void ds41_cpu_q2k_decode16(__m512 *w, const uint8_t *block, unsigned g,
+                                         __m512 d, __m512 dmin, __m512i offsets) {
+    const __m512i low4 = _mm512_set1_epi32(15), low2 = _mm512_set1_epi32(3);
+    const __m512i sc = _mm512_and_si512(_mm512_srli_epi32(
+        _mm512_i32gather_epi32(offsets, block + (g & ~3u), 1),
+        8 * (g & 3u)), _mm512_set1_epi32(255));
+    const __m512 scale = _mm512_mul_ps(d, _mm512_cvtepi32_ps(_mm512_and_si512(sc, low4)));
+    const __m512 minv = _mm512_mul_ps(dmin, _mm512_cvtepi32_ps(_mm512_srli_epi32(sc, 4)));
+    const unsigned q_base = 32u * (g / 8u) + 16u * (g & 1u);
+    const __m512i shift = _mm512_set1_epi32((int)(((g / 2u) & 3u) * 2u));
+    for (unsigned l = 0; l < 16; l += 4) {
+        const __m512i packed = _mm512_srlv_epi32(_mm512_i32gather_epi32(
+            offsets, block + offsetof(block_q2_K, qs) + q_base + l, 1), shift);
+        for (unsigned j = 0; j < 4; j++)
+            w[l + j] = _mm512_sub_ps(_mm512_mul_ps(scale, _mm512_cvtepi32_ps(
+                _mm512_and_si512(_mm512_srli_epi32(packed, 8 * j), low2))), minv);
+    }
+}
+
+/* out[t * out_stride + r] = row r of a Q8_0 matrix times x[t * x_stride +
+ * group(r) * group_in], for n tokens, optionally rounded to BF16. */
+typedef struct {
+    const uint8_t *data;
+    const float *x;
+    float *out;
+    uint64_t x_stride, out_stride, in_dim, row_bytes, group_rows, group_in;
+    uint32_t n;
+    bool round;
+} ds41_cpu_q8_batch_ctx;
+
+static void ds41_cpu_q8_batch_worker(void *vctx, uint64_t first, uint64_t last) {
+    const ds41_cpu_q8_batch_ctx *c = vctx;
+    const __m512i offsets = ds41_cpu_row_offsets(c->row_bytes);
+    __m512 w[32], acc[DS41_CPU_PASS];
+    const float *xp[DS41_CPU_PASS];
+    for (uint64_t tile = first; tile < last; tile++) {
+        const uint64_t row = tile * 16;
+        const uint8_t *rows = c->data + row * c->row_bytes;
+        const float *x = c->x + row / c->group_rows * c->group_in;
+        for (uint32_t t0 = 0; t0 < c->n; t0 += DS41_CPU_PASS) {
+            const uint32_t nt = c->n - t0 < DS41_CPU_PASS ? c->n - t0 : DS41_CPU_PASS;
+            for (uint32_t t = 0; t < nt; t++) {
+                acc[t] = _mm512_setzero_ps();
+                xp[t] = x + (uint64_t)(t0 + t) * c->x_stride;
+            }
+            for (uint64_t b = 0; b < c->in_dim / 32; b++) {
+                ds41_cpu_q8_decode16(w, rows + b * 34, offsets);
+                ds41_cpu_apply16(acc, w, xp, nt, b * 32, 32);
+            }
+            for (uint32_t t = 0; t < nt; t++)
+                _mm512_storeu_ps(c->out + (uint64_t)(t0 + t) * c->out_stride + row,
+                                 c->round ? ds41_cpu_bf16_16(acc[t]) : acc[t]);
+        }
+    }
+}
+
+/* Routed experts of a token chunk grouped by expert: entries
+ * [first[u], first[u + 1]) are token * 6 + slot pairs of the u-th distinct
+ * expert, in token order.  mid and partial are indexed by entry. */
+typedef struct {
+    const uint8_t *gate[DS4_MAX_EXPERT], *up[DS4_MAX_EXPERT], *down[DS4_MAX_EXPERT];
+    uint32_t first[DS4_MAX_EXPERT + 1];
+    const uint32_t *entry;
+    const float *x, *weight;
+    float *mid, *partial;
+    uint64_t x_stride, gate_row_bytes, up_row_bytes, down_row_bytes;
+    float clamp;
+} ds41_cpu_routed_batch_ctx;
+
+static void ds41_cpu_routed_mid_batch_worker(void *vctx, uint64_t first, uint64_t last) {
+    const ds41_cpu_routed_batch_ctx *c = vctx;
+    const uint32_t tiles = DS4_N_FF_EXP / 16;
+    const __m512i og = ds41_cpu_row_offsets(c->gate_row_bytes);
+    const __m512i ou = ds41_cpu_row_offsets(c->up_row_bytes);
+    __m512 wg[32], wu[32], ag[DS41_CPU_PASS], au[DS41_CPU_PASS];
+    const float *xp[DS41_CPU_PASS];
+    for (uint64_t unit = first; unit < last; unit++) {
+        const uint32_t e = (uint32_t)(unit / tiles);
+        const uint64_t row = (unit % tiles) * 16;
+        const uint8_t *grows = c->gate[e] + row * c->gate_row_bytes;
+        const uint8_t *urows = c->up[e] + row * c->up_row_bytes;
+        for (uint32_t k0 = c->first[e]; k0 < c->first[e + 1]; k0 += DS41_CPU_PASS) {
+            const uint32_t nt = c->first[e + 1] - k0 < DS41_CPU_PASS ?
+                c->first[e + 1] - k0 : DS41_CPU_PASS;
+            for (uint32_t t = 0; t < nt; t++) {
+                ag[t] = au[t] = _mm512_setzero_ps();
+                xp[t] = c->x + (uint64_t)(c->entry[k0 + t] / DS4_N_EXPERT_USED) * c->x_stride;
+            }
+            for (uint64_t b = 0; b < DS4_N_EMBD / QK_K; b++) {
+                const uint8_t *gb = grows + b * sizeof(block_iq2_xxs);
+                const uint8_t *ub = urows + b * sizeof(block_iq2_xxs);
+                const __m512 dg = _mm512_mul_ps(_mm512_set1_ps(0.125f),
+                    ds41_cpu_half16(_mm512_i32gather_epi32(og, gb, 1)));
+                const __m512 du = _mm512_mul_ps(_mm512_set1_ps(0.125f),
+                    ds41_cpu_half16(_mm512_i32gather_epi32(ou, ub, 1)));
+                for (unsigned ib = 0; ib < QK_K / 32; ib++) {
+                    ds41_cpu_iq2xxs_decode16(wg, gb, ib, dg, og);
+                    ds41_cpu_iq2xxs_decode16(wu, ub, ib, du, ou);
+                    ds41_cpu_apply16x2(ag, au, wg, wu, xp, nt, b * QK_K + ib * 32u, 32);
+                }
+            }
+            for (uint32_t t = 0; t < nt; t++) {
+                const uint32_t k = c->entry[k0 + t];
+                float gate[16] __attribute__((aligned(64)));
+                float up[16] __attribute__((aligned(64)));
+                _mm512_storeu_ps(gate, ag[t]);
+                _mm512_storeu_ps(up, au[t]);
+                float *mid = c->mid + (uint64_t)k * DS4_N_FF_EXP + row;
+                for (unsigned lane = 0; lane < 16; lane++) {
+                    float g = gate[lane], u = up[lane];
+                    if (c->clamp > 1.0e-6f) {
+                        if (g > c->clamp) g = c->clamp;
+                        if (u > c->clamp) u = c->clamp;
+                        if (u < -c->clamp) u = -c->clamp;
+                    }
+                    mid[lane] = silu(g) * u * c->weight[k];
+                }
+            }
+        }
+    }
+}
+
+static void ds41_cpu_routed_down_batch_worker(void *vctx, uint64_t first, uint64_t last) {
+    const ds41_cpu_routed_batch_ctx *c = vctx;
+    const uint32_t tiles = DS4_N_EMBD / 16;
+    const __m512i od = ds41_cpu_row_offsets(c->down_row_bytes);
+    __m512 w[16], acc[DS41_CPU_PASS];
+    const float *xp[DS41_CPU_PASS];
+    for (uint64_t unit = first; unit < last; unit++) {
+        const uint32_t e = (uint32_t)(unit / tiles);
+        const uint64_t row = (unit % tiles) * 16;
+        const uint8_t *rows = c->down[e] + row * c->down_row_bytes;
+        for (uint32_t k0 = c->first[e]; k0 < c->first[e + 1]; k0 += DS41_CPU_PASS) {
+            const uint32_t nt = c->first[e + 1] - k0 < DS41_CPU_PASS ?
+                c->first[e + 1] - k0 : DS41_CPU_PASS;
+            for (uint32_t t = 0; t < nt; t++) {
+                acc[t] = _mm512_setzero_ps();
+                xp[t] = c->mid + (uint64_t)c->entry[k0 + t] * DS4_N_FF_EXP;
+            }
+            for (uint64_t b = 0; b < DS4_N_FF_EXP / QK_K; b++) {
+                const uint8_t *block = rows + b * sizeof(block_q2_K);
+                const __m512i halves = _mm512_i32gather_epi32(
+                    od, block + offsetof(block_q2_K, d), 1);
+                const __m512 d = ds41_cpu_half16(halves);
+                const __m512 dmin = ds41_cpu_half16(_mm512_srli_epi32(halves, 16));
+                for (unsigned g = 0; g < QK_K / 16; g++) {
+                    ds41_cpu_q2k_decode16(w, block, g, d, dmin, od);
+                    ds41_cpu_apply16(acc, w, xp, nt, b * QK_K + g * 16u, 16);
+                }
+            }
+            for (uint32_t t = 0; t < nt; t++)
+                _mm512_storeu_ps(c->partial + (uint64_t)c->entry[k0 + t] * DS4_N_EMBD + row, acc[t]);
+        }
+    }
+}
 #endif
 
 /* A matrix whose row groups read consecutive input slices, like the grouped
@@ -481,6 +758,95 @@ static bool ds41_cpu_matvec_q8_pair(float *out0, float *out1, const ds4_model *m
     return true;
 #else
     (void)out0; (void)out1; (void)m; (void)t0; (void)t1; (void)x;
+    return false;
+#endif
+}
+
+/* n tokens through one Q8_0 matrix: out[t * out_stride + r] = row r times
+ * x[t * x_stride + group(r) * group_in], rounded to BF16 when asked.  Every
+ * value is bitwise ds41_cpu_matvec_q8_grouped's.  Returns false, having done
+ * nothing, when the batched kernel does not apply. */
+static bool ds41_cpu_matmul_q8(float *out, uint64_t out_stride, const ds4_model *m,
+                               const ds4_tensor *t, const float *x, uint64_t x_stride,
+                               uint32_t n, uint64_t group_rows, uint64_t group_in,
+                               bool round) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    if (t->type != DS4_TENSOR_Q8_0 || t->ndim < 2 || t->dim[0] == 0 ||
+        t->dim[0] % 32 || t->dim[0] > (uint64_t)(INT32_MAX / (15 * 34)) * 32) return false;
+    const uint64_t rows = t->elements / t->dim[0];
+    if (!rows || rows % 16 || !group_rows || group_rows % 16 || rows % group_rows) return false;
+    ds41_cpu_q8_batch_ctx ctx = {
+        .data = tensor_data(m, t), .x = x, .out = out, .x_stride = x_stride,
+        .out_stride = out_stride, .in_dim = t->dim[0], .row_bytes = t->dim[0] / 32 * 34,
+        .group_rows = group_rows, .group_in = group_in, .n = n, .round = round,
+    };
+    ds4_parallel_for_min_rows(rows / 16, ds41_cpu_q8_batch_worker, &ctx, 1);
+    return true;
+#else
+    (void)out; (void)out_stride; (void)m; (void)t; (void)x; (void)x_stride;
+    (void)n; (void)group_rows; (void)group_in; (void)round;
+    return false;
+#endif
+}
+
+/* Routed experts of n tokens grouped by expert, for Q2 models.  partial gets
+ * each (token, slot) down projection; the caller adds the slots in order.
+ * Returns false, having done nothing, when the batched kernels do not apply. */
+static bool ds41_cpu_routed_moe_batch(float *partial, float *mid, uint32_t *entry,
+                                      const ds4_model *m, const ds4_layer_weights *l,
+                                      const float *x, uint64_t x_stride, uint32_t n,
+                                      const int *selected, const float *weights) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    if (!l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps ||
+        l->ffn_gate_exps->type != DS4_TENSOR_IQ2_XXS ||
+        l->ffn_up_exps->type != DS4_TENSOR_IQ2_XXS ||
+        l->ffn_down_exps->type != DS4_TENSOR_Q2_K ||
+        DS4_N_EXPERT > DS4_MAX_EXPERT || DS4_N_EXPERT_USED == 0 ||
+        DS4_N_EXPERT_USED > DS4_MAX_EXPERT_USED ||
+        DS4_N_EMBD % QK_K || DS4_N_FF_EXP % QK_K ||
+        DS4_N_EMBD / QK_K > INT32_MAX / (15 * (int)sizeof(block_q2_K)) ||
+        DS4_N_FF_EXP / QK_K > INT32_MAX / (15 * (int)sizeof(block_q2_K))) return false;
+    ds41_cpu_routed_batch_ctx c = {0};
+    uint32_t count[DS4_MAX_EXPERT] = {0}, used[DS4_MAX_EXPERT];
+    const uint32_t pairs = n * DS4_N_EXPERT_USED;
+    for (uint32_t k = 0; k < pairs; k++) {
+        if (selected[k] < 0 || (uint32_t)selected[k] >= DS4_N_EXPERT)
+            ds4_die("V4.1 CPU routed-MoE selected expert is outside range");
+        count[selected[k]]++;
+    }
+    uint32_t n_used = 0, fill[DS4_MAX_EXPERT];
+    c.first[0] = 0;
+    for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+        if (!count[e]) continue;
+        uint64_t gi, go, ui, uo, di, dout;
+        c.gate[n_used] = tensor_expert_bytes(m, l->ffn_gate_exps, e, &gi, &go, &c.gate_row_bytes);
+        c.up[n_used] = tensor_expert_bytes(m, l->ffn_up_exps, e, &ui, &uo, &c.up_row_bytes);
+        c.down[n_used] = tensor_expert_bytes(m, l->ffn_down_exps, e, &di, &dout, &c.down_row_bytes);
+        if (gi != DS4_N_EMBD || ui != DS4_N_EMBD || go != DS4_N_FF_EXP ||
+            uo != DS4_N_FF_EXP || di != DS4_N_FF_EXP || dout != DS4_N_EMBD)
+            ds4_die("V4.1 CPU routed-MoE found unexpected expert dimensions");
+        used[e] = n_used;
+        fill[n_used] = c.first[n_used];
+        c.first[n_used + 1] = c.first[n_used] + count[e];
+        n_used++;
+    }
+    for (uint32_t k = 0; k < pairs; k++) entry[fill[used[selected[k]]]++] = k;
+    c.entry = entry;
+    c.x = x;
+    c.x_stride = x_stride;
+    c.weight = weights;
+    c.mid = mid;
+    c.partial = partial;
+    c.clamp = DS4_SWIGLU_CLAMP_EXP;
+    /* Each expert is a NUMA group: a node takes the row half placed on it. */
+    ds4_pool_dispatch((uint64_t)n_used * (DS4_N_FF_EXP / 16), ds41_cpu_routed_mid_batch_worker,
+                      &c, DS4_N_FF_EXP / 16, 1);
+    ds4_pool_dispatch((uint64_t)n_used * (DS4_N_EMBD / 16), ds41_cpu_routed_down_batch_worker,
+                      &c, DS4_N_EMBD / 16, 1);
+    return true;
+#else
+    (void)partial; (void)mid; (void)entry; (void)m; (void)l; (void)x; (void)x_stride;
+    (void)n; (void)selected; (void)weights;
     return false;
 #endif
 }

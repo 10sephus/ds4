@@ -559,22 +559,12 @@ static void ds41_cpu_out_graph_run(ds41_cpu_attention_state *s, const ds4_model 
 }
 #endif
 
-/* The plain projections: the HC mixer, then q, kv, the compressor and the
- * index selection, one dispatch per matrix. */
-static bool ds41_cpu_attention_project(ds41_cpu_attention_state *s, const ds4_model *m,
-                                       const ds4_layer_weights *l, uint32_t il,
-                                       uint32_t pos, const float *norm,
-                                       const ds41_cpu_hc_job *hc) {
+/* RoPE of the token's projected q and kv, its kv into the layer's raw
+ * window, then the compressor and index selection. */
+static bool ds41_cpu_attention_cache(ds41_cpu_attention_state *s, const ds4_model *m,
+                                     const ds4_layer_weights *l, uint32_t il,
+                                     uint32_t pos, const float *norm) {
     const uint32_t ratio = ds4_layer_compress_ratio(il);
-    ds41_prof(DS41_PROF_HC);
-    if (!ds41_cpu_hc_run(hc)) return false;
-    ds41_prof(DS41_PROF_Q);
-    if (!ds41_cpu_matvec(s->qr, m, l->attn_q_a, norm, true) ||
-        !ds41_cpu_norm(s->qr, s->qr, m, l->attn_q_a_norm) ||
-        !ds41_cpu_matvec(s->q, m, l->attn_q_b, s->qr, true)) return false;
-    ds41_prof(DS41_PROF_KV);
-    if (!ds41_cpu_matvec(s->kv, m, l->attn_kv, norm, true) ||
-        !ds41_cpu_norm(s->kv, s->kv, m, l->attn_kv_a_norm)) return false;
     ds41_prof(DS41_PROF_Q);
     ds41_cpu_rope(s->q, 512, 64, pos, ratio != 0, false);
     ds41_prof(DS41_PROF_KV);
@@ -584,46 +574,56 @@ static bool ds41_cpu_attention_project(ds41_cpu_attention_state *s, const ds4_mo
     return ds41_cpu_attention_select(s, m, l, il, pos, norm);
 }
 
-/* Attention of the normalized input norm into block.  The HC mixer of the
- * layer runs alongside the projections, the HC post and the FFN input
- * after the output projection. */
-static bool ds41_cpu_attention_forward(ds41_cpu_attention_state *s,
-                                       const ds4_model *m, const ds4_layer_weights *l,
-                                       uint32_t il, uint32_t pos, const float *norm,
-                                       float *block, const ds41_cpu_hc_job *hc,
-                                       const ds41_cpu_hc_post_job *post) {
-    if (!s || il >= 40 || pos >= s->ctx) return false;
+/* The staged rows of the token and the sink softmax of its 64 heads into
+ * s->heads, rounded to BF16 and rotated back. */
+static void ds41_cpu_attention_attend(ds41_cpu_attention_state *s, const ds4_model *m,
+                                      const ds4_layer_weights *l, uint32_t il, uint32_t pos) {
     const uint32_t ratio = ds4_layer_compress_ratio(il);
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
-#if defined(__AVX512F__) && defined(__AVX512BW__)
-    const bool index = n_comp && ds41_index_source(il);
-    if (ds41_cpu_proj_graph_supported(l, il, index, hc)) {
-        ds41_prof(DS41_PROF_PROJ);
-        if (!ds41_cpu_proj_graph_run(s, m, l, il, pos, norm, index, hc)) return false;
-        ds41_prof(DS41_PROF_Q);
-        ds41_cpu_rope(s->q, 512, 64, pos, ratio != 0, false);
-        ds41_prof(DS41_PROF_INDEX);
-        if (index) ds41_cpu_attention_rank(s, il, owner, n_comp);
-    } else if (!ds41_cpu_attention_project(s, m, l, il, pos, norm, hc)) return false;
-#else
-    if (!ds41_cpu_attention_project(s, m, l, il, pos, norm, hc)) return false;
-#endif
-    ds41_prof(DS41_PROF_STAGE);
     const uint32_t attended = n_comp < 512u ? n_comp : 512u;
     const uint32_t n_raw = pos < 127u ? pos + 1u : 128u;
+    ds41_prof(DS41_PROF_STAGE);
     ds41_cpu_attention_stage(s, il, pos, owner, n_raw, attended);
-#if defined(__AVX512F__) && defined(__AVX512BW__)
-    if (ds41_cpu_out_graph_supported(l, post)) {
-        ds41_prof(DS41_PROF_OUT);
-        ds41_cpu_out_graph_run(s, m, l, pos, ratio != 0, n_raw + attended, block, post);
-        return true;
-    }
-#endif
     ds41_prof(DS41_PROF_ATTN);
     ds41_cpu_attention_heads(s, tensor_data(m, l->attn_sinks), n_raw + attended);
     ds41_cpu_bf16_rows(s->heads, 64u * 512u);
     ds41_cpu_rope(s->heads, 512, 64, pos, ratio != 0, true);
+}
+
+/* The plain projections: the HC mixer, then q, kv, the compressor and the
+ * index selection, one dispatch per matrix. */
+static bool ds41_cpu_attention_project(ds41_cpu_attention_state *s, const ds4_model *m,
+                                       const ds4_layer_weights *l, uint32_t il,
+                                       uint32_t pos, const float *norm,
+                                       const ds41_cpu_hc_job *hc) {
+    ds41_prof(DS41_PROF_HC);
+    if (!ds41_cpu_hc_run(hc)) return false;
+    ds41_prof(DS41_PROF_Q);
+    if (!ds41_cpu_matvec(s->qr, m, l->attn_q_a, norm, true) ||
+        !ds41_cpu_norm(s->qr, s->qr, m, l->attn_q_a_norm) ||
+        !ds41_cpu_matvec(s->q, m, l->attn_q_b, s->qr, true)) return false;
+    ds41_prof(DS41_PROF_KV);
+    if (!ds41_cpu_matvec(s->kv, m, l->attn_kv, norm, true) ||
+        !ds41_cpu_norm(s->kv, s->kv, m, l->attn_kv_a_norm)) return false;
+    return ds41_cpu_attention_cache(s, m, l, il, pos, norm);
+}
+
+/* Attention of one token from its projected s->qr, s->q and s->kv into
+ * s->heads, updating the caches.  Tokens must arrive in position order. */
+static bool ds41_cpu_attention_core(ds41_cpu_attention_state *s, const ds4_model *m,
+                                    const ds4_layer_weights *l, uint32_t il,
+                                    uint32_t pos, const float *norm) {
+    if (!s || il >= 40 || pos >= s->ctx) return false;
+    if (!ds41_cpu_attention_cache(s, m, l, il, pos, norm)) return false;
+    ds41_cpu_attention_attend(s, m, l, il, pos);
+    return true;
+}
+
+/* The grouped low-rank output projection of s->heads into block. */
+static bool ds41_cpu_attention_output(ds41_cpu_attention_state *s,
+                                      const ds4_model *m, const ds4_layer_weights *l,
+                                      float *block) {
     ds41_prof(DS41_PROF_OUT);
     if (l->attn_output_a->type == DS4_TENSOR_Q8_0 && l->attn_output_a->dim[0] == 4096u &&
         l->attn_output_a->elements == 4096u * 8192u) {
@@ -648,6 +648,45 @@ static bool ds41_cpu_attention_forward(ds41_cpu_attention_state *s,
     }
     if (!ds41_cpu_matvec(block, m, l->attn_output_b, s->low, false)) return false;
     ds41_cpu_bf16_rows(block, 5120);
+    return true;
+}
+
+/* Attention of the normalized input norm into block.  The HC mixer of the
+ * layer runs alongside the projections, the HC post and the FFN input
+ * after the output projection. */
+static bool ds41_cpu_attention_forward(ds41_cpu_attention_state *s,
+                                       const ds4_model *m, const ds4_layer_weights *l,
+                                       uint32_t il, uint32_t pos, const float *norm,
+                                       float *block, const ds41_cpu_hc_job *hc,
+                                       const ds41_cpu_hc_post_job *post) {
+    if (!s || il >= 40 || pos >= s->ctx) return false;
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    const uint32_t ratio = ds4_layer_compress_ratio(il);
+    const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
+    const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
+    const bool index = n_comp && ds41_index_source(il);
+    if (ds41_cpu_proj_graph_supported(l, il, index, hc)) {
+        ds41_prof(DS41_PROF_PROJ);
+        if (!ds41_cpu_proj_graph_run(s, m, l, il, pos, norm, index, hc)) return false;
+        ds41_prof(DS41_PROF_Q);
+        ds41_cpu_rope(s->q, 512, 64, pos, ratio != 0, false);
+        ds41_prof(DS41_PROF_INDEX);
+        if (index) ds41_cpu_attention_rank(s, il, owner, n_comp);
+        if (ds41_cpu_out_graph_supported(l, post)) {
+            const uint32_t attended = n_comp < 512u ? n_comp : 512u;
+            const uint32_t n_raw = pos < 127u ? pos + 1u : 128u;
+            ds41_prof(DS41_PROF_STAGE);
+            ds41_cpu_attention_stage(s, il, pos, owner, n_raw, attended);
+            ds41_prof(DS41_PROF_OUT);
+            ds41_cpu_out_graph_run(s, m, l, pos, ratio != 0, n_raw + attended, block, post);
+            return true;
+        }
+    } else if (!ds41_cpu_attention_project(s, m, l, il, pos, norm, hc)) return false;
+#else
+    if (!ds41_cpu_attention_project(s, m, l, il, pos, norm, hc)) return false;
+#endif
+    ds41_cpu_attention_attend(s, m, l, il, pos);
+    if (!ds41_cpu_attention_output(s, m, l, block)) return false;
     ds41_prof(DS41_PROF_HC);
     return ds41_cpu_hc_post_run(post);
 }

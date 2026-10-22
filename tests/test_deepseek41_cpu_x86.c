@@ -519,6 +519,113 @@ static void check_out_graph(test_layer *tl, const ds4_layer_weights *l) {
     ds41_cpu_attention_free(b); ds41_cpu_attention_free(a);
 }
 #endif
+/* The batched prefill kernels against the one-token ones, token by token:
+ * Q8_0 with BF16 rounding and row groups, then the routed experts grouped
+ * by expert with the slots added in order. */
+static void check_q8_batch(void) {
+    const uint64_t dims[] = {32, 64, 256, 1280};
+    const uint64_t rows[] = {16, 48, 512};
+    const uint32_t tokens[] = {1, 2, 3, 5, 33, 70};
+    for (size_t d = 0; d < sizeof(dims) / sizeof(*dims); d++) {
+        for (size_t r = 0; r < sizeof(rows) / sizeof(*rows); r++) {
+            for (size_t tk = 0; tk < sizeof(tokens) / sizeof(*tokens); tk++) {
+                const uint64_t k = dims[d], n = rows[r];
+                const uint32_t nt = tokens[tk];
+                const uint64_t groups = n % 32 == 0 ? 2 : 1;
+                const size_t bytes = (size_t)n * (k / 32) * 34;
+                const uint64_t xs = k * groups + 3, os = n + 5;
+                test_buffer w = test_alloc(bytes), xb = test_alloc(nt * xs * sizeof(float));
+                test_buffer ab = test_alloc(nt * os * sizeof(float));
+                test_buffer bb = test_alloc(nt * os * sizeof(float));
+                float *x = (float *)xb.data, *a = (float *)ab.data, *b = (float *)bb.data;
+                test_fill_quants(w.data, bytes, DS4_TENSOR_Q8_0);
+                for (uint64_t i = 0; i < nt * xs; i++) x[i] = test_float();
+                ds4_model m = {.map = w.data, .size = bytes};
+                ds4_tensor t = {.type = DS4_TENSOR_Q8_0, .ndim = 2,
+                               .dim = {k, n}, .elements = k * n, .bytes = bytes};
+                for (int round = 0; round < 2; round++) {
+                    memset(a, 0, nt * os * sizeof(float));
+                    memset(b, 0, nt * os * sizeof(float));
+                    for (uint32_t i = 0; i < nt; i++) {
+                        ds41_cpu_matvec_q8_grouped(a + i * os, &m, &t, x + i * xs,
+                                                   n / groups, k);
+                        if (round) ds41_cpu_bf16_rows(a + i * os, n);
+                    }
+                    if (ds41_cpu_matmul_q8(b, os, &m, &t, x, xs, nt, n / groups, k, round))
+                        test_equal("Q8 batch", a, b, nt * os);
+                }
+                test_free(bb); test_free(ab); test_free(xb); test_free(w);
+            }
+        }
+    }
+}
+
+static void check_routed_batch(uint32_t embd, uint32_t hidden, float clamp) {
+    g_ds4_shape = DS4_SHAPE_FLASH41;
+    g_ds4_shape.n_embd = embd;
+    g_ds4_shape.n_ff_exp = hidden;
+    g_ds4_shape.n_expert = 7;
+    g_ds4_shape.n_expert_used = 3;
+    g_ds4_shape.swiglu_clamp_exp = clamp;
+    const size_t gbytes = (size_t)embd * hidden * 7 / QK_K * sizeof(block_iq2_xxs);
+    const size_t dbytes = (size_t)embd * hidden * 7 / QK_K * sizeof(block_q2_K);
+    test_buffer w = test_alloc(2 * gbytes + dbytes);
+    test_fill_quants(w.data, gbytes, DS4_TENSOR_IQ2_XXS);
+    test_fill_quants(w.data + gbytes, gbytes, DS4_TENSOR_IQ2_XXS);
+    test_fill_quants(w.data + 2 * gbytes, dbytes, DS4_TENSOR_Q2_K);
+    ds4_model m = {.map = w.data, .size = 2 * gbytes + dbytes};
+    ds4_tensor gate = {.type = DS4_TENSOR_IQ2_XXS, .ndim = 3, .dim = {embd, hidden, 7},
+                      .elements = (uint64_t)embd * hidden * 7, .bytes = gbytes};
+    ds4_tensor up = gate, down = gate;
+    up.abs_offset = gbytes;
+    down.type = DS4_TENSOR_Q2_K;
+    down.abs_offset = 2 * gbytes;
+    down.bytes = dbytes;
+    down.dim[0] = hidden; down.dim[1] = embd;
+    ds4_layer_weights l = {.ffn_gate_exps = &gate, .ffn_up_exps = &up, .ffn_down_exps = &down};
+    const uint32_t tokens[] = {1, 2, 5, 9, 40};
+    for (size_t tk = 0; tk < sizeof(tokens) / sizeof(*tokens); tk++) {
+        const uint32_t nt = tokens[tk];
+        float *x = malloc((size_t)nt * embd * sizeof(float));
+        float *ma = malloc((size_t)nt * 3 * hidden * sizeof(float));
+        float *mb = malloc((size_t)nt * 3 * hidden * sizeof(float));
+        float *oa = malloc((size_t)nt * embd * sizeof(float));
+        float *ob = malloc((size_t)nt * embd * sizeof(float));
+        float *partial = malloc((size_t)nt * 3 * embd * sizeof(float));
+        float *weights = malloc((size_t)nt * 3 * sizeof(float));
+        int *selected = malloc((size_t)nt * 3 * sizeof(int));
+        uint32_t *entry = malloc((size_t)nt * 3 * sizeof(uint32_t));
+        CHECK(x && ma && mb && oa && ob && partial && weights && selected && entry);
+        for (uint32_t i = 0; i < nt * embd; i++) x[i] = test_float();
+        for (uint32_t t = 0; t < nt; t++) {
+            /* Three distinct experts, mostly 0..2 so that experts are shared. */
+            const uint32_t base = test_random() % (t % 3 ? 5 : 2);
+            for (uint32_t k = 0; k < 3; k++) {
+                selected[t * 3 + k] = (int)((base + k * (1 + t % 2)) % 7);
+                weights[t * 3 + k] = test_float();
+            }
+            if (selected[t * 3] == selected[t * 3 + 2]) selected[t * 3 + 2] = (selected[t * 3 + 2] + 1) % 7;
+            if (selected[t * 3 + 1] == selected[t * 3 + 2]) selected[t * 3 + 2] = (selected[t * 3 + 2] + 1) % 7;
+            if (selected[t * 3] == selected[t * 3 + 2]) selected[t * 3 + 2] = (selected[t * 3 + 2] + 1) % 7;
+            ds41_cpu_routed_moe(oa + (size_t)t * embd, ma + (size_t)t * 3 * hidden, &m, &l,
+                                x + (size_t)t * embd, selected + t * 3, weights + t * 3);
+        }
+        if (ds41_cpu_routed_moe_batch(partial, mb, entry, &m, &l, x, embd, nt, selected, weights)) {
+            for (uint32_t t = 0; t < nt; t++)
+                for (uint32_t i = 0; i < embd; i++) {
+                    float sum = 0.0f;
+                    for (uint32_t k = 0; k < 3; k++)
+                        sum = sum + partial[((size_t)t * 3 + k) * embd + i];
+                    ob[(size_t)t * embd + i] = sum;
+                }
+            test_equal("routed batch mid", ma, mb, (size_t)nt * 3 * hidden);
+            test_equal("routed batch out", oa, ob, (size_t)nt * embd);
+        }
+        free(entry); free(selected); free(weights); free(partial);
+        free(ob); free(oa); free(mb); free(ma); free(x);
+    }
+    test_free(w);
+}
 
 int main(void) {
     const ds4_shape saved = g_ds4_shape;
@@ -543,6 +650,9 @@ int main(void) {
             check_moe(256, 256, DS4_TENSOR_Q2_K, DS4_TENSOR_Q2_K, 10.0f);
             check_moe(512, 768, DS4_TENSOR_IQ2_XXS, DS4_TENSOR_Q2_K, 10.0f);
             check_moe(5120, 2304, DS4_TENSOR_IQ2_XXS, DS4_TENSOR_Q2_K, 10.0f);
+            check_q8_batch();
+            check_routed_batch(256, 512, 10.0f);
+            check_routed_batch(512, 256, 0.0f);
             ds4_threads_shutdown();
             printf("V4.1 CPU Q8/Q4/Q2 bitwise reference checks: %u threads%s PASS\n",
                    threads[i], mode ? ", NUMA halves" : "");
