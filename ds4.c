@@ -9611,6 +9611,42 @@ static void head_rms_norm_inplace(float *x, uint32_t n_head, uint32_t head_dim, 
         const uint32_t n = n_head - h0 < GROUP ? n_head - h0 : GROUP;
         float *heads = x + (uint64_t)h0 * head_dim;
         double ss[GROUP] = { 0.0 };
+#if defined(__AVX512F__)
+        /* One double lane per head: each 8x8 block of the eight heads is
+         * transposed (as in dot_f16_rows) so that lane h still adds
+         * (double)v * v for i = 0, 1, ... in order, with the same exact
+         * product and the same rounded add as the scalar loop. */
+        if (n == GROUP && head_dim % 8 == 0) {
+            __m512d acc = _mm512_setzero_pd();
+            for (uint32_t i = 0; i < head_dim; i += 8) {
+                __m256 p[GROUP];
+                for (unsigned h = 0; h < GROUP; h++) p[h] = _mm256_loadu_ps(heads + (uint64_t)h * head_dim + i);
+                const __m256 t0 = _mm256_unpacklo_ps(p[0], p[1]), t1 = _mm256_unpackhi_ps(p[0], p[1]);
+                const __m256 t2 = _mm256_unpacklo_ps(p[2], p[3]), t3 = _mm256_unpackhi_ps(p[2], p[3]);
+                const __m256 t4 = _mm256_unpacklo_ps(p[4], p[5]), t5 = _mm256_unpackhi_ps(p[4], p[5]);
+                const __m256 t6 = _mm256_unpacklo_ps(p[6], p[7]), t7 = _mm256_unpackhi_ps(p[6], p[7]);
+                const __m256 s0 = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(1, 0, 1, 0));
+                const __m256 s1 = _mm256_shuffle_ps(t0, t2, _MM_SHUFFLE(3, 2, 3, 2));
+                const __m256 s2 = _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(1, 0, 1, 0));
+                const __m256 s3 = _mm256_shuffle_ps(t1, t3, _MM_SHUFFLE(3, 2, 3, 2));
+                const __m256 s4 = _mm256_shuffle_ps(t4, t6, _MM_SHUFFLE(1, 0, 1, 0));
+                const __m256 s5 = _mm256_shuffle_ps(t4, t6, _MM_SHUFFLE(3, 2, 3, 2));
+                const __m256 s6 = _mm256_shuffle_ps(t5, t7, _MM_SHUFFLE(1, 0, 1, 0));
+                const __m256 s7 = _mm256_shuffle_ps(t5, t7, _MM_SHUFFLE(3, 2, 3, 2));
+                const __m256 col[8] = {
+                    _mm256_permute2f128_ps(s0, s4, 0x20), _mm256_permute2f128_ps(s1, s5, 0x20),
+                    _mm256_permute2f128_ps(s2, s6, 0x20), _mm256_permute2f128_ps(s3, s7, 0x20),
+                    _mm256_permute2f128_ps(s0, s4, 0x31), _mm256_permute2f128_ps(s1, s5, 0x31),
+                    _mm256_permute2f128_ps(s2, s6, 0x31), _mm256_permute2f128_ps(s3, s7, 0x31),
+                };
+                for (unsigned c = 0; c < 8; c++) {
+                    const __m512d d = _mm512_cvtps_pd(col[c]);
+                    acc = _mm512_add_pd(acc, _mm512_mul_pd(d, d));
+                }
+            }
+            _mm512_storeu_pd(ss, acc);
+        } else
+#endif
         for (uint32_t i = 0; i < head_dim; i++) {
             for (uint32_t h = 0; h < n; h++) {
                 const float v = heads[(uint64_t)h * head_dim + i];
