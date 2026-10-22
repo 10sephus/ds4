@@ -1537,8 +1537,9 @@ static uint16_t ffn_graph_half(void) {
     return f32_to_f16((float)(1 + quant_random() % 200) * 0.00011f);
 }
 
-/* The staged decode FFN (router, shared and routed experts in one dispatch)
- * must give the plain path's routed and shared outputs bit for bit, for a
+/* The staged decode FFN (HC pre-step, router, shared and routed experts and
+ * the HC post in one dispatch) must reproduce the plain sublayer bit for bit:
+ * norm, routed and shared outputs, post/comb and the new HC state, for a
  * hash-routed and a top-k layer, at several thread counts, with and without
  * the two-cursor NUMA split.  Eight experts are backed by memory; the hash
  * table and the selection bias keep the router inside them. */
@@ -1546,16 +1547,21 @@ static void check_ffn_graph(void) {
     const ds4_shape saved = g_ds4_shape;
     g_ds4_shape = DS4_SHAPE_FLASH;
     const uint64_t E = DS4_N_EMBD, F = DS4_N_FF_EXP, NE = DS4_N_EXPERT, U = DS4_N_EXPERT_USED;
+    const uint32_t n_hc = DS4_N_HC;
+    const uint64_t hc_dim = (uint64_t)n_hc * E, n_mix = (uint64_t)n_hc * (2 + n_hc);
     const uint64_t n_exp = 8, n_tok_ids = 16;
     const uint64_t router_bytes = NE * E * 2, bias_bytes = NE * 4, hash_bytes = U * n_tok_ids * 4;
     const uint64_t iq2_row = E / QK_K * 66, q2k_row = F / QK_K * 84;
     const uint64_t gate_bytes = n_exp * F * iq2_row, down_bytes = n_exp * E * q2k_row;
     const uint64_t sh_gate_bytes = F * (E / 32) * 34, sh_down_bytes = E * (F / 32) * 34;
-    uint64_t off[9];
-    const uint64_t sizes[9] = {router_bytes, bias_bytes, hash_bytes, gate_bytes, gate_bytes,
-                               down_bytes, sh_gate_bytes, sh_gate_bytes, sh_down_bytes};
+    const uint64_t hcfn_bytes = n_mix * hc_dim * 2;
+    enum { N_T = 13 };
+    uint64_t off[N_T];
+    const uint64_t sizes[N_T] = {router_bytes, bias_bytes, hash_bytes, gate_bytes, gate_bytes,
+                                 down_bytes, sh_gate_bytes, sh_gate_bytes, sh_down_bytes,
+                                 hcfn_bytes, 3 * 4, n_mix * 4, E * 4};
     uint64_t total = 0;
-    for (int i = 0; i < 9; i++) { off[i] = total; total += (sizes[i] + 63) / 64 * 64; }
+    for (int i = 0; i < N_T; i++) { off[i] = total; total += (sizes[i] + 63) / 64 * 64; }
     quant_buffer wb = quant_alloc(total);
     uint8_t *w = wb.data;
     for (uint64_t i = 0; i < total; i++) w[i] = (uint8_t)quant_random();
@@ -1582,6 +1588,13 @@ static void check_ffn_graph(void) {
             memcpy(w + off[t] + b * 34, &d, 2);
         }
     }
+    uint16_t *hcfn = (uint16_t *)(w + off[9]);
+    for (uint64_t i = 0; i < n_mix * hc_dim; i++) hcfn[i] = f32_to_f16(quant_float() * 0.01f);
+    float *hcscale = (float *)(w + off[10]), *hcbase = (float *)(w + off[11]);
+    float *normw = (float *)(w + off[12]);
+    for (int i = 0; i < 3; i++) hcscale[i] = 0.5f + 0.25f * (float)i;
+    for (uint64_t i = 0; i < n_mix; i++) hcbase[i] = quant_float();
+    for (uint64_t i = 0; i < E; i++) normw[i] = quant_float();
 
     ds4_model m = {.map = w, .size = total};
     ds4_tensor t_router = {.type = DS4_TENSOR_F16, .ndim = 2, .dim = {E, NE},
@@ -1603,6 +1616,14 @@ static void check_ffn_graph(void) {
     t_sh_up.abs_offset = off[7];
     ds4_tensor t_sh_down = {.type = DS4_TENSOR_Q8_0, .ndim = 2, .dim = {F, E},
                             .abs_offset = off[8], .elements = F * E, .bytes = sh_down_bytes};
+    ds4_tensor t_hcfn = {.type = DS4_TENSOR_F16, .ndim = 2, .dim = {hc_dim, n_mix},
+                         .abs_offset = off[9], .elements = hc_dim * n_mix, .bytes = hcfn_bytes};
+    ds4_tensor t_hcscale = {.type = DS4_TENSOR_F32, .ndim = 1, .dim = {3},
+                            .abs_offset = off[10], .elements = 3, .bytes = 12};
+    ds4_tensor t_hcbase = {.type = DS4_TENSOR_F32, .ndim = 1, .dim = {n_mix},
+                           .abs_offset = off[11], .elements = n_mix, .bytes = n_mix * 4};
+    ds4_tensor t_norm = {.type = DS4_TENSOR_F32, .ndim = 1, .dim = {E},
+                         .abs_offset = off[12], .elements = E, .bytes = E * 4};
     ds4_layer_weights layer;
     memset(&layer, 0, sizeof(layer));
     layer.ffn_gate_inp = &t_router;
@@ -1612,13 +1633,20 @@ static void check_ffn_graph(void) {
     layer.ffn_gate_shexp = &t_sh_gate;
     layer.ffn_up_shexp = &t_sh_up;
     layer.ffn_down_shexp = &t_sh_down;
+    layer.hc_ffn_fn = &t_hcfn;
+    layer.hc_ffn_scale = &t_hcscale;
+    layer.hc_ffn_base = &t_hcbase;
+    layer.ffn_norm = &t_norm;
     CHECK(ffn_graph_supported(&layer));
 
     ds4_cpu_decode_scratch scratch;
     cpu_decode_scratch_init(&scratch, 64);
-    float *x = xmalloc(E * sizeof(float));
-    float *moe0 = xmalloc(E * sizeof(float)), *moe1 = xmalloc(E * sizeof(float));
-    float *sh0 = xmalloc(E * sizeof(float)), *sh1 = xmalloc(E * sizeof(float));
+    float *res = xmalloc(hc_dim * sizeof(float)), *flat = xmalloc(hc_dim * sizeof(float));
+    float *cur0 = xmalloc(E * sizeof(float)), *norm0 = xmalloc(E * sizeof(float));
+    float *moe0 = xmalloc(E * sizeof(float)), *sh0 = xmalloc(E * sizeof(float));
+    float *sum = xmalloc(E * sizeof(float));
+    float *hc0 = xmalloc(hc_dim * sizeof(float)), *hc1 = xmalloc(hc_dim * sizeof(float));
+    float post0[4], comb0[16], post1[4], comb1[16];
 
     ds4_numa_init();
     const bool numa = g_numa.on;
@@ -1633,23 +1661,42 @@ static void check_ffn_graph(void) {
                 layer.ffn_gate_tid2eid = hashed ? &t_hash : NULL;
                 layer.ffn_exp_probs_b = hashed ? NULL : &t_bias;
                 const int token = (int)(quant_random() % n_tok_ids);
-                for (uint64_t i = 0; i < E; i++) x[i] = quant_float() * (iter < 2 ? 1.0f : 30.0f);
-                layer_routed_moe_one_prealloc(moe0, &m, &layer, x, 0, token, DS4_SWIGLU_CLAMP_EXP,
+                for (uint64_t i = 0; i < hc_dim; i++) res[i] = quant_float() * (iter < 2 ? 1.0f : 30.0f);
+
+                hc_pre_from_state_one_scratch(&m, &t_hcfn, &t_hcscale, &t_hcbase, res, cur0,
+                                              post0, comb0, flat, false);
+                rms_norm_weight(norm0, cur0, normw, E, DS4_RMS_EPS);
+                layer_routed_moe_one_prealloc(moe0, &m, &layer, norm0, 0, token, DS4_SWIGLU_CLAMP_EXP,
                                               scratch.routed_mid_all, scratch.routed_xq,
                                               scratch.routed_midq, scratch.routed_q8_xq,
                                               scratch.routed_q8_xscale, scratch.routed_q8_midq,
                                               scratch.routed_q8_midscale);
-                layer_shared_ffn_one_decode_scratch(sh0, &m, &layer, x, &scratch);
-                memset(moe1, 0xff, E * sizeof(float));
-                memset(sh1, 0xff, E * sizeof(float));
-                layer_ffn_moe_shared_graph(moe1, sh1, &m, &layer, x, token, &scratch);
+                layer_shared_ffn_one_decode_scratch(sh0, &m, &layer, norm0, &scratch);
+                for (uint64_t i = 0; i < E; i++) sum[i] = moe0[i] + sh0[i];
+                hc_post_one(hc0, sum, res, post0, comb0, (uint32_t)E, n_hc);
+
+                memset(scratch.ffn_moe, 0xff, E * sizeof(float));
+                memset(scratch.ffn_shared, 0xff, E * sizeof(float));
+                memset(scratch.ffn_norm, 0xff, E * sizeof(float));
+                memset(hc1, 0xff, hc_dim * sizeof(float));
+                /* Two iterations in three also fold the HC post into the dispatch. */
+                const bool fold = iter % 3 != 0;
+                layer_ffn_graph(fold ? hc1 : NULL, &m, &layer, res, token, &scratch, post1, comb1);
                 uint64_t live = 0;
                 for (uint64_t i = 0; i < E; i++) {
-                    quant_bits_equal("FFN graph routed", moe0[i], moe1[i], (unsigned)i);
-                    quant_bits_equal("FFN graph shared", sh0[i], sh1[i], (unsigned)i);
+                    quant_bits_equal("FFN graph norm", norm0[i], scratch.ffn_norm[i], (unsigned)i);
+                    quant_bits_equal("FFN graph routed", moe0[i], scratch.ffn_moe[i], (unsigned)i);
+                    quant_bits_equal("FFN graph shared", sh0[i], scratch.ffn_shared[i], (unsigned)i);
                     live += isfinite(moe0[i]) && isfinite(sh0[i]) && moe0[i] != 0.0f && sh0[i] != 0.0f;
                 }
                 CHECK(live > E / 2);   /* the weights exercise real values */
+                for (uint32_t i = 0; i < n_hc; i++) quant_bits_equal("FFN graph post", post0[i], post1[i], i);
+                for (uint32_t i = 0; i < n_hc * n_hc; i++) quant_bits_equal("FFN graph comb", comb0[i], comb1[i], i);
+                if (fold) {
+                    for (uint64_t i = 0; i < hc_dim; i++) {
+                        quant_bits_equal("FFN graph HC post", hc0[i], hc1[i], (unsigned)i);
+                    }
+                }
             }
             ds4_threads_shutdown();
             printf("CPU staged decode FFN: %u threads%s PASS\n", threads[ti], mode ? " (NUMA)" : "");
@@ -1657,7 +1704,8 @@ static void check_ffn_graph(void) {
     }
     g_numa.on = numa;
     g_requested_threads = 0;
-    free(sh1); free(sh0); free(moe1); free(moe0); free(x);
+    free(hc1); free(hc0); free(sum); free(sh0); free(moe0); free(norm0); free(cur0);
+    free(flat); free(res);
     cpu_decode_scratch_free(&scratch);
     quant_free(wb);
     g_ds4_shape = saved;

@@ -2128,7 +2128,7 @@ typedef struct {
 } ds4_pool_cursor;
 
 /* One stage of a staged dispatch (ds4_pool_run_stages): a row-parallel kernel
- * like a plain dispatch, the earlier stage it waits for, and an optional
+ * like a plain dispatch, the earlier stages it waits for, and an optional
  * serial step run by the thread that completes its last row. */
 typedef struct {
     ds4_parallel_fn fn;
@@ -2136,7 +2136,7 @@ typedef struct {
     uint64_t n_rows;
     uint64_t group_rows;
     uint64_t min_chunk;
-    int dep;                        /* earlier stage that must be finished, or -1 */
+    uint32_t deps;                  /* bit k: wait until stage k is finished */
     void (*finish)(void *ctx);      /* NULL, or the serial step after the last row */
     void *finish_ctx;
     /* Set up by ds4_pool_run_stages(); the claim layout is the plain one. */
@@ -2274,15 +2274,16 @@ static void ds4_stage_claim(ds4_pool_stage *s, int node) {
     }
 }
 
-/* Walk the stages in order: wait for the stage's dependency, then claim rows
+/* Walk the stages in order: wait for the stage's dependencies, then claim rows
  * on the home node and on the other node, as ds4_pool_work() does.  A thread
  * that runs out of rows in one stage starts on the next, so the tail of one
  * kernel overlaps the next independent one instead of waiting at a join. */
 static void ds4_stages_work(ds4_pool_stage *stages, uint32_t n_stages, int node) {
     for (uint32_t k = 0; k < n_stages; k++) {
         ds4_pool_stage *s = &stages[k];
-        if (s->dep >= 0) {
-            const uint32_t *ready = &stages[s->dep].ready;
+        for (uint32_t d = 0; d < k; d++) {
+            if (!(s->deps & (1u << d))) continue;
+            const uint32_t *ready = &stages[d].ready;
             for (uint32_t spins = 0; !__atomic_load_n(ready, __ATOMIC_ACQUIRE); spins++) {
                 ds4_cpu_relax();
                 if ((spins & 4095u) == 4095u) sched_yield();
@@ -2566,7 +2567,7 @@ static void ds4_pool_run_stages(ds4_pool_stage *stages, uint32_t n_stages) {
     const bool serial = g_parallel_depth > 0 || g_pool.n_threads <= 1;
     for (uint32_t k = 0; k < n_stages; k++) {
         ds4_pool_stage *s = &stages[k];
-        if (s->dep >= (int)k) ds4_die("staged dispatch depends on a later stage");
+        if (k >= 32 || (s->deps >> k) != 0) ds4_die("staged dispatch depends on a later stage");
         uint64_t chunk = s->n_rows / (8u * g_pool.n_threads);
         if (chunk < 1) chunk = 1;
         if (chunk > 64) chunk = 64;
@@ -14754,33 +14755,95 @@ static void layer_ffn_one(
     free(ffn_cur);
 }
 
-/* Decode routed MoE plus shared expert as one staged dispatch:
+/* The decode FFN sublayer as one staged dispatch.  The calling thread runs
+ * the HC RMS norm, then
  *
- *   0  router logits (F16)          finish: expert selection, Q8_K input
- *   1  shared gate/up (Q8_0)        finish: SwiGLU, Q8_0 shared mid
- *   2  routed gate/up (IQ2_XXS)     after 0, finish: Q8_K routed mids
- *   3  shared down (Q8_0)           after 1
- *   4  routed down (Q2_K)           after 2
+ *   0  HC mix (F16)                 finish: Sinkhorn split, stream sum,
+ *                                           ffn_norm, Q8_0 input
+ *   1  router logits (F16)          after 0, finish: selection, Q8_K input
+ *   2  shared gate/up (Q8_0)        after 0, finish: SwiGLU, Q8_0 mid
+ *   3  routed gate/up (IQ2_XXS)     after 1, finish: Q8_K routed mids
+ *   4  shared down (Q8_0)           after 2
+ *   5  routed down (Q2_K)           after 3
+ *   6  moe + shared, HC post        after 4 and 5 (when out_hc is given)
  *
- * The plain path runs these as five dispatches with the serial steps between
- * them on the calling thread.  Here the thread that completes a stage runs
- * its serial step while the others stream the weights of the next
+ * The plain path runs the six matvecs as six dispatches with the serial steps
+ * and the post on the calling thread.  Here the thread that completes a stage
+ * runs its serial step while the others stream the weights of the next
  * independent stage, and there is a single join.  Every row runs the same
- * kernel on the same inputs, so moe and shared are bitwise the plain ones. */
+ * kernel on the same inputs and the serial steps are the same functions, so
+ * moe, shared, post and comb are bitwise the plain ones, and so is out_hc,
+ * which stage 6 builds column by column like hc_post_one(). */
+typedef struct {
+    float *out_hc;
+    float *ffn_out;
+    const float *moe;
+    const float *shared;
+    const float *residual_hc;
+    const float *post;
+    const float *comb;
+} ffn_graph_post_ctx;
+
+/* moe + shared and hc_post_one() for a range of embedding columns: every
+ * element is computed with the same operations in the same order. */
+static void ffn_graph_post_worker(void *vctx, uint64_t d0, uint64_t d1) {
+    ffn_graph_post_ctx *ctx = vctx;
+    const uint32_t n_hc = DS4_N_HC;
+    const uint64_t n_embd = DS4_N_EMBD;
+    for (uint64_t d = d0; d < d1; d++) ctx->ffn_out[d] = ctx->moe[d] + ctx->shared[d];
+    for (uint32_t dst = 0; dst < n_hc; dst++) {
+        float *out = ctx->out_hc + (uint64_t)dst * n_embd;
+        const float p = ctx->post[dst];
+        for (uint64_t d = d0; d < d1; d++) out[d] = ctx->ffn_out[d] * p;
+        for (uint32_t src = 0; src < n_hc; src++) {
+            const float w = ctx->comb[dst + src * n_hc];
+            const float *res = ctx->residual_hc + (uint64_t)src * n_embd;
+            for (uint64_t d = d0; d < d1; d++) out[d] += w * res[d];
+        }
+    }
+}
+
 typedef struct {
     const ds4_model *model;
     const ds4_layer_weights *layer;
+    const float *inp_hc;
     const float *x;
     ds4_cpu_decode_scratch *scratch;
+    float *post;
+    float *comb;
     int token;
+    float mix[24];
     float logits[DS4_MAX_EXPERT];
     iq2xxs_q8 yq[DS4_MAX_EMBD / QK_K];
+    matvec_f16_ctx hc_mix;
     matvec_f16_ctx router;
     matvec_q8_0_pair_ctx shared_gate_up;
     matvec_iq2_xxs_mid_ctx routed_mid;
     matvec_q8_0_ctx shared_down;
     matvec_q2_k_accum_ctx routed_down;
+    ffn_graph_post_ctx hc_post;
 } ffn_graph_ctx;
+
+/* hc_pre_from_state_one_scratch() after its matvec, then the FFN norm and
+ * the shared expert's input quantization. */
+static void ffn_graph_hc_pre(void *vctx) {
+    ffn_graph_ctx *g = vctx;
+    const ds4_layer_weights *layer = g->layer;
+    const uint32_t n_hc = DS4_N_HC;
+    float split[24];
+
+    hc_split_sinkhorn_one(split, g->mix, tensor_data(g->model, layer->hc_ffn_scale),
+                          tensor_data(g->model, layer->hc_ffn_base), (int)n_hc,
+                          DS4_N_HC_SINKHORN_ITER, 1.0e-6f);
+    hc_weighted_sum_one(g->scratch->ffn_cur, g->inp_hc, split, DS4_N_EMBD, n_hc);
+    memcpy(g->post, split + n_hc, n_hc * sizeof(g->post[0]));
+    memcpy(g->comb, split + 2 * n_hc, n_hc * n_hc * sizeof(g->comb[0]));
+    rms_norm_weight(g->scratch->ffn_norm, g->scratch->ffn_cur,
+                    tensor_data(g->model, layer->ffn_norm), DS4_N_EMBD, DS4_RMS_EPS);
+    /* Stage 2 reads this; its finish step then reuses the buffer for the
+     * shared mid, as the plain path does. */
+    cpu_decode_quantize_q8_0(g->scratch, g->scratch->ffn_norm, DS4_N_EMBD);
+}
 
 static void ffn_graph_route(void *vctx) {
     ffn_graph_ctx *g = vctx;
@@ -14843,7 +14906,11 @@ static bool ffn_graph_supported(const ds4_layer_weights *layer) {
     }
     const ds4_tensor *r = layer->ffn_gate_inp;
     const ds4_tensor *g = layer->ffn_gate_shexp, *u = layer->ffn_up_shexp, *d = layer->ffn_down_shexp;
+    const ds4_tensor *h = layer->hc_ffn_fn;
     return enabled &&
+           h && h->type == DS4_TENSOR_F16 && h->ndim == 2 &&
+           h->dim[0] == (uint64_t)DS4_N_HC * DS4_N_EMBD &&
+           h->dim[1] == (uint64_t)DS4_N_HC * (2 + DS4_N_HC) && h->dim[1] <= 24 &&
            r && r->type == DS4_TENSOR_F16 && r->ndim == 2 &&
            r->dim[0] == DS4_N_EMBD && r->dim[1] == DS4_N_EXPERT &&
            layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
@@ -14863,32 +14930,46 @@ static bool ffn_graph_supported(const ds4_layer_weights *layer) {
            DS4_N_EMBD % QK_K == 0 && DS4_N_FF_EXP % QK_K == 0 && DS4_N_EMBD <= DS4_MAX_EMBD;
 }
 
-static void layer_ffn_moe_shared_graph(
-        float                  * moe,
-        float                  * shared,
+/* Outputs: ffn_cur, ffn_norm, ffn_moe, ffn_shared in scratch, post and comb,
+ * and with out_hc the sublayer output (ffn_out holds moe + shared). */
+static void layer_ffn_graph(
+        float                  * out_hc,
         const ds4_model        * model,
         const ds4_layer_weights * layer,
-        const float            * x,
+        const float            * inp_hc,
         int                      token,
-        ds4_cpu_decode_scratch * scratch) {
+        ds4_cpu_decode_scratch * scratch,
+        float                  * post,
+        float                  * comb) {
     ffn_graph_ctx g;   /* on the stack: token decode must not touch the heap */
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t embd_blocks = DS4_N_EMBD / 32u;
     const uint64_t mid_blocks = DS4_N_FF_EXP / 32u;
+    const float *x = scratch->ffn_norm;
+    float *moe = scratch->ffn_moe;
+    float *shared = scratch->ffn_shared;
 
     g.model = model;
     g.layer = layer;
+    g.inp_hc = inp_hc;
     g.x = x;
     g.scratch = scratch;
+    g.post = post;
+    g.comb = comb;
     g.token = token;
+    rms_norm_no_weight(scratch->hc_flat, inp_hc, hc_dim, DS4_RMS_EPS);
+    g.hc_mix = (matvec_f16_ctx) {
+        .out = g.mix,
+        .data = tensor_data(model, layer->hc_ffn_fn),
+        .x = scratch->hc_flat,
+        .in_dim = hc_dim,
+    };
     g.router = (matvec_f16_ctx) {
         .out = g.logits,
         .data = tensor_data(model, layer->ffn_gate_inp),
         .x = x,
         .in_dim = DS4_N_EMBD,
     };
-    /* Stage 1 reads this quantized input; its finish step then reuses the
-     * buffer for the shared mid, as the plain path does. */
-    cpu_decode_quantize_q8_0(scratch, x, DS4_N_EMBD);
     g.shared_gate_up = (matvec_q8_0_pair_ctx) {
         .out0 = scratch->shared_gate,
         .out1 = scratch->shared_up,
@@ -14922,22 +15003,40 @@ static void layer_ffn_moe_shared_graph(
         .n_expert = (int)DS4_N_EXPERT_USED,
     };
 
-    ds4_pool_stage stages[5] = {
+    g.hc_post = (ffn_graph_post_ctx) {
+        .out_hc = out_hc,
+        .ffn_out = scratch->ffn_out,
+        .moe = moe,
+        .shared = shared,
+        .residual_hc = inp_hc,
+        .post = post,
+        .comb = comb,
+    };
+
+    const uint64_t n_mix = layer->hc_ffn_fn->dim[1];
+    ds4_pool_stage stages[7] = {
+        { .fn = matvec_f16_worker, .ctx = &g.hc_mix,
+          .n_rows = n_mix, .group_rows = n_mix, .min_chunk = DS4_F16_ROWS,
+          .finish = ffn_graph_hc_pre, .finish_ctx = &g },
         { .fn = matvec_f16_worker, .ctx = &g.router,
           .n_rows = DS4_N_EXPERT, .group_rows = DS4_N_EXPERT, .min_chunk = DS4_F16_ROWS,
-          .dep = -1, .finish = ffn_graph_route, .finish_ctx = &g },
+          .deps = 1u << 0, .finish = ffn_graph_route, .finish_ctx = &g },
         { .fn = matvec_q8_0_pair_worker, .ctx = &g.shared_gate_up,
           .n_rows = DS4_N_FF_EXP, .group_rows = DS4_N_FF_EXP,
-          .dep = -1, .finish = ffn_graph_shared_mid, .finish_ctx = &g },
+          .deps = 1u << 0, .finish = ffn_graph_shared_mid, .finish_ctx = &g },
         { .fn = matvec_iq2_xxs_mid_worker, .ctx = &g.routed_mid,
           .n_rows = (uint64_t)DS4_N_EXPERT_USED * DS4_N_FF_EXP, .group_rows = DS4_N_FF_EXP,
-          .dep = 0, .finish = ffn_graph_routed_midq, .finish_ctx = &g },
+          .deps = 1u << 1, .finish = ffn_graph_routed_midq, .finish_ctx = &g },
         { .fn = matvec_q8_0_worker, .ctx = &g.shared_down,
-          .n_rows = DS4_N_EMBD, .group_rows = DS4_N_EMBD, .dep = 1 },
+          .n_rows = DS4_N_EMBD, .group_rows = DS4_N_EMBD, .deps = 1u << 2 },
         { .fn = matvec_q2_k_accum_worker, .ctx = &g.routed_down,
-          .n_rows = DS4_N_EMBD, .group_rows = DS4_N_EMBD, .dep = 2 },
+          .n_rows = DS4_N_EMBD, .group_rows = DS4_N_EMBD, .deps = 1u << 3 },
+        /* Light elementwise work: claims of 256 columns. */
+        { .fn = ffn_graph_post_worker, .ctx = &g.hc_post,
+          .n_rows = DS4_N_EMBD, .group_rows = DS4_N_EMBD, .min_chunk = 256,
+          .deps = (1u << 4) | (1u << 5) },
     };
-    ds4_pool_run_stages(stages, 5);
+    ds4_pool_run_stages(stages, out_hc ? 7 : 6);
 }
 
 /* Allocation-free decode FFN using the persistent CPU scratch buffers. */
@@ -14962,28 +15061,32 @@ static void layer_ffn_one_decode_scratch(
     float post[4];
     float comb[16];
 
-    double t0 = profile ? now_sec() : 0.0;
-    hc_pre_from_state_one_scratch(model,
-                                  layer->hc_ffn_fn,
-                                  layer->hc_ffn_scale,
-                                  layer->hc_ffn_base,
-                                  inp_hc, scratch->ffn_cur, post, comb,
-                                  scratch->hc_flat,
-                                  false);
-    if (profile) t_hc = now_sec() - t0;
-
-    t0 = profile ? now_sec() : 0.0;
-    const float *ffn_norm = tensor_data(model, layer->ffn_norm);
-    rms_norm_weight(scratch->ffn_norm, scratch->ffn_cur, ffn_norm, DS4_N_EMBD, DS4_RMS_EPS);
-    if (profile) t_norm = now_sec() - t0;
-
+    double t0;
+    bool post_done = false;
     if (ffn_graph_supported(layer)) {
-        /* One dispatch for both; the profile reports it as routed. */
+        /* One dispatch from the HC mix to, without steering, the HC post;
+         * the profile reports it as routed. */
+        post_done = !cpu_directional_steering_enabled(steering_dirs, steering_scale);
         t0 = profile ? now_sec() : 0.0;
-        layer_ffn_moe_shared_graph(scratch->ffn_moe, scratch->ffn_shared, model, layer,
-                                   scratch->ffn_norm, token, scratch);
+        layer_ffn_graph(post_done ? out_hc : NULL, model, layer, inp_hc, token, scratch,
+                        post, comb);
         if (profile) t_routed = now_sec() - t0;
     } else {
+        t0 = profile ? now_sec() : 0.0;
+        hc_pre_from_state_one_scratch(model,
+                                      layer->hc_ffn_fn,
+                                      layer->hc_ffn_scale,
+                                      layer->hc_ffn_base,
+                                      inp_hc, scratch->ffn_cur, post, comb,
+                                      scratch->hc_flat,
+                                      false);
+        if (profile) t_hc = now_sec() - t0;
+
+        t0 = profile ? now_sec() : 0.0;
+        const float *ffn_norm = tensor_data(model, layer->ffn_norm);
+        rms_norm_weight(scratch->ffn_norm, scratch->ffn_cur, ffn_norm, DS4_N_EMBD, DS4_RMS_EPS);
+        if (profile) t_norm = now_sec() - t0;
+
         t0 = profile ? now_sec() : 0.0;
         layer_routed_moe_one_prealloc(scratch->ffn_moe,
                                       model,
@@ -15007,11 +15110,13 @@ static void layer_ffn_one_decode_scratch(
     }
 
     t0 = profile ? now_sec() : 0.0;
-    for (uint32_t i = 0; i < DS4_N_EMBD; i++) {
-        scratch->ffn_out[i] = scratch->ffn_moe[i] + scratch->ffn_shared[i];
+    if (!post_done) {
+        for (uint32_t i = 0; i < DS4_N_EMBD; i++) {
+            scratch->ffn_out[i] = scratch->ffn_moe[i] + scratch->ffn_shared[i];
+        }
+        cpu_directional_steering_project_rows(scratch->ffn_out, steering_dirs, il, 1, steering_scale);
+        hc_post_one(out_hc, scratch->ffn_out, inp_hc, post, comb, DS4_N_EMBD, n_hc);
     }
-    cpu_directional_steering_project_rows(scratch->ffn_out, steering_dirs, il, 1, steering_scale);
-    hc_post_one(out_hc, scratch->ffn_out, inp_hc, post, comb, DS4_N_EMBD, n_hc);
     if (profile) t_post = now_sec() - t0;
 
     if (profile) {
