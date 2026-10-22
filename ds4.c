@@ -14939,22 +14939,27 @@ typedef struct {
     uint32_t         n_tok;
 } compressor_project_batch_ctx;
 
-static void compressor_project_batch_worker(void *vctx, uint64_t r0, uint64_t r1) {
+/* One item is a group of DS4_F16_ROWS weight rows: it stays in L2 while
+ * every token's activation streams past it. */
+static void compressor_project_batch_worker(void *vctx, uint64_t g0, uint64_t g1) {
     const compressor_project_batch_ctx *ctx = vctx;
-    for (uint64_t o = r0; o < r1; o++) {
-        const uint16_t *row = ctx->w + o * ctx->in_dim;
+    for (uint64_t g = g0; g < g1; g++) {
+        const uint64_t o = g * DS4_F16_ROWS;
+        const uint64_t n_rows = ctx->width - o < DS4_F16_ROWS ? ctx->width - o : DS4_F16_ROWS;
+        const uint16_t *rows = ctx->w + o * ctx->in_dim;
         for (uint32_t t = 0; t < ctx->n_tok; t++) {
-            ctx->out[(uint64_t)t * ctx->width + o] =
-                dot_f16_row(row, ctx->x + (uint64_t)t * ctx->in_dim, ctx->in_dim);
+            dot_f16_rows(ctx->out + (uint64_t)t * ctx->width + o, rows, n_rows,
+                         ctx->x + (uint64_t)t * ctx->in_dim, ctx->in_dim);
         }
     }
 }
 
 /* Prefill compressor projections for all tokens at once, row-outer so each
  * F16 weight row is read once instead of once per token and the thread pool
- * is dispatched once per matrix instead of twice per token.  Every element is
- * the same dot_f16_row() call the per-token path makes, so the rows are
- * bit-identical.  Other weight types keep the per-token projection. */
+ * is dispatched once per matrix instead of twice per token.  Every element
+ * is the row-group kernel's result for its row, bitwise the dot_f16_row()
+ * call the per-token path makes.  Other weight types keep the per-token
+ * projection. */
 static void compressor_project_batch(
         float            * kv_all,
         float            * sc_all,
@@ -14983,10 +14988,11 @@ static void compressor_project_batch(
         .width = width,
         .n_tok = n_tok,
     };
-    ds4_parallel_for_min_rows(width, compressor_project_batch_worker, &ctx, 1);
+    const uint64_t groups = (width + DS4_F16_ROWS - 1) / DS4_F16_ROWS;
+    ds4_parallel_for_min_rows(groups, compressor_project_batch_worker, &ctx, 1);
     ctx.out = sc_all;
     ctx.w = tensor_data(model, wgate);
-    ds4_parallel_for_min_rows(width, compressor_project_batch_worker, &ctx, 1);
+    ds4_parallel_for_min_rows(groups, compressor_project_batch_worker, &ctx, 1);
 }
 
 /* Streaming compressor update for one token given its projected rows.  It
