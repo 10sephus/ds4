@@ -779,7 +779,8 @@ static bool ds41_cpu_matmul(float *out, uint64_t out_stride, const ds4_model *m,
     matrix.ndim = 2;
     matrix.elements = matrix.dim[0] * matrix.dim[1];
     if (ds41_cpu_matmul_q8(out, out_stride, m, &matrix, x, x_stride, n,
-                           matrix.dim[1], 0, round)) return true;
+                           matrix.dim[1], 0, round) ||
+        ds41_cpu_matmul_f16(out, out_stride, m, &matrix, x, x_stride, n, round)) return true;
     for (uint32_t t = 0; t < n; t++)
         if (!ds41_cpu_matvec(out + (size_t)t * out_stride, m, w,
                              x + (size_t)t * x_stride, round)) return false;

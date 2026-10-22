@@ -630,6 +630,49 @@ static void ds41_cpu_q8_batch_worker(void *vctx, uint64_t first, uint64_t last) 
     }
 }
 
+/* out[t * out_stride + r] = row r of an F16 matrix times x[t * x_stride] for
+ * n tokens, optionally rounded to BF16, as matvec_f16 computes each token:
+ * dot_f16_rows converts a weight with VCVTPH2PS, multiplies it by x and adds
+ * the product to the row's sum in input order. */
+typedef struct {
+    const uint8_t *data;
+    const float *x;
+    float *out;
+    uint64_t x_stride, out_stride, in_dim, row_bytes;
+    uint32_t n;
+    bool round;
+} ds41_cpu_f16_batch_ctx;
+
+static void ds41_cpu_f16_batch_worker(void *vctx, uint64_t first, uint64_t last) {
+    const ds41_cpu_f16_batch_ctx *c = vctx;
+    const __m512i offsets = ds41_cpu_row_offsets(c->row_bytes);
+    __m512 w[32], acc[DS41_CPU_PASS];
+    const float *xp[DS41_CPU_PASS];
+    for (uint64_t tile = first; tile < last; tile++) {
+        const uint64_t row = tile * 16;
+        const uint8_t *rows = c->data + row * c->row_bytes;
+        for (uint32_t t0 = 0; t0 < c->n; t0 += DS41_CPU_PASS) {
+            const uint32_t nt = c->n - t0 < DS41_CPU_PASS ? c->n - t0 : DS41_CPU_PASS;
+            for (uint32_t t = 0; t < nt; t++) {
+                acc[t] = _mm512_setzero_ps();
+                xp[t] = c->x + (uint64_t)(t0 + t) * c->x_stride;
+            }
+            for (uint64_t i = 0; i < c->in_dim; i += 32) {
+                /* Each dword gathers the halves of inputs j and j + 1. */
+                for (unsigned k = 0; k < 16; k++) {
+                    const __m512i pair = _mm512_i32gather_epi32(offsets, rows + 2 * (i + 2 * k), 1);
+                    w[2 * k] = _mm512_cvtph_ps(_mm512_cvtepi32_epi16(pair));
+                    w[2 * k + 1] = _mm512_cvtph_ps(_mm512_cvtepi32_epi16(_mm512_srli_epi32(pair, 16)));
+                }
+                ds41_cpu_apply16(acc, w, xp, nt, i, 32);
+            }
+            for (uint32_t t = 0; t < nt; t++)
+                _mm512_storeu_ps(c->out + (uint64_t)(t0 + t) * c->out_stride + row,
+                                 c->round ? ds41_cpu_bf16_16(acc[t]) : acc[t]);
+        }
+    }
+}
+
 /* F32 rows times many tokens with matvec_f32_worker's double chain for each
  * (row, token): (double)w * x added in input order, rounded to float at the
  * end.  SIMD lanes are eight tokens of xt, the inputs as [group][i][8]
@@ -880,6 +923,30 @@ static bool ds41_cpu_matmul_q8(float *out, uint64_t out_stride, const ds4_model 
 #else
     (void)out; (void)out_stride; (void)m; (void)t; (void)x; (void)x_stride;
     (void)n; (void)group_rows; (void)group_in; (void)round;
+    return false;
+#endif
+}
+
+/* n tokens through an F16 matrix, each output bitwise matvec_f16's (then
+ * rounded to BF16 when asked).  Returns false, having done nothing, when the
+ * batched kernel does not apply. */
+static bool ds41_cpu_matmul_f16(float *out, uint64_t out_stride, const ds4_model *m,
+                                const ds4_tensor *t, const float *x, uint64_t x_stride,
+                                uint32_t n, bool round) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    if (t->type != DS4_TENSOR_F16 || t->ndim < 2 || t->dim[0] == 0 || t->dim[0] % 32 ||
+        t->dim[0] > (uint64_t)INT32_MAX / 32) return false;
+    const uint64_t rows = t->elements / t->dim[0];
+    if (!rows || rows % 16 || !n) return false;
+    ds41_cpu_f16_batch_ctx ctx = {
+        .data = tensor_data(m, t), .x = x, .out = out, .x_stride = x_stride,
+        .out_stride = out_stride, .in_dim = t->dim[0], .row_bytes = t->dim[0] * 2,
+        .n = n, .round = round,
+    };
+    ds4_parallel_for_min_rows(rows / 16, ds41_cpu_f16_batch_worker, &ctx, 1);
+    return true;
+#else
+    (void)out; (void)out_stride; (void)m; (void)t; (void)x; (void)x_stride; (void)n; (void)round;
     return false;
 #endif
 }

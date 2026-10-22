@@ -560,6 +560,47 @@ static void check_q8_batch(void) {
     }
 }
 
+/* The batched F16 kernel against matvec_f16 token by token, with and
+ * without BF16 rounding, special halves included. */
+static void check_f16_batch(void) {
+    const uint64_t dims[] = {32, 64, 1280, 6144};
+    const uint64_t rows[] = {16, 48, 512};
+    const uint32_t tokens[] = {1, 2, 3, 5, 33, 70};
+    for (size_t d = 0; d < sizeof(dims) / sizeof(*dims); d++) {
+        for (size_t r = 0; r < sizeof(rows) / sizeof(*rows); r++) {
+            for (size_t tk = 0; tk < sizeof(tokens) / sizeof(*tokens); tk++) {
+                const uint64_t k = dims[d], n = rows[r];
+                const uint32_t nt = tokens[tk];
+                const size_t bytes = (size_t)n * k * 2;
+                const uint64_t xs = k + 3, os = n + 5;
+                test_buffer w = test_alloc(bytes), xb = test_alloc(nt * xs * sizeof(float));
+                test_buffer ab = test_alloc(nt * os * sizeof(float));
+                test_buffer bb = test_alloc(nt * os * sizeof(float));
+                float *x = (float *)xb.data, *a = (float *)ab.data, *b = (float *)bb.data;
+                for (size_t i = 0; i < bytes; i += 2) {
+                    const uint16_t h = test_half();
+                    memcpy(w.data + i, &h, sizeof(h));
+                }
+                for (uint64_t i = 0; i < nt * xs; i++) x[i] = test_float();
+                ds4_model m = {.map = w.data, .size = bytes};
+                ds4_tensor t = {.type = DS4_TENSOR_F16, .ndim = 2,
+                               .dim = {k, n}, .elements = k * n, .bytes = bytes};
+                for (int round = 0; round < 2; round++) {
+                    memset(a, 0, nt * os * sizeof(float));
+                    memset(b, 0, nt * os * sizeof(float));
+                    for (uint32_t i = 0; i < nt; i++) {
+                        matvec_f16(a + i * os, &m, &t, x + i * xs);
+                        if (round) ds41_cpu_bf16_rows(a + i * os, n);
+                    }
+                    if (ds41_cpu_matmul_f16(b, os, &m, &t, x, xs, nt, round))
+                        test_equal("F16 batch", a, b, nt * os);
+                }
+                test_free(bb); test_free(ab); test_free(xb); test_free(w);
+            }
+        }
+    }
+}
+
 static void check_f32_batch(void) {
     const uint64_t dims[] = {1, 7, 256, 5120};
     const uint64_t rows[] = {1, 3, 4, 5, 24, 384};
@@ -684,6 +725,7 @@ int main(void) {
             check_moe(512, 768, DS4_TENSOR_IQ2_XXS, DS4_TENSOR_Q2_K, 10.0f);
             check_moe(5120, 2304, DS4_TENSOR_IQ2_XXS, DS4_TENSOR_Q2_K, 10.0f);
             check_q8_batch();
+            check_f16_batch();
             check_f32_batch();
             check_routed_batch(256, 512, 10.0f);
             check_routed_batch(512, 256, 0.0f);
