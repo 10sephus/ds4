@@ -213,12 +213,13 @@ static void ds41_cpu_hc_post_norm(void *vctx) {
 #define DS41_CPU_BATCH 512u
 #define DS41_CPU_BATCH_TOKEN_BYTES (4u * (3u * 4u * 5120u + 4u * 5120u + 52u + 1280u + \
     2u * 64u * 512u + 512u + 8192u + 2u * 24u * 256u + 5u * 5120u + 3u * 2304u + \
-    6u * (2304u + 5120u + 1u) + 6u + 48u + 6u + 512u + 24u + 384u + 2u * 4u * 5120u))
+    6u * (2304u + 5120u + 1u) + 6u + 48u + 6u + 512u + 24u + 384u + 2u * 4u * 5120u + \
+    2u * 512u + 32u * 128u + 32u))
 typedef struct ds41_cpu_batch {
     float *residual, *after_attn, *flat, *x, *norm, *block, *shared;
     float *pre, *attn_split, *ffn_split, *qr, *q, *kv, *heads, *low;
     float *rows, *engram_kv, *shared_gate, *shared_up, *shared_mid;
-    float *mid, *partial, *weight, *mix, *probs;
+    float *mid, *partial, *weight, *mix, *probs, *ckv, *cscore, *iq, *iw;
     double *xt;
     int *selected;
     uint32_t *ids, *entry, *sel;
@@ -709,6 +710,7 @@ static void ds41_cpu_batch_free(ds41_cpu_batch *b) {
     free(b->shared_mid); free(b->mid); free(b->partial); free(b->weight);
     free(b->selected); free(b->ids); free(b->entry); free(b->sel);
     free(b->mix); free(b->probs); free(b->xt);
+    free(b->ckv); free(b->cscore); free(b->iq); free(b->iw);
     free(b);
 }
 
@@ -747,12 +749,17 @@ static ds41_cpu_batch *ds41_cpu_batch_create(void) {
     b->mix = malloc(n * 24u * f);
     b->probs = malloc(n * DS4_N_EXPERT * f);
     b->xt = malloc(n * 4u * 5120u * sizeof(double));
+    b->ckv = malloc(n * 512u * f);
+    b->cscore = malloc(n * 512u * f);
+    b->iq = malloc(n * 32u * 128u * f);
+    b->iw = malloc(n * 32u * f);
     if (!b->residual || !b->after_attn || !b->flat || !b->x || !b->norm ||
         !b->block || !b->shared || !b->pre || !b->attn_split || !b->ffn_split ||
         !b->qr || !b->q || !b->kv || !b->heads || !b->low || !b->rows ||
         !b->engram_kv || !b->shared_gate || !b->shared_up || !b->shared_mid ||
         !b->mid || !b->partial || !b->weight || !b->selected || !b->ids || !b->entry ||
-        !b->sel || !b->mix || !b->probs || !b->xt) {
+        !b->sel || !b->mix || !b->probs || !b->xt || !b->ckv || !b->cscore ||
+        !b->iq || !b->iw) {
         ds41_cpu_batch_free(b);
         return NULL;
     }
@@ -954,18 +961,34 @@ static bool ds41_cpu_prefill_layer(ds41_cpu_state *s, uint32_t il, uint32_t n,
     if (c.failed ||
         !ds41_cpu_matmul(b->q, 64u * 512u, m, l->attn_q_b, b->qr, 1280, n, true)) return false;
     DS41_PHASE(1);
+    /* The compressor and indexer projections of the chunk, which the
+     * token loop below would otherwise compute one token at a time. */
+    const uint32_t ratio = ds4_layer_compress_ratio(il);
+    const bool kv_source = ds41_kv_source(il), index = ds41_index_source(il);
+    if (kv_source &&
+        (!ds41_cpu_matmul(b->ckv, 512, m, l->attn_compressor_kv, b->norm, 5120, n, ratio == 1u) ||
+         (ratio == 2u && !ds41_cpu_matmul(b->cscore, 512, m, l->attn_compressor_gate,
+                                          b->norm, 5120, n, false)))) return false;
+    if (index &&
+        (!ds41_cpu_matmul(b->iq, 32u * 128u, m, l->indexer_attn_q_b, b->qr, 1280, n, true) ||
+         !ds41_cpu_matmul(b->iw, 32, m, l->indexer_proj, b->norm, 5120, n, true))) return false;
     /* A compressed layer that is no index source attends the rows its
      * token's last index source selected: keep that selection per token. */
-    const bool index = ds41_index_source(il);
-    const bool reuse = !index && ds4_layer_compress_ratio(il) != 0;
+    const bool reuse = !index && ratio != 0;
     for (uint32_t i = 0; i < n; i++) {
         uint32_t *sel = b->sel + (size_t)i * 512u;
         memcpy(as->qr, b->qr + (size_t)i * 1280u, sizeof(as->qr));
         memcpy(as->q, b->q + (size_t)i * 64u * 512u, sizeof(as->q));
         memcpy(as->kv, b->kv + (size_t)i * 512u, sizeof(as->kv));
         if (reuse) memcpy(as->selected_comp, sel, sizeof(as->selected_comp));
-        if (!ds41_cpu_attention_core(as, m, l, il, s->pos + i, b->norm + (size_t)i * 5120u))
-            return false;
+        as->given_kv = kv_source ? b->ckv + (size_t)i * 512u : NULL;
+        as->given_score = kv_source && ratio == 2u ? b->cscore + (size_t)i * 512u : NULL;
+        as->given_index_q = index ? b->iq + (size_t)i * 32u * 128u : NULL;
+        as->given_index_w = index ? b->iw + (size_t)i * 32u : NULL;
+        const bool ok = ds41_cpu_attention_core(as, m, l, il, s->pos + i,
+                                                b->norm + (size_t)i * 5120u);
+        as->given_kv = as->given_score = as->given_index_q = as->given_index_w = NULL;
+        if (!ok) return false;
         if (index) memcpy(sel, as->selected_comp, sizeof(as->selected_comp));
         memcpy(b->heads + (size_t)i * 64u * 512u, as->heads, sizeof(as->heads));
     }
