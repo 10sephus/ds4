@@ -883,6 +883,8 @@ static void check_q8_0_batch(void) {
 typedef struct {
     uint32_t claims[64 * DS4_MAX_THREADS];
     uint64_t n_rows;
+    uint64_t group_rows;
+    uint64_t half_rows;
     uint64_t nested_rows;
     uint32_t threads_seen;
     uint32_t round;
@@ -898,7 +900,14 @@ static void pool_nested_worker(void *vctx, uint64_t row0, uint64_t row1) {
 
 static void pool_claim_worker(void *vctx, uint64_t row0, uint64_t row1) {
     pool_test_ctx *ctx = vctx;
-    CHECK(row0 < row1 && row1 <= ctx->n_rows && row1 - row0 <= 64);
+    CHECK(row0 < row1 && row1 <= ctx->n_rows);
+    if (g_pool.n_threads > 1) {   /* one thread runs the whole range inline */
+        CHECK(row1 - row0 <= 64);
+        /* A claim never crosses the half of a group that belongs to one node. */
+        const uint64_t g = row0 / ctx->group_rows;
+        const uint64_t i = row0 - g * ctx->group_rows;
+        CHECK(row1 <= g * ctx->group_rows + (i < ctx->half_rows ? ctx->half_rows : ctx->group_rows));
+    }
     if (pool_thread_round != ctx->round) {
         pool_thread_round = ctx->round;
         __atomic_fetch_add(&ctx->threads_seen, 1, __ATOMIC_RELAXED);
@@ -913,14 +922,16 @@ static void pool_claim_worker(void *vctx, uint64_t row0, uint64_t row1) {
     }
 }
 
-static void pool_dispatch(pool_test_ctx *ctx, uint64_t n_rows, bool slow) {
+static void pool_dispatch(pool_test_ctx *ctx, uint64_t n_rows, uint64_t group_rows, bool slow) {
     ctx->n_rows = n_rows;
+    ctx->group_rows = group_rows;
+    ctx->half_rows = g_numa.on ? group_rows / 2 : group_rows;
     ctx->nested_rows = 0;
     ctx->threads_seen = 0;
     ctx->slow = slow;
     ctx->round++;
     memset(ctx->claims, 0, (size_t)n_rows * sizeof(ctx->claims[0]));
-    ds4_parallel_for_min_rows(n_rows, pool_claim_worker, ctx, 1);
+    ds4_pool_dispatch(n_rows, pool_claim_worker, ctx, group_rows, 1);
     for (uint64_t r = 0; r < n_rows; r++) CHECK(ctx->claims[r] == 1);
     CHECK(ctx->nested_rows == 1000);
 }
@@ -931,20 +942,31 @@ static void check_thread_pool(void) {
     CHECK(ctx);
     alarm(600);   /* a lost wake-up would otherwise hang here forever */
     CHECK(ds4_default_threads() >= 1 && ds4_default_threads() <= DS4_MAX_THREADS);
-    for (size_t i = 0; i < sizeof(threads) / sizeof(*threads); i++) {
-        g_requested_threads = threads[i];
-        ds4_threads_init();
-        CHECK(g_pool.n_threads == threads[i]);
-        pool_dispatch(ctx, 64 * threads[i], true);
-        CHECK(ctx->threads_seen >= (threads[i] + 1) / 2);
-        const uint32_t rounds = threads[i] == DS4_MAX_THREADS ? 2000 : 100000;
-        for (uint32_t k = 0; k < rounds; k++) {
-            pool_dispatch(ctx, 1 + k % 37, false);
-            if (k % 2000 == 0) usleep(3 * DS4_POOL_SPIN_US);
+    ds4_numa_init();
+    const bool numa = g_numa.on;
+    /* The two-cursor split runs where the host has two NUMA nodes in the
+     * affinity mask; the plain pool runs everywhere. */
+    for (int mode = numa; mode >= 0; mode--) {
+        g_numa.on = mode;
+        for (size_t i = 0; i < sizeof(threads) / sizeof(*threads); i++) {
+            g_requested_threads = threads[i];
+            ds4_threads_init();
+            CHECK(g_pool.n_threads == threads[i]);
+            pool_dispatch(ctx, 64 * threads[i], 64 * threads[i], true);
+            CHECK(ctx->threads_seen >= (threads[i] + 1) / 2);
+            pool_dispatch(ctx, 6 * 600, 600, false);        /* six experts' rows */
+            pool_dispatch(ctx, 7 * 333 + 100, 333, false);  /* odd halves, partial group */
+            pool_dispatch(ctx, 3000, 1, false);             /* nothing for node 0 */
+            const uint32_t rounds = threads[i] == DS4_MAX_THREADS ? 2000 : 100000;
+            for (uint32_t k = 0; k < rounds; k++) {
+                pool_dispatch(ctx, 1 + k % 37, 1 + k % 37, false);
+                if (k % 2000 == 0) usleep(3 * DS4_POOL_SPIN_US);
+            }
+            ds4_threads_shutdown();
+            printf("CPU thread pool: %u threads%s PASS\n", threads[i], mode ? " (NUMA)" : "");
         }
-        ds4_threads_shutdown();
-        printf("CPU thread pool: %u threads PASS\n", threads[i]);
     }
+    g_numa.on = numa;
     g_requested_threads = 0;
     free(ctx);
 }

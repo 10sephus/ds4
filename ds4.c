@@ -2103,8 +2103,32 @@ typedef void (*ds4_parallel_fn)(void *ctx, uint64_t row0, uint64_t row1);
  * still frees the core across the serial attention loop and between tokens. */
 #define DS4_POOL_SPIN_US 1000
 
+/* NUMA topology of the CPUs this process may run on.  On a two-socket host
+ * the pool splits every row range between the sockets and keeps each worker
+ * on its home socket, so weights placed by model_place_weights() stream over
+ * the local memory controller instead of the interconnect.  One node (or a
+ * cpuset inside one node), more than two nodes, and DS4_NUMA=0 run the plain
+ * single-cursor pool; nothing but timing depends on the mode. */
+typedef struct {
+    bool on;
+    uint32_t cpus[2];
+    uint32_t cores[2];
+#if defined(__linux__)
+    cpu_set_t all;      /* process mask at startup, restored at shutdown */
+    cpu_set_t set[2];   /* the CPUs of each node inside that mask */
+#endif
+} ds4_numa_topology;
+
+static ds4_numa_topology g_numa;
+
+/* A claim cursor per node on its own cache line. */
+typedef struct {
+    uint64_t v __attribute__((aligned(64)));
+} ds4_pool_cursor;
+
 typedef struct {
     pthread_t threads[DS4_MAX_THREADS];
+    uint8_t thread_node[DS4_MAX_THREADS];   /* home NUMA node per thread */
     pthread_mutex_t mutex;
     pthread_cond_t work_cond;
     pthread_cond_t done_cond;
@@ -2114,13 +2138,19 @@ typedef struct {
     bool shutdown;
     ds4_parallel_fn fn;
     void *ctx;
-    uint64_t n_rows;
     uint64_t chunk;
+    /* Rows come in groups of group_rows (the whole dispatch, or one expert).
+     * Node 0's cursor covers the first half_rows of every group and node 1's
+     * the rest, each as a dense virtual index space of end[node] entries.
+     * Without NUMA half_rows == group_rows and the second space is empty. */
+    uint64_t group_rows;
+    uint64_t half_rows;
+    uint64_t end[2];
     /* Each dispatch-hot word gets its own cache line: generation is polled by
-     * every idle worker, cursor is bumped by every chunk claim and pending by
-     * every finishing worker. */
+     * every idle worker, a cursor is bumped by every chunk claim on its node
+     * and pending by every finishing worker. */
     uint32_t generation __attribute__((aligned(64)));
-    uint64_t cursor __attribute__((aligned(64)));
+    ds4_pool_cursor cursor[2];
     uint32_t pending __attribute__((aligned(64)));
 } ds4_thread_pool;
 
@@ -2159,30 +2189,60 @@ static void ds4_pool_notify(pthread_cond_t *cond) {
     pthread_mutex_unlock(&g_pool.mutex);
 }
 
-/* Claim chunks of rows until the shared cursor passes n_rows.  Every row is
- * still computed whole by exactly one thread, so the result does not depend
- * on which thread claims which chunk or in what order. */
-static void ds4_pool_work(void) {
-    const uint64_t n_rows = g_pool.n_rows;
-    const uint64_t chunk = g_pool.chunk;
+/* Claim chunks from one node's cursor until it passes end[node].  A chunk is
+ * a run of virtual indices, handed to fn one group half at a time so that
+ * every call sees contiguous rows.  Every row is still computed whole by
+ * exactly one thread, so the result does not depend on which thread claims
+ * which chunk, in what order, or from which cursor. */
+static void ds4_pool_claim(int node) {
+    const uint64_t group = g_pool.group_rows;
+    const uint64_t half = node ? group - g_pool.half_rows : g_pool.half_rows;
+    const uint64_t first = node ? g_pool.half_rows : 0;
+    const uint64_t end = g_pool.end[node];
     for (;;) {
-        const uint64_t row0 = __atomic_fetch_add(&g_pool.cursor, chunk, __ATOMIC_RELAXED);
-        if (row0 >= n_rows) return;
-        g_pool.fn(g_pool.ctx, row0, row0 + chunk < n_rows ? row0 + chunk : n_rows);
+        uint64_t v = __atomic_fetch_add(&g_pool.cursor[node].v, g_pool.chunk, __ATOMIC_RELAXED);
+        if (v >= end) return;
+        const uint64_t v_end = v + g_pool.chunk < end ? v + g_pool.chunk : end;
+        while (v < v_end) {
+            const uint64_t g = v / half;
+            const uint64_t i = v - g * half;
+            const uint64_t n = half - i < v_end - v ? half - i : v_end - v;
+            const uint64_t row0 = g * group + first + i;
+            g_pool.fn(g_pool.ctx, row0, row0 + n);
+            v += n;
+        }
     }
+}
+
+/* Home cursor first, then whatever is left on the other node: a short tail
+ * of remote reads beats an idle thread waiting at the join. */
+static void ds4_pool_work(int node) {
+    ds4_pool_claim(node);
+    ds4_pool_claim(1 - node);
+}
+
+/* Soft-pin the calling thread to its home node's whole CPU set, never to one
+ * CPU: the scheduler must still be able to move it off a busy core. */
+static void ds4_numa_pin(int node) {
+#if defined(__linux__)
+    if (g_numa.on) sched_setaffinity(0, sizeof(cpu_set_t), &g_numa.set[node]);
+#else
+    (void)node;
+#endif
 }
 
 /* The pool generation advances once per dispatch (and once at shutdown), and
  * a dispatch cannot start before every worker finished the previous one, so a
  * private counter tracks it exactly. */
 static void *ds4_worker_main(void *arg) {
-    (void)arg;
+    const int node = g_pool.thread_node[(uintptr_t)arg];
     uint32_t generation = 0;
     g_parallel_depth = 1;   /* a kernel that dispatches again runs it inline */
+    ds4_numa_pin(node);
     for (;;) {
         ds4_pool_wait(&g_pool.generation, ++generation, &g_pool.work_cond);
         if (g_pool.shutdown) return NULL;
-        ds4_pool_work();
+        ds4_pool_work(node);
         if (__atomic_sub_fetch(&g_pool.pending, 1, __ATOMIC_RELEASE) == 0) {
             ds4_pool_notify(&g_pool.done_cond);
         }
@@ -2200,6 +2260,68 @@ static int ds4_cpu_topology_id(int cpu, const char *name) {
     fclose(f);
     return id;
 }
+
+/* Distinct physical cores in mask, or 0 when sysfs has no topology. */
+static uint32_t ds4_count_cores(const cpu_set_t *mask) {
+    uint32_t seen[DS4_MAX_THREADS];
+    uint32_t cores = 0;
+    for (int cpu = 0; cpu < CPU_SETSIZE && cores < DS4_MAX_THREADS; cpu++) {
+        if (!CPU_ISSET(cpu, mask)) continue;
+        const int core = ds4_cpu_topology_id(cpu, "core_id");
+        const int package = ds4_cpu_topology_id(cpu, "physical_package_id");
+        if (core < 0 || package < 0) return 0;
+        const uint32_t key = ((uint32_t)package << 16) | (uint32_t)core;
+        uint32_t i = 0;
+        while (i < cores && seen[i] != key) i++;
+        if (i == cores) seen[cores++] = key;
+    }
+    return cores;
+}
+
+/* The CPUs of NUMA node `node` that are also in mask ("0,2-4,..." in sysfs);
+ * false when the node does not exist. */
+static bool ds4_node_cpus(int node, const cpu_set_t *mask, cpu_set_t *set) {
+    char path[80];
+    snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/cpulist", node);
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+    CPU_ZERO(set);
+    int a, b;
+    while (fscanf(f, "%d", &a) == 1) {
+        int sep = fgetc(f);
+        b = a;
+        if (sep == '-') {
+            if (fscanf(f, "%d", &b) != 1) break;
+            sep = fgetc(f);
+        }
+        for (int cpu = a; cpu <= b && cpu < CPU_SETSIZE; cpu++) {
+            if (CPU_ISSET(cpu, mask)) CPU_SET(cpu, set);
+        }
+        if (sep != ',') break;
+    }
+    fclose(f);
+    return true;
+}
+
+static void ds4_numa_init(void) {
+    static bool probed;
+    if (probed) return;
+    probed = true;
+    const char *env = getenv("DS4_NUMA");
+    if ((env && !strcmp(env, "0")) || sched_getaffinity(0, sizeof(g_numa.all), &g_numa.all) != 0)
+        return;
+    cpu_set_t third;
+    for (int node = 0; node < 2; node++) {
+        if (!ds4_node_cpus(node, &g_numa.all, &g_numa.set[node])) return;
+        g_numa.cpus[node] = (uint32_t)CPU_COUNT(&g_numa.set[node]);
+        g_numa.cores[node] = ds4_count_cores(&g_numa.set[node]);
+        if (g_numa.cpus[node] < 2 || g_numa.cores[node] == 0) return;
+    }
+    if (ds4_node_cpus(2, &g_numa.all, &third) && CPU_COUNT(&third) > 0) return;
+    g_numa.on = true;
+}
+#else
+static void ds4_numa_init(void) {}
 #endif
 
 /* One thread per physical core this process may run on.  A hyperthread
@@ -2211,21 +2333,8 @@ static uint32_t ds4_default_threads(void) {
 #if defined(__linux__)
     cpu_set_t mask;
     if (sched_getaffinity(0, sizeof(mask), &mask) == 0) {
-        uint32_t seen[DS4_MAX_THREADS];
         cpus = (uint32_t)CPU_COUNT(&mask);
-        for (int cpu = 0; cpu < CPU_SETSIZE && cores < DS4_MAX_THREADS; cpu++) {
-            if (!CPU_ISSET(cpu, &mask)) continue;
-            const int core = ds4_cpu_topology_id(cpu, "core_id");
-            const int package = ds4_cpu_topology_id(cpu, "physical_package_id");
-            if (core < 0 || package < 0) {
-                cores = 0;
-                break;
-            }
-            const uint32_t key = ((uint32_t)package << 16) | (uint32_t)core;
-            uint32_t i = 0;
-            while (i < cores && seen[i] != key) i++;
-            if (i == cores) seen[cores++] = key;
-        }
+        cores = ds4_count_cores(&mask);
     }
 #elif defined(__APPLE__)
     int physical = 0;
@@ -2248,6 +2357,7 @@ static void ds4_threads_init(void) {
     if (g_pool.initialized) return;
 
     pthread_once(&iq2xxs_tables_once, iq2xxs_tables_init);
+    ds4_numa_init();
 
     uint32_t n_threads = ds4_default_threads();
     const char *env = getenv("DS4_THREADS");
@@ -2262,6 +2372,27 @@ static void ds4_threads_init(void) {
         n_threads = DS4_MAX_THREADS;
     }
 
+    /* Home nodes in proportion to the physical cores of each node (its CPUs
+     * once every core has a thread), thread 0 (the caller) on node 0. */
+    uint32_t n_node0 = n_threads;
+    if (g_numa.on) {
+        const bool smt = n_threads > g_numa.cores[0] + g_numa.cores[1];
+        const uint32_t w0 = smt ? g_numa.cpus[0] : g_numa.cores[0];
+        const uint32_t w = w0 + (smt ? g_numa.cpus[1] : g_numa.cores[1]);
+        n_node0 = 0;
+        for (uint32_t i = 0; i < n_threads; i++) {
+            const uint32_t upto = ((i + 1) * w0 + w - 1) / w;   /* ceil */
+            g_pool.thread_node[i] = upto == n_node0;   /* no new node-0 slot */
+            n_node0 = upto;
+        }
+        fprintf(stderr, "ds4: NUMA: %u+%u CPUs (%u+%u cores) in the affinity mask, "
+                        "%u+%u threads\n",
+                g_numa.cpus[0], g_numa.cpus[1], g_numa.cores[0], g_numa.cores[1],
+                n_node0, n_threads - n_node0);
+    } else {
+        memset(g_pool.thread_node, 0, sizeof(g_pool.thread_node));
+    }
+
     pthread_mutex_init(&g_pool.mutex, NULL);
     pthread_cond_init(&g_pool.work_cond, NULL);
     pthread_cond_init(&g_pool.done_cond, NULL);
@@ -2270,10 +2401,11 @@ static void ds4_threads_init(void) {
     g_pool.initialized = true;
 
     for (uint32_t i = 1; i < n_threads; i++) {
-        if (pthread_create(&g_pool.threads[i], NULL, ds4_worker_main, NULL) != 0) {
+        if (pthread_create(&g_pool.threads[i], NULL, ds4_worker_main, (void *)(uintptr_t)i) != 0) {
             ds4_die("failed to create worker thread");
         }
     }
+    ds4_numa_pin(0);
 }
 
 static void ds4_threads_shutdown(void) {
@@ -2285,6 +2417,9 @@ static void ds4_threads_shutdown(void) {
     for (uint32_t i = 1; i < g_pool.n_threads; i++) {
         pthread_join(g_pool.threads[i], NULL);
     }
+#if defined(__linux__)
+    if (g_numa.on) sched_setaffinity(0, sizeof(g_numa.all), &g_numa.all);
+#endif
 
     pthread_cond_destroy(&g_pool.done_cond);
     pthread_cond_destroy(&g_pool.work_cond);
@@ -2293,8 +2428,12 @@ static void ds4_threads_shutdown(void) {
 }
 
 /* Run a row-parallel CPU kernel, falling back to serial execution for small
- * jobs or nested calls where spawning more work would only add latency. */
-static void ds4_parallel_for_min_rows(uint64_t n_rows, ds4_parallel_fn fn, void *ctx, uint64_t min_parallel_rows) {
+ * jobs or nested calls where spawning more work would only add latency.
+ * group_rows splits the rows between the NUMA nodes at every multiple of it
+ * (n_rows for one dense tensor, out_dim when the rows run over the selected
+ * experts), matching the halves model_place_weights() put on each node. */
+static void ds4_pool_dispatch(uint64_t n_rows, ds4_parallel_fn fn, void *ctx,
+                              uint64_t group_rows, uint64_t min_parallel_rows) {
     ds4_threads_init();
 
     if (g_parallel_depth > 0 || g_pool.n_threads <= 1 || n_rows < min_parallel_rows) {
@@ -2308,24 +2447,39 @@ static void ds4_parallel_for_min_rows(uint64_t n_rows, ds4_parallel_fn fn, void 
     uint64_t chunk = n_rows / (8u * g_pool.n_threads);
     if (chunk < 1) chunk = 1;
     if (chunk > 64) chunk = 64;
+    const uint64_t half = g_numa.on ? group_rows / 2 : group_rows;
+    const uint64_t groups = n_rows / group_rows;
+    const uint64_t tail = n_rows - groups * group_rows;
     g_pool.fn = fn;
     g_pool.ctx = ctx;
-    g_pool.n_rows = n_rows;
     g_pool.chunk = chunk;
-    __atomic_store_n(&g_pool.cursor, 0, __ATOMIC_RELAXED);
+    g_pool.group_rows = group_rows;
+    g_pool.half_rows = half;
+    g_pool.end[0] = groups * half + (tail < half ? tail : half);
+    g_pool.end[1] = groups * (group_rows - half) + (tail > half ? tail - half : 0);
+    __atomic_store_n(&g_pool.cursor[0].v, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_pool.cursor[1].v, 0, __ATOMIC_RELAXED);
     __atomic_store_n(&g_pool.pending, g_pool.n_workers, __ATOMIC_RELAXED);
     __atomic_add_fetch(&g_pool.generation, 1, __ATOMIC_RELEASE);
     ds4_pool_notify(&g_pool.work_cond);
 
     g_parallel_depth++;
-    ds4_pool_work();
+    ds4_pool_work(0);
     g_parallel_depth--;
 
     ds4_pool_wait(&g_pool.pending, 0, &g_pool.done_cond);
 }
 
+static void ds4_parallel_for_min_rows(uint64_t n_rows, ds4_parallel_fn fn, void *ctx, uint64_t min_parallel_rows) {
+    ds4_pool_dispatch(n_rows, fn, ctx, n_rows, min_parallel_rows);
+}
+
 static void ds4_parallel_for(uint64_t n_rows, ds4_parallel_fn fn, void *ctx) {
-    ds4_parallel_for_min_rows(n_rows, fn, ctx, 512);
+    ds4_pool_dispatch(n_rows, fn, ctx, n_rows, 512);
+}
+
+static void ds4_parallel_for_grouped(uint64_t n_rows, ds4_parallel_fn fn, void *ctx, uint64_t group_rows) {
+    ds4_pool_dispatch(n_rows, fn, ctx, group_rows, 512);
 }
 
 static void cursor_error(ds4_cursor *c, const char *msg) {
@@ -11026,7 +11180,7 @@ static void matvec_iq2_xxs_experts_mid_prequant(
     ctx.in_dim = in_dim0;
     ctx.out_dim = out_dim0;
     ctx.xq = yq;
-    ds4_parallel_for((uint64_t)n_expert * out_dim0, matvec_iq2_xxs_mid_worker, &ctx);
+    ds4_parallel_for_grouped((uint64_t)n_expert * out_dim0, matvec_iq2_xxs_mid_worker, &ctx, out_dim0);
 }
 
 static DS4_MAYBE_UNUSED void matvec_q8_0_experts_mid_prequant(
@@ -11078,7 +11232,7 @@ static DS4_MAYBE_UNUSED void matvec_q8_0_experts_mid_prequant(
     ctx.in_dim = in_dim0;
     ctx.out_dim = out_dim0;
     ctx.blocks = in_dim0 / 32u;
-    ds4_parallel_for((uint64_t)n_expert * out_dim0, matvec_q8_0_mid_worker, &ctx);
+    ds4_parallel_for_grouped((uint64_t)n_expert * out_dim0, matvec_q8_0_mid_worker, &ctx, out_dim0);
 }
 
 static DS4_MAYBE_UNUSED void matvec_q8_k_experts_mid_prequant(
@@ -11127,7 +11281,7 @@ static DS4_MAYBE_UNUSED void matvec_q8_k_experts_mid_prequant(
 
     ctx.in_dim = in_dim0;
     ctx.out_dim = out_dim0;
-    ds4_parallel_for((uint64_t)n_expert * out_dim0, matvec_q8_k_mid_worker, &ctx);
+    ds4_parallel_for_grouped((uint64_t)n_expert * out_dim0, matvec_q8_k_mid_worker, &ctx, out_dim0);
 }
 
 typedef struct {
@@ -11326,7 +11480,7 @@ static void matvec_q2_k_experts_mid_prequant(
 
     ctx.in_dim = in_dim0;
     ctx.out_dim = out_dim0;
-    ds4_parallel_for((uint64_t)n_expert * out_dim0, matvec_q2_k_mid_worker, &ctx);
+    ds4_parallel_for_grouped((uint64_t)n_expert * out_dim0, matvec_q2_k_mid_worker, &ctx, out_dim0);
 }
 
 typedef struct {
@@ -12144,7 +12298,7 @@ static void matvec_q4_k_experts_mid_prequant(
 
     ctx.in_dim = in_dim0;
     ctx.out_dim = out_dim0;
-    ds4_parallel_for((uint64_t)n_expert * out_dim0, matvec_q4_k_mid_worker, &ctx);
+    ds4_parallel_for_grouped((uint64_t)n_expert * out_dim0, matvec_q4_k_mid_worker, &ctx, out_dim0);
 }
 
 typedef struct {
@@ -12336,7 +12490,7 @@ static void matvec_q5_q6_k_experts_mid_prequant(
 
     ctx.in_dim = in_dim0;
     ctx.out_dim = out_dim0;
-    ds4_parallel_for((uint64_t)n_expert * out_dim0, matvec_q5_q6_k_mid_worker, &ctx);
+    ds4_parallel_for_grouped((uint64_t)n_expert * out_dim0, matvec_q5_q6_k_mid_worker, &ctx, out_dim0);
 }
 
 static void matvec_q5_q6_k_expert(
