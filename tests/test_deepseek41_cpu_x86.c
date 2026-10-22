@@ -331,8 +331,8 @@ typedef struct {
     uint64_t used;
 } test_layer;
 
-static const ds4_tensor *test_tensor(test_layer *tl, uint32_t type, uint64_t d0,
-                                     uint64_t d1, uint64_t d2) {
+static ds4_tensor *test_tensor(test_layer *tl, uint32_t type, uint64_t d0,
+                               uint64_t d1, uint64_t d2) {
     ds4_tensor *t = &tl->t[tl->n++];
     uint64_t row_bytes;
     CHECK(tl->n <= 32 && tensor_nbytes(type, d0, &row_bytes));
