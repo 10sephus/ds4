@@ -1138,6 +1138,9 @@ typedef struct {
     float *attn_out;
     float *after_attn_hc;
     float *attn_score;
+    float *attn_qt;
+    const float **attn_rows;
+    float *attn_inv;
 
     float *comp;
     float *index_comp;
@@ -14818,7 +14821,10 @@ static void cpu_decode_scratch_init(ds4_cpu_decode_scratch *scratch, uint32_t ct
     scratch->attn_low = xmalloc((size_t)DS4_N_OUT_GROUP * DS4_N_LORA_O * sizeof(float));
     scratch->attn_out = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
     scratch->after_attn_hc = xmalloc((size_t)hc_dim * sizeof(float));
-    scratch->attn_score = xmalloc((size_t)attn_score_cap * sizeof(float));
+    scratch->attn_score = xmalloc((size_t)16u * ((DS4_N_HEAD + 15u) / 16u) * attn_score_cap * sizeof(float));
+    scratch->attn_qt = xmalloc((size_t)q_dim * sizeof(float));
+    scratch->attn_rows = xmalloc((size_t)attn_score_cap * sizeof(float *));
+    scratch->attn_inv = xmalloc((size_t)DS4_N_HEAD * sizeof(float));
 
     scratch->comp = xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(float));
     scratch->index_comp = xmalloc((size_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float));
@@ -14896,6 +14902,9 @@ static void cpu_decode_scratch_free(ds4_cpu_decode_scratch *scratch) {
     free(scratch->comp_kv_cur);
     free(scratch->index_comp);
     free(scratch->comp);
+    free(scratch->attn_inv);
+    free(scratch->attn_rows);
+    free(scratch->attn_qt);
     free(scratch->attn_score);
     free(scratch->after_attn_hc);
     free(scratch->attn_out);
@@ -15345,6 +15354,245 @@ static void layer_attention_mixed_one(
     if (score != score_stack) free(score);
 }
 
+/* Sink-aware attention over raw SWA rows plus optional compressed rows, in
+ * three pooled passes that reproduce the serial per-head arithmetic bitwise.
+ *
+ * The rows a token attends to (raw rows, then the compressed rows the indexer
+ * allows) are listed once in attention order, so no pass tests the mask and
+ * every per-head sequence runs over exactly the rows the serial code used.
+ *
+ * Pass A scores (row, head) pairs sixteen heads per vector: lane h walks
+ * i = 0..head_dim-1 adding q[h][i]*k[r][i] to its accumulator from +0.0f with
+ * separate multiply and add, the exact x86 dot_f32 sequence.  Items are
+ * (head group, row chunk).  Pass B1 is one item per head: the running max,
+ * the expf chain and the denominator in row order, scalar as before, with
+ * the weights replacing the scores.  Pass B2 items are (head group, 16-wide
+ * dim chunk): every output element is still its own ((0 + w0*x0) + w1*x1)
+ * + ... chain, vectorised across dims and kept in a register, and each row
+ * line is loaded once for the sixteen heads.
+ *
+ * qt is the transposed query, [n_head/16][head_dim][16]; score holds
+ * [n_head/16][score_stride][16] floats, row-major within a head group. */
+#define ATTN_LANES_ROWS_PER_ITEM 16
+#define ATTN_LANES_BLOCK 8
+#define ATTN_LANES_PREFETCH 4
+
+typedef struct {
+    float               * out_heads;
+    const float         * sinks;
+    const float         * q;
+    const float         * qt;
+    const float * const * rows;     /* live KV rows in attention order */
+    float               * score;    /* scores, then softmax weights */
+    float               * inv;      /* 1 / denominator per head */
+    uint32_t              score_stride;
+    uint32_t              n_rows;
+    uint32_t              n_chunks;
+    uint32_t              n_dim_chunks;
+} layer_attention_lanes_ctx;
+
+static inline float *attn_lanes_score(const layer_attention_lanes_ctx *ctx, uint32_t h, uint32_t r) {
+    return ctx->score + ((uint64_t)(h / 16) * ctx->score_stride + r) * 16 + h % 16;
+}
+
+#if defined(DS4_NO_GPU) && defined(__AVX512F__)
+/* dst[i][l] = src[l][i] for a 16x16 block: unpack pairs, then quads, then
+ * 128-bit lanes.  Pure data movement. */
+static inline void attn_lanes_transpose16(float *dst, const float *src, uint64_t src_stride) {
+    __m512 r[16], t[16];
+    for (uint32_t l = 0; l < 16; l++) r[l] = _mm512_loadu_ps(src + l * src_stride);
+    for (uint32_t k = 0; k < 16; k += 2) {
+        t[k] = _mm512_unpacklo_ps(r[k], r[k + 1]);
+        t[k + 1] = _mm512_unpackhi_ps(r[k], r[k + 1]);
+    }
+    for (uint32_t k = 0; k < 16; k += 4) {
+        r[k] = _mm512_castpd_ps(_mm512_unpacklo_pd(_mm512_castps_pd(t[k]), _mm512_castps_pd(t[k + 2])));
+        r[k + 1] = _mm512_castpd_ps(_mm512_unpackhi_pd(_mm512_castps_pd(t[k]), _mm512_castps_pd(t[k + 2])));
+        r[k + 2] = _mm512_castpd_ps(_mm512_unpacklo_pd(_mm512_castps_pd(t[k + 1]), _mm512_castps_pd(t[k + 3])));
+        r[k + 3] = _mm512_castpd_ps(_mm512_unpackhi_pd(_mm512_castps_pd(t[k + 1]), _mm512_castps_pd(t[k + 3])));
+    }
+    for (uint32_t k = 0; k < 4; k++) {
+        t[k] = _mm512_shuffle_f32x4(r[k], r[k + 4], 0x88);
+        t[k + 4] = _mm512_shuffle_f32x4(r[k], r[k + 4], 0xdd);
+        t[k + 8] = _mm512_shuffle_f32x4(r[k + 8], r[k + 12], 0x88);
+        t[k + 12] = _mm512_shuffle_f32x4(r[k + 8], r[k + 12], 0xdd);
+    }
+    for (uint32_t k = 0; k < 8; k++) {
+        _mm512_storeu_ps(dst + k * 16, _mm512_shuffle_f32x4(t[k], t[k + 8], 0x88));
+        _mm512_storeu_ps(dst + (k + 8) * 16, _mm512_shuffle_f32x4(t[k], t[k + 8], 0xdd));
+    }
+}
+
+/* Scores of up to ATTN_LANES_BLOCK rows for heads h0..h0+15.  Rows past
+ * n_rows alias the last one so the block always runs eight independent
+ * accumulator chains; their results are simply not stored. */
+static void attn_lanes_score_block(
+        const layer_attention_lanes_ctx *ctx,
+        uint32_t h0,
+        uint32_t r0,
+        uint32_t n_rows,
+        float kq_scale) {
+    const float *qt = ctx->qt + (uint64_t)h0 * DS4_N_HEAD_DIM;
+    const float *k[ATTN_LANES_BLOCK];
+    __m512 acc[ATTN_LANES_BLOCK];
+    for (uint32_t j = 0; j < ATTN_LANES_BLOCK; j++) {
+        k[j] = ctx->rows[r0 + (j < n_rows ? j : n_rows - 1)];
+        acc[j] = _mm512_setzero_ps();
+    }
+    for (uint32_t i = 0; i < DS4_N_HEAD_DIM; i++) {
+        const __m512 qv = _mm512_loadu_ps(qt + (uint64_t)i * 16);
+        for (uint32_t j = 0; j < ATTN_LANES_BLOCK; j++) {
+            acc[j] = _mm512_add_ps(acc[j], _mm512_mul_ps(qv, _mm512_set1_ps(k[j][i])));
+        }
+    }
+    const __m512 scale = _mm512_set1_ps(kq_scale);
+    for (uint32_t j = 0; j < n_rows; j++) {
+        _mm512_storeu_ps(attn_lanes_score(ctx, h0, r0 + j), _mm512_mul_ps(acc[j], scale));
+    }
+}
+#endif
+
+static void attn_lanes_score_worker(void *vctx, uint64_t item0, uint64_t item1) {
+    const layer_attention_lanes_ctx *ctx = vctx;
+    const float kq_scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
+    for (uint64_t item = item0; item < item1; item++) {
+        const uint32_t h0 = (uint32_t)(item / ctx->n_chunks) * 16;
+        const uint32_t r0 = (uint32_t)(item % ctx->n_chunks) * ATTN_LANES_ROWS_PER_ITEM;
+        const uint32_t h1 = h0 + 16 < DS4_N_HEAD ? h0 + 16 : DS4_N_HEAD;
+        const uint32_t r1 = r0 + ATTN_LANES_ROWS_PER_ITEM < ctx->n_rows ? r0 + ATTN_LANES_ROWS_PER_ITEM : ctx->n_rows;
+        uint32_t h = h0;
+#if defined(DS4_NO_GPU) && defined(__AVX512F__)
+        if (h1 == h0 + 16) {
+            for (uint32_t r = r0; r < r1; r += ATTN_LANES_BLOCK) {
+                attn_lanes_score_block(ctx, h0, r, r1 - r < ATTN_LANES_BLOCK ? r1 - r : ATTN_LANES_BLOCK, kq_scale);
+            }
+            h = h1;
+        }
+#endif
+        for (; h < h1; h++) {
+            const float *qh = ctx->q + (uint64_t)h * DS4_N_HEAD_DIM;
+            for (uint32_t r = r0; r < r1; r++) {
+                *attn_lanes_score(ctx, h, r) = dot_f32(qh, ctx->rows[r], DS4_N_HEAD_DIM) * kq_scale;
+            }
+        }
+    }
+}
+
+static void attn_lanes_weight_worker(void *vctx, uint64_t h0, uint64_t h1) {
+    const layer_attention_lanes_ctx *ctx = vctx;
+    for (uint64_t h = h0; h < h1; h++) {
+        float *score = attn_lanes_score(ctx, (uint32_t)h, 0);
+        float max_score = ctx->sinks[h];
+        for (uint32_t r = 0; r < ctx->n_rows; r++) {
+            if (score[(uint64_t)r * 16] > max_score) max_score = score[(uint64_t)r * 16];
+        }
+        float denom = expf(ctx->sinks[h] - max_score);
+        for (uint32_t r = 0; r < ctx->n_rows; r++) {
+            score[(uint64_t)r * 16] = expf(score[(uint64_t)r * 16] - max_score);
+            denom += score[(uint64_t)r * 16];
+        }
+        ctx->inv[h] = 1.0f / denom;
+    }
+}
+
+static void attn_lanes_sum_worker(void *vctx, uint64_t item0, uint64_t item1) {
+    const layer_attention_lanes_ctx *ctx = vctx;
+    const uint32_t head_dim = DS4_N_HEAD_DIM;
+    for (uint64_t item = item0; item < item1; item++) {
+        const uint32_t h0 = (uint32_t)(item / ctx->n_dim_chunks) * 16;
+        const uint32_t d0 = (uint32_t)(item % ctx->n_dim_chunks) * 16;
+        const uint32_t h1 = h0 + 16 < DS4_N_HEAD ? h0 + 16 : DS4_N_HEAD;
+        const uint32_t d1 = d0 + 16 < head_dim ? d0 + 16 : head_dim;
+        const float *w = attn_lanes_score(ctx, h0, 0);
+#if defined(DS4_NO_GPU) && defined(__AVX512F__)
+        if (h1 == h0 + 16 && d1 == d0 + 16) {
+            __m512 acc[16];
+            for (uint32_t l = 0; l < 16; l++) acc[l] = _mm512_setzero_ps();
+            for (uint32_t r = 0; r < ctx->n_rows; r++) {
+                /* One line per row at a 2 KB stride defeats the hardware prefetcher. */
+                if (r + ATTN_LANES_PREFETCH < ctx->n_rows) {
+                    _mm_prefetch((const char *)(ctx->rows[r + ATTN_LANES_PREFETCH] + d0), _MM_HINT_T0);
+                }
+                const __m512 x = _mm512_loadu_ps(ctx->rows[r] + d0);
+                const float *wr = w + (uint64_t)r * 16;
+                for (uint32_t l = 0; l < 16; l++) {
+                    acc[l] = _mm512_add_ps(acc[l], _mm512_mul_ps(_mm512_set1_ps(wr[l]), x));
+                }
+            }
+            for (uint32_t l = 0; l < 16; l++) {
+                _mm512_storeu_ps(ctx->out_heads + (uint64_t)(h0 + l) * head_dim + d0,
+                                 _mm512_mul_ps(acc[l], _mm512_set1_ps(ctx->inv[h0 + l])));
+            }
+            continue;
+        }
+#endif
+        for (uint32_t h = h0; h < h1; h++) {
+            float *oh = ctx->out_heads + (uint64_t)h * head_dim + d0;
+            memset(oh, 0, (size_t)(d1 - d0) * sizeof(oh[0]));
+            for (uint32_t r = 0; r < ctx->n_rows; r++) {
+                axpy_f32(oh, ctx->rows[r] + d0, w[(uint64_t)r * 16 + (h - h0)], d1 - d0);
+            }
+            scale_f32(oh, ctx->inv[h], d1 - d0);
+        }
+    }
+}
+
+/* Caller scratch: qt n_head * head_dim floats, rows n_raw + n_comp pointers,
+ * score 16 * ceil(n_head / 16) * score_stride floats with score_stride >=
+ * n_raw + n_comp, inv n_head floats. */
+static void layer_attention_lanes(
+        float               * out_heads,
+        const float         * sinks,
+        const float         * q,
+        const float         * raw_kv,
+        uint32_t              n_raw,
+        const float         * comp_kv,
+        uint32_t              n_comp,
+        const bool          * comp_allowed,
+        float               * qt,
+        const float        ** rows,
+        float               * score,
+        float               * inv,
+        uint32_t              score_stride) {
+    const uint32_t n_head = DS4_N_HEAD, head_dim = DS4_N_HEAD_DIM;
+    uint32_t n_rows = 0;
+    for (uint32_t r = 0; r < n_raw; r++) rows[n_rows++] = raw_kv + (uint64_t)r * head_dim;
+    for (uint32_t r = 0; r < n_comp; r++) {
+        if (comp_allowed && !comp_allowed[r]) continue;
+        rows[n_rows++] = comp_kv + (uint64_t)r * head_dim;
+    }
+#if defined(DS4_NO_GPU) && defined(__AVX512F__)
+    for (uint32_t h = 0; h + 16 <= n_head; h += 16) {
+        const float *qg = q + (uint64_t)h * head_dim;
+        float *qtg = qt + (uint64_t)h * head_dim;
+        uint32_t i = 0;
+        for (; i + 16 <= head_dim; i += 16) attn_lanes_transpose16(qtg + i * 16, qg + i, head_dim);
+        for (; i < head_dim; i++) {
+            for (uint32_t l = 0; l < 16; l++) qtg[(uint64_t)i * 16 + l] = qg[(uint64_t)l * head_dim + i];
+        }
+    }
+#endif
+    layer_attention_lanes_ctx ctx = {
+        .out_heads = out_heads,
+        .sinks = sinks,
+        .q = q,
+        .qt = qt,
+        .rows = rows,
+        .score = score,
+        .inv = inv,
+        .score_stride = score_stride,
+        .n_rows = n_rows,
+        .n_chunks = (n_rows + ATTN_LANES_ROWS_PER_ITEM - 1) / ATTN_LANES_ROWS_PER_ITEM,
+        .n_dim_chunks = (head_dim + 15) / 16,
+    };
+    const uint32_t n_groups = (n_head + 15) / 16;
+    if (n_rows > 0) {
+        ds4_parallel_for_min_rows((uint64_t)n_groups * ctx.n_chunks, attn_lanes_score_worker, &ctx, 1);
+    }
+    ds4_parallel_for_min_rows(n_head, attn_lanes_weight_worker, &ctx, 1);
+    ds4_parallel_for_min_rows((uint64_t)n_groups * ctx.n_dim_chunks, attn_lanes_sum_worker, &ctx, 1);
+}
+
 static void layer_attention_mixed_one_decode_scratch(
         float                  * out_heads,
         const ds4_model        * model,
@@ -15356,54 +15604,11 @@ static void layer_attention_mixed_one_decode_scratch(
         uint32_t                 n_comp,
         const bool             * comp_allowed,
         ds4_cpu_decode_scratch * scratch) {
-    const float *sinks = tensor_data(model, layer->attn_sinks);
-    const float kq_scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
-    const uint32_t n_total = n_raw + n_comp;
-    if (n_total > scratch->attn_score_cap) ds4_die("CPU decode attention score scratch buffer is too small");
-    float *score = scratch->attn_score;
-
-    for (uint32_t h = 0; h < DS4_N_HEAD; h++) {
-        const float *qh = q + (uint64_t)h * DS4_N_HEAD_DIM;
-        float max_score = sinks[h];
-        uint32_t idx = 0;
-
-        for (uint32_t r = 0; r < n_raw; r++, idx++) {
-            const float *kv = raw_kv + (uint64_t)r * DS4_N_HEAD_DIM;
-            score[idx] = dot_f32(qh, kv, DS4_N_HEAD_DIM) * kq_scale;
-            if (score[idx] > max_score) max_score = score[idx];
-        }
-        for (uint32_t r = 0; r < n_comp; r++, idx++) {
-            if (comp_allowed && !comp_allowed[r]) {
-                score[idx] = DS4_NEG_INF;
-                continue;
-            }
-            const float *kv = comp_kv + (uint64_t)r * DS4_N_HEAD_DIM;
-            score[idx] = dot_f32(qh, kv, DS4_N_HEAD_DIM) * kq_scale;
-            if (score[idx] > max_score) max_score = score[idx];
-        }
-
-        float *oh = out_heads + (uint64_t)h * DS4_N_HEAD_DIM;
-        memset(oh, 0, (size_t)DS4_N_HEAD_DIM * sizeof(oh[0]));
-
-        float denom = expf(sinks[h] - max_score);
-        idx = 0;
-        for (uint32_t r = 0; r < n_raw; r++, idx++) {
-            const float weight = expf(score[idx] - max_score);
-            const float *kv = raw_kv + (uint64_t)r * DS4_N_HEAD_DIM;
-            denom += weight;
-            axpy_f32(oh, kv, weight, DS4_N_HEAD_DIM);
-        }
-        for (uint32_t r = 0; r < n_comp; r++, idx++) {
-            if (score[idx] <= DS4_NEG_INF * 0.5f) continue;
-            const float weight = expf(score[idx] - max_score);
-            const float *kv = comp_kv + (uint64_t)r * DS4_N_HEAD_DIM;
-            denom += weight;
-            axpy_f32(oh, kv, weight, DS4_N_HEAD_DIM);
-        }
-
-        const float inv = 1.0f / denom;
-        scale_f32(oh, inv, DS4_N_HEAD_DIM);
-    }
+    if (n_raw + n_comp > scratch->attn_score_cap) ds4_die("CPU decode attention score scratch buffer is too small");
+    layer_attention_lanes(out_heads, tensor_data(model, layer->attn_sinks), q,
+                          raw_kv, n_raw, comp_kv, n_comp, comp_allowed,
+                          scratch->attn_qt, scratch->attn_rows, scratch->attn_score, scratch->attn_inv,
+                          scratch->attn_score_cap);
 }
 
 typedef struct {
@@ -16315,15 +16520,11 @@ static void layer_forward_raw_swa_one(
     }
 
     t0 = profile ? now_sec() : 0.0;
-    if (ratio != 0) {
-        layer_attention_mixed_one_decode_scratch(scratch->heads, model, layer, scratch->q,
-                                                 cache->raw_kv, cache->n_raw,
-                                                 cache->attn_comp_kv, cache->n_comp,
-                                                 comp_allowed,
-                                                 scratch);
-    } else {
-        layer_attention_rows_one(scratch->heads, model, layer, scratch->q, cache->raw_kv, cache->n_raw);
-    }
+    layer_attention_mixed_one_decode_scratch(scratch->heads, model, layer, scratch->q,
+                                             cache->raw_kv, cache->n_raw,
+                                             cache->attn_comp_kv, cache->n_comp,
+                                             comp_allowed,
+                                             scratch);
     if (profile) t_attn_rows = now_sec() - t0;
 
     t0 = profile ? now_sec() : 0.0;
@@ -41012,7 +41213,7 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
             }
         }
         if (m.comp_cap == 0) m.comp_cap = ctx / 4u + 2u;
-        m.scratch_bytes = ((uint64_t)(m.raw_cap + m.comp_cap) * sizeof(float)) +
+        m.scratch_bytes = ((uint64_t)(m.raw_cap + m.comp_cap) * (DS4_N_HEAD * sizeof(float) + sizeof(float *))) +
                           ((uint64_t)m.comp_cap * sizeof(float)) +
                           ((uint64_t)m.comp_cap * sizeof(bool));
     }
@@ -60968,7 +61169,7 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         }
     }
     if (m.comp_cap == 0) m.comp_cap = ctx / 4u + 2u;
-    m.scratch_bytes = ((uint64_t)(m.raw_cap + m.comp_cap) * sizeof(float)) +
+    m.scratch_bytes = ((uint64_t)(m.raw_cap + m.comp_cap) * (DS4_N_HEAD * sizeof(float) + sizeof(float *))) +
                       ((uint64_t)m.comp_cap * sizeof(float)) +
                       ((uint64_t)m.comp_cap * sizeof(bool));
     m.total_bytes = m.raw_bytes + m.compressed_bytes + m.scratch_bytes;

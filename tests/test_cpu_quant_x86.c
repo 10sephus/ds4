@@ -978,6 +978,120 @@ static void check_decode_glue(void) {
     free(b); free(a); free(x);
 }
 
+/* Serial sink-aware attention, one head after the other, as the CPU decode
+ * path computed it before the lane-wise kernel. */
+static void lanes_oracle(float *out, const float *sinks, const float *q,
+                         const float *raw, unsigned n_raw,
+                         const float *comp, unsigned n_comp, const bool *allowed) {
+    const unsigned d = DS4_N_HEAD_DIM;
+    const float kq_scale = 1.0f / sqrtf((float)d);
+    float score[1024];
+    CHECK(n_raw + n_comp <= 1024);
+    for (unsigned h = 0; h < DS4_N_HEAD; h++) {
+        const float *qh = q + h * d;
+        float max_score = sinks[h];
+        for (unsigned r = 0; r < n_raw; r++) {
+            score[r] = dot_f32(qh, raw + r * d, d) * kq_scale;
+            if (score[r] > max_score) max_score = score[r];
+        }
+        for (unsigned c = 0; c < n_comp; c++) {
+            if (allowed && !allowed[c]) { score[n_raw + c] = DS4_NEG_INF; continue; }
+            score[n_raw + c] = dot_f32(qh, comp + c * d, d) * kq_scale;
+            if (score[n_raw + c] > max_score) max_score = score[n_raw + c];
+        }
+        float *oh = out + h * d;
+        memset(oh, 0, d * sizeof(oh[0]));
+        float denom = expf(sinks[h] - max_score);
+        for (unsigned r = 0; r < n_raw; r++) {
+            const float weight = expf(score[r] - max_score);
+            denom += weight;
+            axpy_f32(oh, raw + r * d, weight, d);
+        }
+        for (unsigned c = 0; c < n_comp; c++) {
+            if (score[n_raw + c] <= DS4_NEG_INF * 0.5f) continue;
+            const float weight = expf(score[n_raw + c] - max_score);
+            denom += weight;
+            axpy_f32(oh, comp + c * d, weight, d);
+        }
+        const float inv = 1.0f / denom;
+        scale_f32(oh, inv, d);
+    }
+}
+
+/* Magnitude mag with signed zeros mixed in, so the score range, the running
+ * max and the sign of zero products are all exercised. */
+static float lanes_value(float mag) {
+    const uint32_t r = quant_random();
+    if (r % 64 == 0) return -0.0f;
+    if (r % 64 == 1) return 0.0f;
+    return (float)(int32_t)quant_random() * 0x1p-31f * mag;
+}
+
+/* The lane-wise decode attention must stay bitwise the serial oracle for
+ * every row count, mask, pool size and score stride, including the raw-only
+ * case that layer_attention_rows_one used to serve. */
+static void check_attention_lanes(void) {
+    const unsigned d = DS4_N_HEAD_DIM, nh = DS4_N_HEAD;
+    const unsigned raws[] = {0, 1, 5, 128}, comps[] = {0, 1, 17, 384, 520};
+    const uint32_t threads[] = {1, 3, 8};
+    quant_buffer qb = quant_alloc(nh * d * sizeof(float)), sb = quant_alloc(nh * sizeof(float));
+    quant_buffer rb = quant_alloc(128 * d * sizeof(float)), cb = quant_alloc(520 * d * sizeof(float));
+    quant_buffer ab = quant_alloc(520 * sizeof(bool));
+    quant_buffer eb = quant_alloc(nh * d * sizeof(float)), ob = quant_alloc(nh * d * sizeof(float));
+    quant_buffer qtb = quant_alloc(nh * d * sizeof(float)), ib = quant_alloc(nh * sizeof(float));
+    float *q = (float *)qb.data, *sinks = (float *)sb.data;
+    float *raw = (float *)rb.data, *comp = (float *)cb.data;
+    float *expected = (float *)eb.data, *out = (float *)ob.data;
+    bool *allowed = (bool *)ab.data;
+    ds4_model m = {.map = sb.data, .size = nh * sizeof(float)};
+    ds4_tensor t = {.type = DS4_TENSOR_F32, .ndim = 1, .dim = {nh},
+                    .elements = nh, .bytes = nh * sizeof(float)};
+    ds4_layer_weights l = {.attn_sinks = &t};
+
+    for (size_t ti = 0; ti < sizeof(threads) / sizeof(*threads); ti++) {
+        g_requested_threads = threads[ti];
+        for (size_t r = 0; r < sizeof(raws) / sizeof(*raws); r++) {
+            for (size_t c = 0; c < sizeof(comps) / sizeof(*comps); c++) {
+                for (unsigned mask = 0; mask < (comps[c] ? 2u : 1u); mask++) {
+                    const unsigned n_raw = raws[r], n_comp = comps[c];
+                    const float mag = (float)(1 << (3 * ((r + c + mask) % 4)));
+                    for (unsigned i = 0; i < nh * d; i++) q[i] = lanes_value(mag);
+                    for (unsigned i = 0; i < 128 * d; i++) raw[i] = lanes_value(2.0f);
+                    f16_round_inplace_cpu(raw, 128 * d);
+                    for (unsigned i = 0; i < 520 * d; i++) comp[i] = lanes_value(1.0f);
+                    for (unsigned i = 0; i < nh; i++) sinks[i] = lanes_value(8.0f);
+                    for (unsigned i = 0; i < 520; i++) allowed[i] = quant_random() % 3 != 0;
+                    const bool *allow = mask ? allowed : NULL;
+                    lanes_oracle(expected, sinks, q, raw, n_raw, comp, n_comp, allow);
+                    for (unsigned pad = 0; pad < 14; pad += 13) {
+                        const uint32_t cap = n_raw + n_comp + pad;
+                        quant_buffer scb = quant_alloc((size_t)nh * cap * sizeof(float));
+                        quant_buffer rwb = quant_alloc((size_t)cap * sizeof(float *));
+                        ds4_cpu_decode_scratch s = {
+                            .attn_score_cap = cap, .attn_score = (float *)scb.data,
+                            .attn_qt = (float *)qtb.data, .attn_rows = (const float **)rwb.data,
+                            .attn_inv = (float *)ib.data,
+                        };
+                        memset(out, 0xff, nh * d * sizeof(out[0]));
+                        layer_attention_mixed_one_decode_scratch(out, &m, &l, q, raw, n_raw,
+                                                                 comp, n_comp, allow, &s);
+                        CHECK(!memcmp(out, expected, nh * d * sizeof(out[0])));
+                        quant_free(rwb); quant_free(scb);
+                    }
+                    if (n_comp == 0) {
+                        layer_attention_rows_one(expected, &m, &l, q, raw, n_raw);
+                        CHECK(!memcmp(out, expected, nh * d * sizeof(out[0])));
+                    }
+                }
+            }
+        }
+        ds4_threads_shutdown();
+    }
+    g_requested_threads = 0;
+    quant_free(ib); quant_free(qtb); quant_free(ob); quant_free(eb); quant_free(ab);
+    quant_free(cb); quant_free(rb); quant_free(sb); quant_free(qb);
+}
+
 int main(void) {
     check_thread_pool();
     check_integer_dots();
@@ -990,6 +1104,8 @@ int main(void) {
     check_indexer();
     check_indexer_selection();
     puts("CPU indexer row-parallel scoring and top-k selection oracle PASS");
+    check_attention_lanes();
+    puts("CPU lane-wise decode attention bitwise oracle: 1/3/8 threads PASS");
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     puts("CPU ARM DOTPROD Q2_K integer oracle PASS");
     puts("Block FP oracle skipped: existing ARM DOTPROD accumulation order differs");
