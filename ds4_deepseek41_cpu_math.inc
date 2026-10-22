@@ -38,26 +38,22 @@ static void ds41_cpu_bf16_rows(float *x, size_t n) {
     for (size_t i = 0; i < n; i++) x[i] = ds41_cpu_bf16(x[i]);
 }
 
-/* Positive finite E4M3FN codes, including subnormals. */
-static float ds41_cpu_e4m3_value(unsigned code) {
-    return code < 8u ? (float)code * 0x1p-9f :
-        ldexpf(1.0f + (float)(code & 7u) * 0.125f, (int)(code >> 3u) - 7);
-}
-
+/* Nearest E4M3FN value, ties to an even code, saturating at 448 (fminf also
+ * maps NaN to 448).  Below 2^-6 the grid is the subnormal step 2^-9; above it
+ * a float keeps three mantissa bits, rounded to nearest even in the bits.
+ * Equal to a search over the 127 positive codes for every float. */
 static float ds41_cpu_e4m3(float x) {
     const float a = fminf(fabsf(x), 448.0f);
-    unsigned lo = 0, hi = 126;
-    while (lo < hi) {
-        const unsigned mid = (lo + hi + 1u) / 2u;
-        if (ds41_cpu_e4m3_value(mid) <= a) lo = mid;
-        else hi = mid - 1u;
+    float q;
+    if (a < 0.015625f) {
+        q = rintf(a * 512.0f) * 0.001953125f;
+    } else {
+        uint32_t bits;
+        memcpy(&bits, &a, sizeof(bits));
+        bits = (bits + 0x7ffffu + ((bits >> 20) & 1u)) & ~0xfffffu;
+        memcpy(&q, &bits, sizeof(q));
     }
-    if (lo < 126u) {
-        const float below = a - ds41_cpu_e4m3_value(lo);
-        const float above = ds41_cpu_e4m3_value(lo + 1u) - a;
-        if (above < below || (above == below && (lo & 1u))) lo++;
-    }
-    return copysignf(ds41_cpu_e4m3_value(lo), x);
+    return copysignf(q, x);
 }
 
 static float ds41_cpu_e2m1(float x) {
