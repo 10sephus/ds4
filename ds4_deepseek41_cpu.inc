@@ -49,7 +49,13 @@ static bool ds41_cpu_matvec(float *out, const ds4_model *m,
     matrix.ndim = 2;
     matrix.elements = matrix.dim[0] * matrix.dim[1];
     switch (matrix.type) {
-    case DS4_TENSOR_F32: matvec_f32(out, m, &matrix, in); break;
+    case DS4_TENSOR_F32: {
+        /* The 384-row router is below ds4_parallel_for's 512-row floor. */
+        matvec_f32_ctx ctx = {.out = out, .data = tensor_data(m, &matrix),
+                              .x = in, .in_dim = matrix.dim[0]};
+        ds4_parallel_for_min_rows(matrix.dim[1], matvec_f32_worker, &ctx, 2);
+        break;
+    }
     case DS4_TENSOR_F16: matvec_f16(out, m, &matrix, in); break;
     case DS4_TENSOR_Q8_0: ds41_cpu_matvec_q8(out, m, &matrix, in); break;
     default: return false;

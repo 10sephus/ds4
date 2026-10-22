@@ -216,7 +216,7 @@ static bool ds41_cpu_attention_select(ds41_cpu_attention_state *s,
     ds41_cpu_index_score_context c = {
         s->index_q, s->index_cache[owner], s->index_weights, s->index_scores
     };
-    ds4_parallel_for(n_comp, ds41_cpu_index_score_worker, &c);
+    ds4_parallel_for_min_rows(n_comp, ds41_cpu_index_score_worker, &c, 64);
     ds41_cpu_attention_candidates(s, il, n_comp);
     ds41_cpu_attention_topk(s->selected_comp, s->index_scores, n_comp,
                             n_comp < 512u ? n_comp : 512u, s->heap);
@@ -297,7 +297,7 @@ static bool ds41_cpu_attention_forward(ds41_cpu_attention_state *s,
     ds41_cpu_attention_context c = {
         s->q, s->attended_kv, tensor_data(m, l->attn_sinks), s->heads, n_raw + attended
     };
-    ds4_parallel_for(64, ds41_cpu_attention_worker, &c);
+    ds4_parallel_for_min_rows(64, ds41_cpu_attention_worker, &c, 2);
     ds41_cpu_bf16_rows(s->heads, 64u * 512u);
     ds41_cpu_rope(s->heads, 512, 64, pos, ratio != 0, true);
     ds41_prof(DS41_PROF_OUT);
