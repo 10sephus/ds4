@@ -17478,6 +17478,23 @@ static void prefill_norm_worker(void *vctx, uint64_t t0, uint64_t t1) {
     }
 }
 
+typedef struct {
+    float *kv;
+    uint32_t n_tok;
+} prefill_kv_round_ctx;
+
+/* FP8 quantization and F16 rounding of the batch's raw rows, one token per
+ * pool row.  The raw cache holds F16-rounded rows, so the prefix attention
+ * reads exactly what decode reads back from the cache. */
+static void prefill_kv_round_worker(void *vctx, uint64_t t0, uint64_t t1) {
+    prefill_kv_round_ctx *ctx = vctx;
+    for (uint64_t t = t0; t < t1; t++) {
+        float *kv_t = ctx->kv + t * DS4_N_HEAD_DIM;
+        dsv4_fp8_kv_quantize_row_inplace_cpu(kv_t, DS4_N_HEAD_DIM, DS4_N_ROT);
+        for (uint32_t i = 0; i < DS4_N_HEAD_DIM; i++) kv_t[i] = f16_to_f32(f32_to_f16(kv_t[i]));
+    }
+}
+
 static void prefill_rms_norm_rows(float *out, const float *x, const float *weight,
                                   uint64_t dim, uint32_t n_tok) {
     prefill_norm_ctx ctx = { .out = out, .x = x, .weight = weight, .dim = dim };
@@ -17623,19 +17640,12 @@ static void layer_attention_raw_swa_batch(
         if (profile) t_tl_compress += now_sec() - tx;
     }
 
-    for (uint32_t t = 0; t < n_tok; t++) {
-        float *kv_t = kv + (uint64_t)t * DS4_N_HEAD_DIM;
+    tx = profile ? now_sec() : 0.0;
+    prefill_kv_round_ctx round_ctx = { .kv = kv, .n_tok = n_tok };
+    ds4_parallel_for_min_rows(n_tok, prefill_kv_round_worker, &round_ctx, 1);
+    if (profile) t_tl_rope_cache += now_sec() - tx;
 
-        tx = profile ? now_sec() : 0.0;
-        dsv4_fp8_kv_quantize_row_inplace_cpu(kv_t, DS4_N_HEAD_DIM, DS4_N_ROT);
-        /* The raw cache holds F16-rounded rows.  Round the batch row the same
-         * way so the prefix attention below reads exactly what decode reads
-         * back from the cache. */
-        for (uint32_t i = 0; i < DS4_N_HEAD_DIM; i++) kv_t[i] = f16_to_f32(f32_to_f16(kv_t[i]));
-        if (profile) t_tl_rope_cache += now_sec() - tx;
-
-        if (ratio == 0) continue;
-
+    for (uint32_t t = 0; t < n_tok && ratio != 0; t++) {
         tx = profile ? now_sec() : 0.0;
         if (compressor_update_deferred(ape_rows,
                                        comp_rows + (uint64_t)t * comp_width,
