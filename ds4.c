@@ -16940,16 +16940,23 @@ static void layer_attention_prefix_batch(
 typedef struct {
     float       * scores;
     const float * q;          /* [n_head][head_dim] */
-    const float * qt;         /* [head_dim][n_head]: q transposed for lane-per-head dots */
+    const float * qt;         /* [n_head/16][head_dim][16]: q transposed for lane-per-head dots */
     const float * weights;
     const float * index_comp;
+    uint32_t      n_comp;
 } indexer_score_ctx;
 
-static void indexer_score_rows_worker(void *vctx, uint64_t row0, uint64_t row1) {
+/* One item is a group of INDEXER_SCORE_ROWS rows: a row costs about a
+ * microsecond, so claiming rows one by one would spend as long on the
+ * cursor as on the dots. */
+#define INDEXER_SCORE_ROWS 8
+
+static void indexer_score_rows_worker(void *vctx, uint64_t g0, uint64_t g1) {
     const indexer_score_ctx *ctx = vctx;
     const uint32_t head_dim = DS4_N_INDEXER_HEAD_DIM;
     const uint32_t n_head = DS4_N_INDEXER_HEAD;
-    for (uint64_t c = row0; c < row1; c++) {
+    const uint64_t row1 = g1 * INDEXER_SCORE_ROWS < ctx->n_comp ? g1 * INDEXER_SCORE_ROWS : ctx->n_comp;
+    for (uint64_t c = g0 * INDEXER_SCORE_ROWS; c < row1; c++) {
         const float *kv = ctx->index_comp + c * head_dim;
         float s = 0.0f;
         uint32_t h = 0;
@@ -16958,11 +16965,11 @@ static void indexer_score_rows_worker(void *vctx, uint64_t row0, uint64_t row1) 
          * sequence (separate multiply and add, ascending i), so the dots are
          * bitwise identical to the serial path. */
         for (; h + 16 <= n_head; h += 16) {
-            const float *qt = ctx->qt + h;
+            const float *qt = ctx->qt + (uint64_t)h * head_dim;
             __m512 acc = _mm512_setzero_ps();
             for (uint32_t i = 0; i < head_dim; i++) {
                 acc = _mm512_add_ps(acc, _mm512_mul_ps(_mm512_set1_ps(kv[i]),
-                                                       _mm512_loadu_ps(qt + (uint64_t)i * n_head)));
+                                                       _mm512_loadu_ps(qt + (uint64_t)i * 16)));
             }
             float dots[16];
             _mm512_storeu_ps(dots, acc);
@@ -16983,22 +16990,6 @@ static void indexer_score_rows_worker(void *vctx, uint64_t row0, uint64_t row1) 
     }
 }
 
-/* qt[i][h] = q[h][i], the layout the AVX-512 scorer reads sixteen heads at a time. */
-static void indexer_transpose_query(float *qt, const float *q) {
-#if defined(DS4_NO_GPU) && defined(__AVX512F__)
-    const uint32_t head_dim = DS4_N_INDEXER_HEAD_DIM;
-    const uint32_t n_head = DS4_N_INDEXER_HEAD;
-    for (uint32_t h = 0; h < n_head; h++) {
-        for (uint32_t i = 0; i < head_dim; i++) {
-            qt[(uint64_t)i * n_head + h] = q[(uint64_t)h * head_dim + i];
-        }
-    }
-#else
-    (void)qt;
-    (void)q;
-#endif
-}
-
 /* qt is caller scratch of n_head * head_dim floats for the transposed query. */
 static void indexer_score_rows(
         float       * scores,
@@ -17007,15 +16998,17 @@ static void indexer_score_rows(
         const float * weights,
         const float * index_comp,
         uint32_t      n_comp) {
-    indexer_transpose_query(qt, q);
+    attn_lanes_transpose_q(qt, q, DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM);
     indexer_score_ctx ctx = {
         .scores = scores,
         .q = q,
         .qt = qt,
         .weights = weights,
         .index_comp = index_comp,
+        .n_comp = n_comp,
     };
-    ds4_parallel_for_min_rows(n_comp, indexer_score_rows_worker, &ctx, 1);
+    ds4_parallel_for_min_rows((n_comp + INDEXER_SCORE_ROWS - 1) / INDEXER_SCORE_ROWS,
+                              indexer_score_rows_worker, &ctx, 1);
 }
 
 /* Descending score, ascending index: the order in which argmax rounds with a
@@ -17649,7 +17642,7 @@ static void attn_graph_index_q(void *vctx) {
     rope_tail_layer_inplace(scratch->index_q, DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM, DS4_N_ROT,
                             g->pos, g->il, false);
     dsv4_indexer_qat_rows_inplace_cpu(scratch->index_q, DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM);
-    indexer_transpose_query(scratch->index_qt, scratch->index_q);
+    attn_lanes_transpose_q(scratch->index_qt, scratch->index_q, DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM);
 }
 
 /* The attention rows in order: the raw window, then the visible compressed
@@ -17839,6 +17832,7 @@ static void layer_attention_graph(
             .qt = scratch->index_qt,
             .weights = scratch->index_weights,
             .index_comp = cache->index_comp_kv,
+            .n_comp = g.n_index,
         };
     }
     /* n_chunks covers every row that may be listed: the raw window and the
@@ -17882,6 +17876,7 @@ static void layer_attention_graph(
     const uint64_t n_mix_groups = (layer->hc_attn_fn->dim[1] + DS4_F16_ROWS - 1) / DS4_F16_ROWS;
     const uint64_t n_index_groups = (index_dim + DS4_F16_ROWS - 1) / DS4_F16_ROWS;
     const uint64_t n_weight_groups = (DS4_N_INDEXER_HEAD + DS4_F16_ROWS - 1) / DS4_F16_ROWS;
+    const uint64_t n_index_items = (g.n_index + INDEXER_SCORE_ROWS - 1) / INDEXER_SCORE_ROWS;
     const uint64_t n_score = (uint64_t)head_groups * g.lanes.n_chunks;
     const uint64_t n_sum = (uint64_t)head_groups * g.lanes.n_dim_chunks;
     void (*mark)(void *) = g.profile ? attn_graph_mark : NULL;
@@ -17906,7 +17901,7 @@ static void layer_attention_graph(
           .n_rows = g.top_k ? n_index_groups : 0, .group_rows = n_index_groups,
           .deps = 1u << 1, .finish = g.top_k ? attn_graph_index_q : NULL, .finish_ctx = &g },
         { .fn = indexer_score_rows_worker, .ctx = &g.index_score,
-          .n_rows = g.top_k ? g.n_index : 0, .group_rows = g.top_k ? g.n_index : 1,
+          .n_rows = g.top_k ? n_index_items : 0, .group_rows = g.top_k ? n_index_items : 1,
           .deps = (1u << 2) | (1u << 5) | (1u << 6),
           .finish = g.top_k ? attn_graph_index_select : NULL, .finish_ctx = &g },
         { .fn = attn_lanes_score_worker, .ctx = &g.lanes,
