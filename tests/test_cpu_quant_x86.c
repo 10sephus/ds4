@@ -1186,12 +1186,13 @@ static void check_compressor_project_batch(void) {
 
 /* Prefix prefill attention must match the per-token attention each token
  * would run against its raw window and the compressed rows pushed so far,
- * with and without an indexer mask. */
-static void check_prefix_attention(void) {
+ * with and without an indexer mask.  The model shape takes the sixteen-lane
+ * kernels; 3 heads of 40 dims take the partial-group and tail paths. */
+static void check_prefix_attention_shape(uint32_t n_heads, uint32_t n_dims) {
     const ds4_shape saved = g_ds4_shape;
     g_ds4_shape = DS4_SHAPE_FLASH;
-    g_ds4_shape.n_head = 3;
-    g_ds4_shape.n_head_dim = 40;
+    g_ds4_shape.n_head = n_heads;
+    g_ds4_shape.n_head_dim = n_dims;
     const uint32_t n_head = DS4_N_HEAD, head_dim = DS4_N_HEAD_DIM;
     const uint32_t n_tok = 23, raw_cap = 6, n_comp_rows = 9, comp_cap = 16;
     const uint64_t q_dim = (uint64_t)n_head * head_dim;
@@ -1256,6 +1257,11 @@ static void check_prefix_attention(void) {
     free(one); free(batch); free(comp); free(kv); free(q);
     quant_free(sb);
     g_ds4_shape = saved;
+}
+
+static void check_prefix_attention(void) {
+    check_prefix_attention_shape(3, 40);
+    check_prefix_attention_shape(64, 512);
 }
 
 int main(void) {

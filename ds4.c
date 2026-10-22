@@ -15520,6 +15520,7 @@ typedef struct {
     const float * const * rows;     /* live KV rows in attention order */
     float               * score;    /* scores, then softmax weights */
     float               * inv;      /* 1 / denominator per head */
+    uint32_t              n_head;
     uint32_t              score_stride;
     uint32_t              n_rows;
     uint32_t              n_chunks;
@@ -15593,7 +15594,7 @@ static void attn_lanes_score_worker(void *vctx, uint64_t item0, uint64_t item1) 
     for (uint64_t item = item0; item < item1; item++) {
         const uint32_t h0 = (uint32_t)(item / ctx->n_chunks) * 16;
         const uint32_t r0 = (uint32_t)(item % ctx->n_chunks) * ATTN_LANES_ROWS_PER_ITEM;
-        const uint32_t h1 = h0 + 16 < DS4_N_HEAD ? h0 + 16 : DS4_N_HEAD;
+        const uint32_t h1 = h0 + 16 < ctx->n_head ? h0 + 16 : ctx->n_head;
         const uint32_t r1 = r0 + ATTN_LANES_ROWS_PER_ITEM < ctx->n_rows ? r0 + ATTN_LANES_ROWS_PER_ITEM : ctx->n_rows;
         uint32_t h = h0;
 #if defined(DS4_NO_GPU) && defined(__AVX512F__)
@@ -15636,7 +15637,7 @@ static void attn_lanes_sum_worker(void *vctx, uint64_t item0, uint64_t item1) {
     for (uint64_t item = item0; item < item1; item++) {
         const uint32_t h0 = (uint32_t)(item / ctx->n_dim_chunks) * 16;
         const uint32_t d0 = (uint32_t)(item % ctx->n_dim_chunks) * 16;
-        const uint32_t h1 = h0 + 16 < DS4_N_HEAD ? h0 + 16 : DS4_N_HEAD;
+        const uint32_t h1 = h0 + 16 < ctx->n_head ? h0 + 16 : ctx->n_head;
         const uint32_t d1 = d0 + 16 < head_dim ? d0 + 16 : head_dim;
         const float *w = attn_lanes_score(ctx, h0, 0);
 #if defined(DS4_NO_GPU) && defined(__AVX512F__)
@@ -15672,6 +15673,24 @@ static void attn_lanes_sum_worker(void *vctx, uint64_t item0, uint64_t item1) {
     }
 }
 
+/* qt[g][i][l] = q[16g + l][i] for every full group of sixteen heads; the
+ * scalar path of a partial group reads q directly. */
+static void attn_lanes_transpose_q(float *qt, const float *q, uint32_t n_head, uint32_t head_dim) {
+#if defined(DS4_NO_GPU) && defined(__AVX512F__)
+    for (uint32_t h = 0; h + 16 <= n_head; h += 16) {
+        const float *qg = q + (uint64_t)h * head_dim;
+        float *qtg = qt + (uint64_t)h * head_dim;
+        uint32_t i = 0;
+        for (; i + 16 <= head_dim; i += 16) attn_lanes_transpose16(qtg + i * 16, qg + i, head_dim);
+        for (; i < head_dim; i++) {
+            for (uint32_t l = 0; l < 16; l++) qtg[(uint64_t)i * 16 + l] = qg[(uint64_t)l * head_dim + i];
+        }
+    }
+#else
+    (void)qt; (void)q; (void)n_head; (void)head_dim;
+#endif
+}
+
 /* Caller scratch: qt n_head * head_dim floats, rows n_raw + n_comp pointers,
  * score 16 * ceil(n_head / 16) * score_stride floats with score_stride >=
  * n_raw + n_comp, inv n_head floats. */
@@ -15696,17 +15715,7 @@ static void layer_attention_lanes(
         if (comp_allowed && !comp_allowed[r]) continue;
         rows[n_rows++] = comp_kv + (uint64_t)r * head_dim;
     }
-#if defined(DS4_NO_GPU) && defined(__AVX512F__)
-    for (uint32_t h = 0; h + 16 <= n_head; h += 16) {
-        const float *qg = q + (uint64_t)h * head_dim;
-        float *qtg = qt + (uint64_t)h * head_dim;
-        uint32_t i = 0;
-        for (; i + 16 <= head_dim; i += 16) attn_lanes_transpose16(qtg + i * 16, qg + i, head_dim);
-        for (; i < head_dim; i++) {
-            for (uint32_t l = 0; l < 16; l++) qtg[(uint64_t)i * 16 + l] = qg[(uint64_t)l * head_dim + i];
-        }
-    }
-#endif
+    attn_lanes_transpose_q(qt, q, n_head, head_dim);
     layer_attention_lanes_ctx ctx = {
         .out_heads = out_heads,
         .sinks = sinks,
@@ -15715,6 +15724,7 @@ static void layer_attention_lanes(
         .rows = rows,
         .score = score,
         .inv = inv,
+        .n_head = n_head,
         .score_stride = score_stride,
         .n_rows = n_rows,
         .n_chunks = (n_rows + ATTN_LANES_ROWS_PER_ITEM - 1) / ATTN_LANES_ROWS_PER_ITEM,
@@ -15770,65 +15780,63 @@ static inline bool attention_prefix_comp_allowed(
     return (bits[c >> 3] & (uint8_t)(1u << (c & 7u))) != 0;
 }
 
-static void layer_attention_prefix_batch_worker(void *vctx, uint64_t r0, uint64_t r1) {
-    layer_attention_prefix_batch_ctx *ctx = vctx;
+/* One item is a head group of the tokens p and n_tok-1-p: a token's window
+ * grows with its position, so pairing the ends hands a static split about
+ * the same number of rows per thread.  Each token runs the three lane passes
+ * on the worker's own scratch, the same sequence per (token, head) as the
+ * decode kernel, so the rows match the per-token attention bitwise. */
+static void layer_attention_prefix_batch_worker(void *vctx, uint64_t i0, uint64_t i1) {
+    const layer_attention_prefix_batch_ctx *ctx = vctx;
     const float *sinks = tensor_data(ctx->model, ctx->layer->attn_sinks);
-    const float kq_scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
+    const uint32_t n_head = DS4_N_HEAD, head_dim = DS4_N_HEAD_DIM;
+    const uint32_t n_groups = (n_head + 15) / 16;
     const uint32_t max_comp = ctx->comp_counts ? ctx->comp_counts[ctx->n_tok - 1] : 0;
     const uint32_t max_total = ctx->raw_cap + max_comp;
-    float score_stack[2048];
-    float *score = max_total <= 2048 ? score_stack : xmalloc((size_t)max_total * sizeof(score[0]));
+    const float **rows = xmalloc((size_t)max_total * sizeof(rows[0]));
+    float *qt = xmalloc((size_t)16 * head_dim * sizeof(qt[0]));
+    float *score = xmalloc((size_t)16 * max_total * sizeof(score[0]));
+    float inv[16];
+    layer_attention_lanes_ctx lanes = {
+        .qt = qt,
+        .rows = rows,
+        .score = score,
+        .inv = inv,
+        .score_stride = max_total,
+        .n_dim_chunks = (head_dim + 15) / 16,
+    };
 
-    for (uint64_t idx = r0; idx < r1; idx++) {
-        /* Head-outer: a static split then hands every thread the same mix of
-         * short and long token windows.  Each (t, h) output is independent. */
-        const uint32_t t = (uint32_t)(idx % ctx->n_tok);
-        const uint32_t h = (uint32_t)(idx / ctx->n_tok);
-        const uint32_t raw_count = t + 1 < ctx->raw_cap ? t + 1 : ctx->raw_cap;
-        const uint32_t raw_start = t + 1 - raw_count;
-        const uint32_t comp_count = ctx->comp_counts ? ctx->comp_counts[t] : 0;
-        const float *qh = ctx->q + (uint64_t)t * DS4_N_HEAD * DS4_N_HEAD_DIM + (uint64_t)h * DS4_N_HEAD_DIM;
-
-        float max_score = sinks[h];
-        uint32_t sidx = 0;
-        for (uint32_t r = 0; r < raw_count; r++, sidx++) {
-            const float *kv = ctx->raw_kv + (uint64_t)(raw_start + r) * DS4_N_HEAD_DIM;
-            score[sidx] = dot_f32(qh, kv, DS4_N_HEAD_DIM) * kq_scale;
-            if (score[sidx] > max_score) max_score = score[sidx];
-        }
-        for (uint32_t c = 0; c < comp_count; c++, sidx++) {
-            if (!attention_prefix_comp_allowed(ctx, t, c)) {
-                score[sidx] = DS4_NEG_INF;
-                continue;
+    for (uint64_t idx = i0; idx < i1; idx++) {
+        const uint32_t p = (uint32_t)(idx / n_groups);
+        const uint32_t h0 = (uint32_t)(idx % n_groups) * 16;
+        const uint32_t toks[2] = {p, ctx->n_tok - 1 - p};
+        lanes.n_head = h0 + 16 < n_head ? 16 : n_head - h0;
+        lanes.sinks = sinks + h0;
+        for (uint32_t side = 0; side < (toks[0] == toks[1] ? 1u : 2u); side++) {
+            const uint32_t t = toks[side];
+            const uint32_t raw_count = t + 1 < ctx->raw_cap ? t + 1 : ctx->raw_cap;
+            const uint32_t comp_count = ctx->comp_counts ? ctx->comp_counts[t] : 0;
+            uint32_t n_rows = 0;
+            for (uint32_t r = t + 1 - raw_count; r <= t; r++) {
+                rows[n_rows++] = ctx->raw_kv + (uint64_t)r * head_dim;
             }
-            const float *kv = ctx->comp_kv + (uint64_t)c * DS4_N_HEAD_DIM;
-            score[sidx] = dot_f32(qh, kv, DS4_N_HEAD_DIM) * kq_scale;
-            if (score[sidx] > max_score) max_score = score[sidx];
+            for (uint32_t c = 0; c < comp_count; c++) {
+                if (!attention_prefix_comp_allowed(ctx, t, c)) continue;
+                rows[n_rows++] = ctx->comp_kv + (uint64_t)c * head_dim;
+            }
+            lanes.q = ctx->q + ((uint64_t)t * n_head + h0) * head_dim;
+            lanes.out_heads = ctx->out_heads + ((uint64_t)t * n_head + h0) * head_dim;
+            lanes.n_rows = n_rows;
+            lanes.n_chunks = (n_rows + ATTN_LANES_ROWS_PER_ITEM - 1) / ATTN_LANES_ROWS_PER_ITEM;
+            attn_lanes_transpose_q(qt, lanes.q, lanes.n_head, head_dim);
+            attn_lanes_score_worker(&lanes, 0, lanes.n_chunks);
+            attn_lanes_weight_worker(&lanes, 0, lanes.n_head);
+            attn_lanes_sum_worker(&lanes, 0, lanes.n_dim_chunks);
         }
-
-        float *oh = ctx->out_heads + (uint64_t)t * DS4_N_HEAD * DS4_N_HEAD_DIM + (uint64_t)h * DS4_N_HEAD_DIM;
-        memset(oh, 0, (size_t)DS4_N_HEAD_DIM * sizeof(oh[0]));
-
-        float denom = expf(sinks[h] - max_score);
-        sidx = 0;
-        for (uint32_t r = 0; r < raw_count; r++, sidx++) {
-            const float weight = expf(score[sidx] - max_score);
-            const float *kv = ctx->raw_kv + (uint64_t)(raw_start + r) * DS4_N_HEAD_DIM;
-            denom += weight;
-            axpy_f32(oh, kv, weight, DS4_N_HEAD_DIM);
-        }
-        for (uint32_t c = 0; c < comp_count; c++, sidx++) {
-            if (score[sidx] <= DS4_NEG_INF * 0.5f) continue;
-            const float weight = expf(score[sidx] - max_score);
-            const float *kv = ctx->comp_kv + (uint64_t)c * DS4_N_HEAD_DIM;
-            denom += weight;
-            axpy_f32(oh, kv, weight, DS4_N_HEAD_DIM);
-        }
-
-        scale_f32(oh, 1.0f / denom, DS4_N_HEAD_DIM);
     }
 
-    if (score != score_stack) free(score);
+    free(score);
+    free(qt);
+    free(rows);
 }
 
 /* Prefix prefill attention for a fresh prompt.  It computes each token's view
@@ -15860,7 +15868,7 @@ static void layer_attention_prefix_batch(
         .n_tok = n_tok,
         .raw_cap = raw_cap,
     };
-    ds4_parallel_for_min_rows((uint64_t)n_tok * DS4_N_HEAD,
+    ds4_parallel_for_min_rows((uint64_t)((n_tok + 1) / 2) * ((DS4_N_HEAD + 15) / 16),
                               layer_attention_prefix_batch_worker,
                               &ctx,
                               1);
