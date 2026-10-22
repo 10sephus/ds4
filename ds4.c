@@ -1128,7 +1128,6 @@ typedef struct {
 
     float *attn_cur;
     float *attn_norm;
-    float *attn_residual;
     float *q;
     float *qr;
     float *qr_norm;
@@ -3789,46 +3788,23 @@ static void f16_round_inplace_cpu(float *x, uint32_t n) {
     for (uint32_t i = 0; i < n; i++) x[i] = f16_to_f32(f32_to_f16(x[i]));
 }
 
-static float dsv4_e4m3fn_value_cpu(int i) {
-    static const float exp_scale[16] = {
-        0.0f, 0.015625f, 0.03125f, 0.0625f,
-        0.125f, 0.25f, 0.5f, 1.0f,
-        2.0f, 4.0f, 8.0f, 16.0f,
-        32.0f, 64.0f, 128.0f, 256.0f,
-    };
-
-    const int exp = (i >> 3) & 0x0f;
-    const int mant = i & 0x07;
-    return exp == 0
-        ? (float)mant * 0.001953125f
-        : (1.0f + (float)mant * 0.125f) * exp_scale[exp];
-}
-
+/* Round to the nearest E4M3FN value, ties to an even mantissa, saturating at
+ * 448 (fminf also maps NaN to 448).  At and above 2^-6 that keeps three float
+ * mantissa bits; below it the grid is the subnormal step 2^-9. */
 static float dsv4_e4m3fn_dequant_cpu(float x) {
     const float sign = x < 0.0f ? -1.0f : 1.0f;
     const float ax = fminf(fabsf(x), 448.0f);
+    float q;
 
-    int lo = 0;
-    int hi = 126;
-    while (lo < hi) {
-        const int mid = (lo + hi + 1) >> 1;
-        if (dsv4_e4m3fn_value_cpu(mid) <= ax) {
-            lo = mid;
-        } else {
-            hi = mid - 1;
-        }
+    if (ax < 0.015625f) {
+        q = rintf(ax * 512.0f) * 0.001953125f;
+    } else {
+        uint32_t bits;
+        memcpy(&bits, &ax, sizeof(bits));
+        bits = (bits + 0x7ffffu + ((bits >> 20) & 1u)) & ~0xfffffu;
+        memcpy(&q, &bits, sizeof(q));
     }
-
-    int best = lo;
-    if (best < 126) {
-        const float best_diff = fabsf(ax - dsv4_e4m3fn_value_cpu(best));
-        const float next_diff = fabsf(ax - dsv4_e4m3fn_value_cpu(best + 1));
-        if (next_diff < best_diff || (next_diff == best_diff && ((best + 1) & 1) == 0 && (best & 1) != 0)) {
-            best++;
-        }
-    }
-
-    return sign * dsv4_e4m3fn_value_cpu(best);
+    return sign * q;
 }
 
 /* DeepSeek V4 stores the non-RoPE part of compressed KV through an E4M3-style
@@ -9218,15 +9194,27 @@ static void rms_norm_weight(float *out, const float *x, const float *weight, uin
     for (uint64_t i = 0; i < n; i++) out[i] = x[i] * scale * weight[i];
 }
 
-/* Normalize each attention head independently after Q projection. */
+/* Normalize each attention head independently after Q projection.  Groups of
+ * eight heads run their sums of squares side by side: each head still sums its
+ * elements in index order, but eight independent chains hide the add latency. */
 static void head_rms_norm_inplace(float *x, uint32_t n_head, uint32_t head_dim, float eps) {
-    for (uint32_t h = 0; h < n_head; h++) {
-        float *head = x + (uint64_t)h * head_dim;
-        double ss = 0.0;
-        for (uint32_t i = 0; i < head_dim; i++) ss += (double)head[i] * head[i];
+    enum { GROUP = 8 };
+    for (uint32_t h0 = 0; h0 < n_head; h0 += GROUP) {
+        const uint32_t n = n_head - h0 < GROUP ? n_head - h0 : GROUP;
+        float *heads = x + (uint64_t)h0 * head_dim;
+        double ss[GROUP] = { 0.0 };
+        for (uint32_t i = 0; i < head_dim; i++) {
+            for (uint32_t h = 0; h < n; h++) {
+                const float v = heads[(uint64_t)h * head_dim + i];
+                ss[h] += (double)v * v;
+            }
+        }
 
-        const float scale = 1.0f / sqrtf((float)(ss / (double)head_dim) + eps);
-        for (uint32_t i = 0; i < head_dim; i++) head[i] *= scale;
+        for (uint32_t h = 0; h < n; h++) {
+            float *head = heads + (uint64_t)h * head_dim;
+            const float scale = 1.0f / sqrtf((float)(ss[h] / (double)head_dim) + eps);
+            for (uint32_t i = 0; i < head_dim; i++) head[i] *= scale;
+        }
     }
 }
 
@@ -12391,12 +12379,13 @@ static void hc_weighted_sum_one(
         const float * weights,
         uint32_t      n_embd,
         uint32_t      n_hc) {
-    for (uint32_t d = 0; d < n_embd; d++) {
-        float acc = 0.0f;
-        for (uint32_t h = 0; h < n_hc; h++) {
-            acc += x[(uint64_t)h * n_embd + d] * weights[h];
-        }
-        out[d] = acc;
+    /* Stream-at-a-time over contiguous rows so the loops vectorize; each
+     * element still adds the streams in order 0..n_hc-1 starting from zero. */
+    for (uint32_t d = 0; d < n_embd; d++) out[d] = 0.0f;
+    for (uint32_t h = 0; h < n_hc; h++) {
+        const float *xh = x + (uint64_t)h * n_embd;
+        const float w = weights[h];
+        for (uint32_t d = 0; d < n_embd; d++) out[d] += xh[d] * w;
     }
 }
 
@@ -12492,16 +12481,19 @@ static void hc_post_one(
         const float * comb,
         uint32_t      n_embd,
         uint32_t      n_hc) {
+    /* Each output row accumulates one source stream at a time over contiguous
+     * memory, which vectorizes; per element the order is unchanged: the block
+     * term first, then sources 0..n_hc-1. */
     for (uint32_t dst = 0; dst < n_hc; dst++) {
-        for (uint32_t d = 0; d < n_embd; d++) {
-            float acc = block_out[d] * post[dst];
+        float *out = out_hc + (uint64_t)dst * n_embd;
+        const float p = post[dst];
+        for (uint32_t d = 0; d < n_embd; d++) out[d] = block_out[d] * p;
 
-            for (uint32_t src = 0; src < n_hc; src++) {
-                /* The HC combine matrix is addressed as [dst_hc, src_hc]. */
-                acc += comb[dst + src * n_hc] * residual_hc[(uint64_t)src * n_embd + d];
-            }
-
-            out_hc[(uint64_t)dst * n_embd + d] = acc;
+        for (uint32_t src = 0; src < n_hc; src++) {
+            /* The HC combine matrix is addressed as [dst_hc, src_hc]. */
+            const float w = comb[dst + src * n_hc];
+            const float *res = residual_hc + (uint64_t)src * n_embd;
+            for (uint32_t d = 0; d < n_embd; d++) out[d] += w * res[d];
         }
     }
 }
@@ -12828,6 +12820,7 @@ static void rope_tail_ext_inplace(
         float      beta_fast,
         float      beta_slow,
         bool       inverse) {
+    if (n_rot > DS4_MAX_ROT) ds4_die("RoPE dimension exceeds DS4_MAX_ROT");
     const uint32_t n_nope = head_dim - n_rot;
     const float theta_scale = powf(freq_base, -2.0f / (float)n_rot);
     const float sin_sign = inverse ? -1.0f : 1.0f;
@@ -12836,30 +12829,37 @@ static void rope_tail_ext_inplace(
         rope_yarn_corr_dims((int)n_rot, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims);
     }
 
+    /* The angles depend only on the position and the pair index, so compute
+     * the (cos, sin) pairs once and rotate every head with the same table. */
+    float rot[DS4_MAX_ROT];
+    float theta_extrap = (float)pos;
+    for (uint32_t i = 0; i < n_rot; i += 2) {
+        const float theta_interp = freq_scale * theta_extrap;
+        float theta = theta_interp;
+        float mscale = attn_factor;
+
+        if (ext_factor != 0.0f) {
+            const float ramp_mix = rope_yarn_ramp(corr_dims[0], corr_dims[1], (int)i) * ext_factor;
+            theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+            mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+        }
+
+        rot[i + 0] = cosf(theta) * mscale;
+        rot[i + 1] = sin_sign * sinf(theta) * mscale;
+        theta_extrap *= theta_scale;
+    }
+
     for (uint32_t h = 0; h < n_head; h++) {
         float *tail = x + (uint64_t)h * head_dim + n_nope;
-        float theta_extrap = (float)pos;
 
         for (uint32_t i = 0; i < n_rot; i += 2) {
-            const float theta_interp = freq_scale * theta_extrap;
-            float theta = theta_interp;
-            float mscale = attn_factor;
-
-            if (ext_factor != 0.0f) {
-                const float ramp_mix = rope_yarn_ramp(corr_dims[0], corr_dims[1], (int)i) * ext_factor;
-                theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
-                mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
-            }
-
-            const float c = cosf(theta) * mscale;
-            const float s = sin_sign * sinf(theta) * mscale;
+            const float c = rot[i + 0];
+            const float s = rot[i + 1];
             const float x0 = tail[i + 0];
             const float x1 = tail[i + 1];
 
             tail[i + 0] = x0 * c - x1 * s;
             tail[i + 1] = x0 * s + x1 * c;
-
-            theta_extrap *= theta_scale;
         }
     }
 }
@@ -14809,7 +14809,6 @@ static void cpu_decode_scratch_init(ds4_cpu_decode_scratch *scratch, uint32_t ct
 
     scratch->attn_cur = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
     scratch->attn_norm = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
-    scratch->attn_residual = xmalloc((size_t)hc_dim * sizeof(float));
     scratch->q = xmalloc((size_t)q_dim * sizeof(float));
     scratch->qr = xmalloc((size_t)DS4_N_LORA_Q * sizeof(float));
     scratch->qr_norm = xmalloc((size_t)DS4_N_LORA_Q * sizeof(float));
@@ -14907,7 +14906,6 @@ static void cpu_decode_scratch_free(ds4_cpu_decode_scratch *scratch) {
     free(scratch->qr_norm);
     free(scratch->qr);
     free(scratch->q);
-    free(scratch->attn_residual);
     free(scratch->attn_norm);
     free(scratch->attn_cur);
     free(scratch->next);
@@ -16228,13 +16226,14 @@ static void layer_forward_raw_swa_one(
     float post[4];
     float comb[16];
 
+    /* inp_hc stays untouched until the FFN writes out_hc, so it is read
+     * directly as the attention residual. */
     double t0 = profile ? now_sec() : 0.0;
-    memcpy(scratch->attn_residual, inp_hc, (size_t)n_hc * DS4_N_EMBD * sizeof(inp_hc[0]));
     hc_pre_from_state_one_scratch(model,
                                   layer->hc_attn_fn,
                                   layer->hc_attn_scale,
                                   layer->hc_attn_base,
-                                  scratch->attn_residual, scratch->attn_cur, post, comb,
+                                  inp_hc, scratch->attn_cur, post, comb,
                                   scratch->hc_flat,
                                   false);
     if (profile) t_hc = now_sec() - t0;
@@ -16335,7 +16334,7 @@ static void layer_forward_raw_swa_one(
     cpu_directional_steering_project_rows(scratch->attn_out, steering_dirs, il, 1, steering_attn_scale);
     if (profile) t_out = now_sec() - t0;
     t0 = profile ? now_sec() : 0.0;
-    hc_post_one(scratch->after_attn_hc, scratch->attn_out, scratch->attn_residual, post, comb, DS4_N_EMBD, n_hc);
+    hc_post_one(scratch->after_attn_hc, scratch->attn_out, inp_hc, post, comb, DS4_N_EMBD, n_hc);
     if (profile) t_post = now_sec() - t0;
 
     t0 = profile ? now_sec() : 0.0;

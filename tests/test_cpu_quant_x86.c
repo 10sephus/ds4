@@ -799,6 +799,185 @@ static void check_thread_pool(void) {
     free(ctx);
 }
 
+
+/* Scalar references for the decode glue as it was written before the loops
+ * were restructured: per-head RoPE angles, element-at-a-time HC mixing, one
+ * head at a time RMS sums, and the E4M3 table search. */
+static void rope_oracle(float *x, uint32_t n_head, uint32_t head_dim, uint32_t n_rot,
+                        uint32_t pos, uint64_t n_ctx_orig, float freq_base, float freq_scale,
+                        float ext_factor, float attn_factor, bool inverse) {
+    const uint32_t n_nope = head_dim - n_rot;
+    const float theta_scale = powf(freq_base, -2.0f / (float)n_rot);
+    const float sin_sign = inverse ? -1.0f : 1.0f;
+    float corr_dims[2] = { 0.0f, 0.0f };
+    if (ext_factor != 0.0f) {
+        rope_yarn_corr_dims((int)n_rot, n_ctx_orig, freq_base, DS4_ROPE_YARN_BETA_FAST,
+                            DS4_ROPE_YARN_BETA_SLOW, corr_dims);
+    }
+    for (uint32_t h = 0; h < n_head; h++) {
+        float *tail = x + (uint64_t)h * head_dim + n_nope;
+        float theta_extrap = (float)pos;
+        for (uint32_t i = 0; i < n_rot; i += 2) {
+            const float theta_interp = freq_scale * theta_extrap;
+            float theta = theta_interp;
+            float mscale = attn_factor;
+            if (ext_factor != 0.0f) {
+                const float ramp_mix = rope_yarn_ramp(corr_dims[0], corr_dims[1], (int)i) * ext_factor;
+                theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+                mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+            }
+            const float c = cosf(theta) * mscale;
+            const float s = sin_sign * sinf(theta) * mscale;
+            const float x0 = tail[i + 0];
+            const float x1 = tail[i + 1];
+            tail[i + 0] = x0 * c - x1 * s;
+            tail[i + 1] = x0 * s + x1 * c;
+            theta_extrap *= theta_scale;
+        }
+    }
+}
+
+static void hc_post_oracle(float *out_hc, const float *block_out, const float *residual_hc,
+                           const float *post, const float *comb, uint32_t n_embd, uint32_t n_hc) {
+    for (uint32_t dst = 0; dst < n_hc; dst++) {
+        for (uint32_t d = 0; d < n_embd; d++) {
+            float acc = block_out[d] * post[dst];
+            for (uint32_t src = 0; src < n_hc; src++) {
+                acc += comb[dst + src * n_hc] * residual_hc[(uint64_t)src * n_embd + d];
+            }
+            out_hc[(uint64_t)dst * n_embd + d] = acc;
+        }
+    }
+}
+
+static void hc_sum_oracle(float *out, const float *x, const float *weights,
+                          uint32_t n_embd, uint32_t n_hc) {
+    for (uint32_t d = 0; d < n_embd; d++) {
+        float acc = 0.0f;
+        for (uint32_t h = 0; h < n_hc; h++) acc += x[(uint64_t)h * n_embd + d] * weights[h];
+        out[d] = acc;
+    }
+}
+
+static void head_norm_oracle(float *x, uint32_t n_head, uint32_t head_dim, float eps) {
+    for (uint32_t h = 0; h < n_head; h++) {
+        float *head = x + (uint64_t)h * head_dim;
+        double ss = 0.0;
+        for (uint32_t i = 0; i < head_dim; i++) ss += (double)head[i] * head[i];
+        const float scale = 1.0f / sqrtf((float)(ss / (double)head_dim) + eps);
+        for (uint32_t i = 0; i < head_dim; i++) head[i] *= scale;
+    }
+}
+
+static float e4m3_value_oracle(int i) {
+    const int exp = (i >> 3) & 0x0f, mant = i & 0x07;
+    return exp == 0 ? (float)mant * 0.001953125f
+                    : (1.0f + (float)mant * 0.125f) * ldexpf(1.0f, exp - 7);
+}
+
+static float e4m3_oracle(float x) {
+    const float sign = x < 0.0f ? -1.0f : 1.0f;
+    const float ax = fminf(fabsf(x), 448.0f);
+    int lo = 0, hi = 126;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (e4m3_value_oracle(mid) <= ax) lo = mid; else hi = mid - 1;
+    }
+    if (lo < 126) {
+        const float best = fabsf(ax - e4m3_value_oracle(lo));
+        const float next = fabsf(ax - e4m3_value_oracle(lo + 1));
+        if (next < best || (next == best && (lo & 1) != 0)) lo++;
+    }
+    return sign * e4m3_value_oracle(lo);
+}
+
+static float glue_random(float scale) {
+    return ((float)(quant_random() >> 8) / 16777216.0f * 2.0f - 1.0f) * scale;
+}
+
+static void glue_equal(const char *name, const void *expected, const void *actual, size_t bytes, unsigned c) {
+    if (memcmp(expected, actual, bytes) != 0) {
+        fprintf(stderr, "%s case %u differs from the scalar reference\n", name, c);
+        exit(1);
+    }
+}
+
+static void check_decode_glue(void) {
+    enum { HEADS = 64, DIM = 512, ROT = 64, EMBD = 4096, HC = 4 };
+    float *x = malloc((size_t)HEADS * DIM * sizeof(float));
+    float *a = malloc((size_t)HEADS * DIM * sizeof(float));
+    float *b = malloc((size_t)HEADS * DIM * sizeof(float));
+    CHECK(x && a && b);
+
+    /* Dense and YaRN-compressed parameters as rope_tail_layer_inplace passes them. */
+    const float yarn_scale = 1.0f / 16.0f;
+    const float yarn_attn = 1.0f / (1.0f + 0.1f * logf(1.0f / yarn_scale));
+    for (unsigned c = 0; c < 96; c++) {
+        const bool yarn = c & 1, inverse = c & 2;
+        const uint32_t heads = c & 4 ? 1 : HEADS, pos = c * c * 977u + c;
+        for (uint32_t i = 0; i < heads * DIM; i++) x[i] = glue_random(4.0f);
+        memcpy(a, x, (size_t)heads * DIM * sizeof(float));
+        memcpy(b, x, (size_t)heads * DIM * sizeof(float));
+        rope_oracle(a, heads, DIM, ROT, pos, yarn ? 65536 : 0, yarn ? 160000.0f : 10000.0f,
+                    yarn ? yarn_scale : 1.0f, yarn ? 1.0f : 0.0f, yarn ? yarn_attn : 1.0f, inverse);
+        rope_tail_ext_inplace(b, heads, DIM, ROT, pos, yarn ? 65536 : 0, yarn ? 160000.0f : 10000.0f,
+                              yarn ? yarn_scale : 1.0f, yarn ? 1.0f : 0.0f, yarn ? yarn_attn : 1.0f,
+                              DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW, inverse);
+        glue_equal("RoPE", a, b, (size_t)heads * DIM * sizeof(float), c);
+    }
+
+    /* Head RMS: full groups of eight, a partial group, and extreme magnitudes. */
+    for (unsigned c = 0; c < 12; c++) {
+        const uint32_t heads = c % 3 == 2 ? 7 : HEADS, dim = c % 3 == 2 ? 96 : DIM;
+        const float mag = c < 4 ? 1.0f : c < 8 ? 1e-30f : 1e30f;
+        for (uint32_t i = 0; i < heads * dim; i++) x[i] = glue_random(mag);
+        if (c == 1) for (uint32_t i = 0; i < dim; i++) x[3 * dim + i] = 0.0f;
+        memcpy(a, x, (size_t)heads * dim * sizeof(float));
+        memcpy(b, x, (size_t)heads * dim * sizeof(float));
+        head_norm_oracle(a, heads, dim, 1e-6f);
+        head_rms_norm_inplace(b, heads, dim, 1e-6f);
+        glue_equal("head RMS", a, b, (size_t)heads * dim * sizeof(float), c);
+    }
+
+    /* HC pre-sum and post mix with signed zeros, infinities and tiny values. */
+    float post[HC], comb[HC * HC], block[EMBD];
+    for (unsigned c = 0; c < 16; c++) {
+        const uint32_t embd = c & 1 ? 1000 : EMBD;
+        for (uint32_t i = 0; i < HC * embd; i++) x[i] = glue_random(c & 2 ? 1e-38f : 3.0f);
+        for (uint32_t i = 0; i < embd; i++) block[i] = glue_random(c & 4 ? 1e30f : 1.0f);
+        for (uint32_t i = 0; i < HC; i++) post[i] = glue_random(2.0f);
+        for (uint32_t i = 0; i < HC * HC; i++) comb[i] = glue_random(1.0f);
+        if (c == 8) { x[5] = -0.0f; block[5] = -0.0f; post[1] = -0.0f; x[embd + 9] = INFINITY; }
+        hc_post_oracle(a, block, x, post, comb, embd, HC);
+        hc_post_one(b, block, x, post, comb, embd, HC);
+        glue_equal("HC post", a, b, (size_t)HC * embd * sizeof(float), c);
+        hc_sum_oracle(a, x, post, embd, HC);
+        hc_weighted_sum_one(b, x, post, embd, HC);
+        glue_equal("HC sum", a, b, (size_t)embd * sizeof(float), c);
+    }
+
+    /* E4M3: every midpoint between grid values, then a sweep of bit patterns.
+     * Signaling NaNs are skipped: the only caller passes quotients. */
+    for (int i = 0; i < 126; i++) {
+        const float mid = 0.5f * (e4m3_value_oracle(i) + e4m3_value_oracle(i + 1));
+        const float probes[] = {mid, nextafterf(mid, 0.0f), nextafterf(mid, 1000.0f), -mid};
+        for (unsigned j = 0; j < 4; j++) {
+            const float e = e4m3_oracle(probes[j]), g = dsv4_e4m3fn_dequant_cpu(probes[j]);
+            glue_equal("E4M3 tie", &e, &g, sizeof(e), (unsigned)i);
+        }
+    }
+    for (uint64_t u = 0; u < (1ull << 32); u += 1031) {
+        const uint32_t bits = (uint32_t)u;
+        if ((bits & 0x7fc00000u) == 0x7f800000u && (bits & 0x3fffffu)) continue;
+        float v;
+        memcpy(&v, &bits, sizeof(v));
+        const float e = e4m3_oracle(v), g = dsv4_e4m3fn_dequant_cpu(v);
+        glue_equal("E4M3 sweep", &e, &g, sizeof(e), bits);
+    }
+
+    free(b); free(a); free(x);
+}
+
 int main(void) {
     check_thread_pool();
     check_integer_dots();
@@ -834,5 +1013,7 @@ int main(void) {
     puts("CPU scalar IQ2_XXS/Q2_K integer and bitwise block oracles PASS");
 #endif
 #endif
+    check_decode_glue();
+    puts("CPU decode glue (RoPE, HC, head RMS, E4M3) bitwise oracles PASS");
     return 0;
 }
