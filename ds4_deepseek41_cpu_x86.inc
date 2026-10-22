@@ -675,6 +675,16 @@ typedef struct {
     bool round;
 } ds41_cpu_f16_batch_ctx;
 
+/* The 32 converted weights of 16 F16 rows at the input block rows points
+ * to: each dword gathers the halves of inputs j and j + 1. */
+static inline void ds41_cpu_f16_decode16(__m512 *w, const uint8_t *rows, __m512i offsets) {
+    for (unsigned k = 0; k < 16; k++) {
+        const __m512i pair = _mm512_i32gather_epi32(offsets, rows + 4u * k, 1);
+        w[2 * k] = _mm512_cvtph_ps(_mm512_cvtepi32_epi16(pair));
+        w[2 * k + 1] = _mm512_cvtph_ps(_mm512_cvtepi32_epi16(_mm512_srli_epi32(pair, 16)));
+    }
+}
+
 static void ds41_cpu_f16_batch_worker(void *vctx, uint64_t first, uint64_t last) {
     const ds41_cpu_f16_batch_ctx *c = vctx;
     const __m512i offsets = ds41_cpu_row_offsets(c->row_bytes);
@@ -690,17 +700,41 @@ static void ds41_cpu_f16_batch_worker(void *vctx, uint64_t first, uint64_t last)
                 xp[t] = c->x + (uint64_t)(t0 + t) * c->x_stride;
             }
             for (uint64_t i = 0; i < c->in_dim; i += 32) {
-                /* Each dword gathers the halves of inputs j and j + 1. */
-                for (unsigned k = 0; k < 16; k++) {
-                    const __m512i pair = _mm512_i32gather_epi32(offsets, rows + 2 * (i + 2 * k), 1);
-                    w[2 * k] = _mm512_cvtph_ps(_mm512_cvtepi32_epi16(pair));
-                    w[2 * k + 1] = _mm512_cvtph_ps(_mm512_cvtepi32_epi16(_mm512_srli_epi32(pair, 16)));
-                }
+                ds41_cpu_f16_decode16(w, rows + 2 * i, offsets);
                 ds41_cpu_apply16(acc, w, xp, nt, i, 32);
             }
             for (uint32_t t = 0; t < nt; t++)
                 _mm512_storeu_ps(c->out + (uint64_t)(t0 + t) * c->out_stride + row,
                                  c->round ? ds41_cpu_bf16_16(acc[t]) : acc[t]);
+        }
+    }
+}
+
+/* Tile pairs sharing the x broadcasts, as ds41_cpu_q8_batch2_worker. */
+static void ds41_cpu_f16_batch2_worker(void *vctx, uint64_t first, uint64_t last) {
+    const ds41_cpu_f16_batch_ctx *c = vctx;
+    const __m512i offsets = ds41_cpu_row_offsets(c->row_bytes);
+    __m512 wa[32], wb[32], acca[DS41_CPU_PASS], accb[DS41_CPU_PASS];
+    const float *xp[DS41_CPU_PASS];
+    for (uint64_t unit = first; unit < last; unit++) {
+        const uint64_t row = unit * 32;
+        const uint8_t *rows = c->data + row * c->row_bytes;
+        for (uint32_t t0 = 0; t0 < c->n; t0 += DS41_CPU_PASS) {
+            const uint32_t nt = c->n - t0 < DS41_CPU_PASS ? c->n - t0 : DS41_CPU_PASS;
+            for (uint32_t t = 0; t < nt; t++) {
+                acca[t] = accb[t] = _mm512_setzero_ps();
+                xp[t] = c->x + (uint64_t)(t0 + t) * c->x_stride;
+            }
+            for (uint64_t i = 0; i < c->in_dim; i += 32) {
+                ds41_cpu_f16_decode16(wa, rows + 2 * i, offsets);
+                ds41_cpu_f16_decode16(wb, rows + 16 * c->row_bytes + 2 * i, offsets);
+                ds41_cpu_apply16x2(acca, accb, wa, wb, xp, nt, i, 32);
+            }
+            for (uint32_t t = 0; t < nt; t++) {
+                float *out = c->out + (uint64_t)(t0 + t) * c->out_stride + row;
+                _mm512_storeu_ps(out, c->round ? ds41_cpu_bf16_16(acca[t]) : acca[t]);
+                _mm512_storeu_ps(out + 16, c->round ? ds41_cpu_bf16_16(accb[t]) : accb[t]);
+            }
         }
     }
 }
@@ -980,7 +1014,11 @@ static bool ds41_cpu_matmul_f16(float *out, uint64_t out_stride, const ds4_model
         .out_stride = out_stride, .in_dim = t->dim[0], .row_bytes = t->dim[0] * 2,
         .n = n, .round = round,
     };
-    ds4_parallel_for_min_rows(rows / 16, ds41_cpu_f16_batch_worker, &ctx, 1);
+    ds4_threads_init();
+    if (rows % 32 == 0 && rows / 32 >= g_pool.n_threads)
+        ds4_parallel_for_min_rows(rows / 32, ds41_cpu_f16_batch2_worker, &ctx, 1);
+    else
+        ds4_parallel_for_min_rows(rows / 16, ds41_cpu_f16_batch_worker, &ctx, 1);
     return true;
 #else
     (void)out; (void)out_stride; (void)m; (void)t; (void)x; (void)x_stride; (void)n; (void)round;
