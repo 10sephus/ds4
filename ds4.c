@@ -13553,6 +13553,31 @@ static void hc_post_one(
     }
 }
 
+/* hc_post_one() for the embedding columns d0..d1 of every stream: per element
+ * the same operations in the same order (the block term, then the sources),
+ * so a split over threads is exact. */
+static void hc_post_columns(
+        float       * out_hc,
+        const float * block_out,
+        const float * residual_hc,
+        const float * post,
+        const float * comb,
+        uint64_t      d0,
+        uint64_t      d1) {
+    const uint32_t n_hc = DS4_N_HC;
+    const uint64_t n_embd = DS4_N_EMBD;
+    for (uint32_t dst = 0; dst < n_hc; dst++) {
+        float *out = out_hc + (uint64_t)dst * n_embd;
+        const float p = post[dst];
+        for (uint64_t d = d0; d < d1; d++) out[d] = block_out[d] * p;
+        for (uint32_t src = 0; src < n_hc; src++) {
+            const float w = comb[dst + src * n_hc];
+            const float *res = residual_hc + (uint64_t)src * n_embd;
+            for (uint64_t d = d0; d < d1; d++) out[d] += w * res[d];
+        }
+    }
+}
+
 typedef struct {
     float       *out_hc;
     const float *block_out;
@@ -14951,7 +14976,6 @@ typedef struct {
  * the same order as the plain path. */
 static void ffn_graph_post_worker(void *vctx, uint64_t d0, uint64_t d1) {
     ffn_graph_post_ctx *ctx = vctx;
-    const uint32_t n_hc = DS4_N_HC;
     const uint64_t n_embd = DS4_N_EMBD;
     for (uint64_t d = d0; d < d1; d++) {
         float acc = 0.0f;
@@ -14960,16 +14984,7 @@ static void ffn_graph_post_worker(void *vctx, uint64_t d0, uint64_t d1) {
     }
     if (!ctx->out_hc) return;
     for (uint64_t d = d0; d < d1; d++) ctx->ffn_out[d] = ctx->moe[d] + ctx->shared[d];
-    for (uint32_t dst = 0; dst < n_hc; dst++) {
-        float *out = ctx->out_hc + (uint64_t)dst * n_embd;
-        const float p = ctx->post[dst];
-        for (uint64_t d = d0; d < d1; d++) out[d] = ctx->ffn_out[d] * p;
-        for (uint32_t src = 0; src < n_hc; src++) {
-            const float w = ctx->comb[dst + src * n_hc];
-            const float *res = ctx->residual_hc + (uint64_t)src * n_embd;
-            for (uint64_t d = d0; d < d1; d++) out[d] += w * res[d];
-        }
-    }
+    hc_post_columns(ctx->out_hc, ctx->ffn_out, ctx->residual_hc, ctx->post, ctx->comb, d0, d1);
 }
 
 typedef struct {
@@ -16365,9 +16380,11 @@ static void attn_proj_worker(void *vctx, uint64_t v0, uint64_t v1) {
     }
 }
 
-/* Returns false (nothing done) unless q_a and kv are Q8_0; *comp_done tells
- * whether the compressor rows were projected too. */
-static bool attn_input_projections_decode(
+/* Set up the fused projection of x (quantized to Q8_0 in the scratch buffer
+ * by the caller): the number of row groups to dispatch, or 0 unless q_a and
+ * kv are Q8_0; *comp_done tells whether the compressor rows are included. */
+static uint64_t attn_proj_setup(
+        attn_proj_ctx           * ctx,
         const ds4_model         * model,
         const ds4_layer_weights * layer,
         uint32_t                  ratio,
@@ -16379,9 +16396,9 @@ static bool attn_input_projections_decode(
     float *q8_out[2] = { scratch->qr, scratch->kv_raw };
     const uint64_t in_dim = DS4_N_EMBD;
     for (uint32_t k = 0; k < 2; k++) {
-        if (!q8[k] || q8[k]->type != 8 || q8[k]->ndim != 2 || q8[k]->dim[0] != in_dim) return false;
+        if (!q8[k] || q8[k]->type != 8 || q8[k]->ndim != 2 || q8[k]->dim[0] != in_dim) return 0;
     }
-    if (layer->attn_q_a->dim[1] != DS4_N_LORA_Q || layer->attn_kv->dim[1] != DS4_N_HEAD_DIM) return false;
+    if (layer->attn_q_a->dim[1] != DS4_N_LORA_Q || layer->attn_kv->dim[1] != DS4_N_HEAD_DIM) return 0;
 
     const ds4_tensor *f16[4] = {
         layer->attn_compressor_kv, layer->attn_compressor_gate,
@@ -16401,8 +16418,7 @@ static bool attn_input_projections_decode(
         }
     }
 
-    cpu_decode_quantize_q8_0(scratch, x, in_dim);
-    attn_proj_ctx ctx = {
+    *ctx = (attn_proj_ctx) {
         .x = x,
         .xq = scratch->q8_xq,
         .xscale = scratch->q8_xscale,
@@ -16418,13 +16434,29 @@ static bool attn_input_projections_decode(
         const uint64_t groups = (rows + DS4_F16_ROWS - 1) / DS4_F16_ROWS;
         const uint64_t half = groups / 2;
         const uint8_t *data = tensor_data(model, w);
-        ctx.seg[k] = (attn_proj_seg){ out, data, rows, 0, half, k >= 2 };
-        ctx.seg[n + k] = (attn_proj_seg){ out, data, rows, half, groups - half, k >= 2 };
+        ctx->seg[k] = (attn_proj_seg){ out, data, rows, 0, half, k >= 2 };
+        ctx->seg[n + k] = (attn_proj_seg){ out, data, rows, half, groups - half, k >= 2 };
         total += groups;
     }
-    ctx.n_seg = 2u * n;
-    ds4_parallel_for_min_rows(total, attn_proj_worker, &ctx, 1);
+    ctx->n_seg = 2u * n;
     *comp_done = n_f16 != 0;
+    return total;
+}
+
+/* The fused projection as one dispatch.  Returns false (nothing done) when
+ * attn_proj_setup() does not cover the layer. */
+static bool attn_input_projections_decode(
+        const ds4_model         * model,
+        const ds4_layer_weights * layer,
+        uint32_t                  ratio,
+        const float             * x,
+        ds4_cpu_decode_scratch  * scratch,
+        bool                    * comp_done) {
+    attn_proj_ctx ctx;
+    const uint64_t total = attn_proj_setup(&ctx, model, layer, ratio, x, scratch, comp_done);
+    if (total == 0) return false;
+    cpu_decode_quantize_q8_0(scratch, x, DS4_N_EMBD);
+    ds4_parallel_for_min_rows(total, attn_proj_worker, &ctx, 1);
     return true;
 }
 
@@ -16937,14 +16969,8 @@ static void indexer_score_rows_worker(void *vctx, uint64_t row0, uint64_t row1) 
     }
 }
 
-/* qt is caller scratch of n_head * head_dim floats for the transposed query. */
-static void indexer_score_rows(
-        float       * scores,
-        float       * qt,
-        const float * q,
-        const float * weights,
-        const float * index_comp,
-        uint32_t      n_comp) {
+/* qt[i][h] = q[h][i], the layout the AVX-512 scorer reads sixteen heads at a time. */
+static void indexer_transpose_query(float *qt, const float *q) {
 #if defined(DS4_NO_GPU) && defined(__AVX512F__)
     const uint32_t head_dim = DS4_N_INDEXER_HEAD_DIM;
     const uint32_t n_head = DS4_N_INDEXER_HEAD;
@@ -16953,7 +16979,21 @@ static void indexer_score_rows(
             qt[(uint64_t)i * n_head + h] = q[(uint64_t)h * head_dim + i];
         }
     }
+#else
+    (void)qt;
+    (void)q;
 #endif
+}
+
+/* qt is caller scratch of n_head * head_dim floats for the transposed query. */
+static void indexer_score_rows(
+        float       * scores,
+        float       * qt,
+        const float * q,
+        const float * weights,
+        const float * index_comp,
+        uint32_t      n_comp) {
+    indexer_transpose_query(qt, q);
     indexer_score_ctx ctx = {
         .scores = scores,
         .q = q,
@@ -17395,41 +17435,488 @@ static void layer_attention_raw_swa_batch(
 
 /* Full transformer layer for one decode token: attention sublayer followed by
  * FFN sublayer, both operating on the HC state. */
-static void layer_forward_raw_swa_one(
-        float                   * out_hc,
+/* =========================================================================
+ * Staged decode attention sublayer.
+ * =========================================================================
+ *
+ * The plain decode attention side of a layer is eleven pool dispatches with
+ * serial glue between them (the HC mix, the fused q_a/kv/compressor
+ * projection, q_b, the three lane passes, the grouped output projection a
+ * and b, plus three indexer dispatches on ratio-4 layers past the top-k
+ * window).  Here the whole sublayer is one staged dispatch
+ * (ds4_pool_run_stages), each stage waiting only on the stages it reads:
+ *
+ *   0  HC mix (F16)                 then the HC pre tail, the attention norm
+ *                                   and its Q8_0 quantization
+ *   1  q_a, kv, compressor rows     after 0, then the q_a norm and its
+ *                                   quantization
+ *   2  kv tail (one item)           after 1: kv norm, RoPE, FP8, the raw
+ *                                   push, the compressor updates and pushes
+ *   3  q_b (Q8_0)                   after 1
+ *   4  q tail (16-head groups)      after 3: head norms, RoPE, transpose
+ *   5  indexer head weights (F16)   after 0 (ratio-4 layers past top-k only)
+ *   6  indexer query (F16)          after 1, then RoPE, QAT and transpose
+ *   7  indexer scores               after 2, 5, 6, then top-k and the row list
+ *   8  attention scores             after 2, 4, 7
+ *   9  softmax weights              after 8
+ *  10  weighted sums                after 9
+ *  11  output tail (head groups)    after 10: inverse RoPE and quantization
+ *  12  output projection a          after 11, then the low-rank quantization
+ *  13  output projection b          after 12
+ *  14  HC post                      after 13 (without steering)
+ *
+ * Every row of every stage runs the kernel the plain dispatch runs on the
+ * same inputs, the serial steps are the same functions on the same data, and
+ * a stage starts only when every buffer it reads is complete, so q, kv, the
+ * caches, the heads, attn_out and the new HC state are bitwise the plain
+ * path's.  The one Q8_0 activation buffer is reused along the dependency
+ * chain (attn_norm for stage 1, the q_a norm for 3, the heads for 12, the
+ * low rank for 13): each quantization runs after every reader of the
+ * previous contents.  What the plain path serializes between its dispatches
+ * now overlaps: the kv tail runs beside q_b, the indexer projections beside
+ * the q tail (the threads walk the stages in order, so they reach stage 5
+ * once q_b is done), and a thread out of rows in one stage moves on instead
+ * of waiting at a join. */
+
+/* Decode profile phases of the attention sublayer (DS4_DECODE_PROFILE_DETAIL). */
+enum {
+    ATTN_T_HC, ATTN_T_Q, ATTN_T_KV, ATTN_T_ROPE, ATTN_T_COMPRESS, ATTN_T_INDEXER,
+    ATTN_T_ATTN_ROWS, ATTN_T_INV_ROPE, ATTN_T_OUT, ATTN_T_POST, ATTN_T_N
+};
+
+typedef struct {
+    const ds4_model *model;
+    const ds4_layer_weights *layer;
+    ds4_layer_cache *cache;
+    const float *inp_hc;
+    ds4_cpu_decode_scratch *scratch;
+    uint32_t il;
+    uint32_t pos;
+    uint32_t ratio;
+    uint32_t n_raw;       /* raw, compressed and indexer rows after this token's pushes */
+    uint32_t n_comp;
+    uint32_t n_index;
+    uint32_t top_k;       /* indexer rows kept, 0 when every compressed row is visible */
+    bool profile;
+    double mark[5];       /* ready times: HC, projections, q, attention, output */
+    float mix[24];
+    float post[4];
+    float comb[16];
+    matvec_f16_ctx hc_mix;
+    attn_proj_ctx proj;
+    matvec_q8_0_ctx q_b;
+    matvec_f16_ctx index_weights;
+    matvec_f16_ctx index_q;
+    indexer_score_ctx index_score;
+    layer_attention_lanes_ctx lanes;
+    matvec_q8_0_grouped_ctx out_a;
+    matvec_q8_0_ctx out_b;
+} attn_graph_ctx;
+
+static void attn_graph_mark(void *vctx) {
+    *(double *)vctx = now_sec();
+}
+
+/* hc_pre_from_state_one_scratch() after its matvec, then the attention norm
+ * and its quantization for stage 1. */
+static void attn_graph_hc_pre(void *vctx) {
+    attn_graph_ctx *g = vctx;
+    const ds4_layer_weights *layer = g->layer;
+    ds4_cpu_decode_scratch *scratch = g->scratch;
+    const uint32_t n_hc = DS4_N_HC;
+    float split[24];
+
+    hc_split_sinkhorn_one(split, g->mix, tensor_data(g->model, layer->hc_attn_scale),
+                          tensor_data(g->model, layer->hc_attn_base), (int)n_hc,
+                          DS4_N_HC_SINKHORN_ITER, 1.0e-6f);
+    hc_weighted_sum_one(scratch->attn_cur, g->inp_hc, split, DS4_N_EMBD, n_hc);
+    memcpy(g->post, split + n_hc, n_hc * sizeof(g->post[0]));
+    memcpy(g->comb, split + 2 * n_hc, n_hc * n_hc * sizeof(g->comb[0]));
+    layer_attn_norm_one(scratch->attn_norm, g->model, layer, scratch->attn_cur);
+    cpu_decode_quantize_q8_0(scratch, scratch->attn_norm, DS4_N_EMBD);
+    if (g->profile) g->mark[0] = now_sec();
+}
+
+static void attn_graph_q_a(void *vctx) {
+    attn_graph_ctx *g = vctx;
+    ds4_cpu_decode_scratch *scratch = g->scratch;
+    rms_norm_weight(scratch->qr_norm, scratch->qr, tensor_data(g->model, g->layer->attn_q_a_norm),
+                    DS4_N_LORA_Q, DS4_RMS_EPS);
+    cpu_decode_quantize_q8_0(scratch, scratch->qr_norm, DS4_N_LORA_Q);
+    if (g->profile) g->mark[1] = now_sec();
+}
+
+/* The serial kv steps of the plain path, as one work item beside q_b. */
+static void attn_graph_kv_worker(void *vctx, uint64_t i0, uint64_t i1) {
+    attn_graph_ctx *g = vctx;
+    const ds4_model *model = g->model;
+    const ds4_layer_weights *layer = g->layer;
+    ds4_layer_cache *cache = g->cache;
+    ds4_cpu_decode_scratch *scratch = g->scratch;
+    (void)i0; (void)i1;
+
+    rms_norm_weight(scratch->kv, scratch->kv_raw, tensor_data(model, layer->attn_kv_a_norm),
+                    DS4_N_HEAD_DIM, DS4_RMS_EPS);
+    rope_tail_layer_inplace(scratch->kv, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, g->pos, g->il, false);
+    dsv4_fp8_kv_quantize_row_inplace_cpu(scratch->kv, DS4_N_HEAD_DIM, DS4_N_ROT);
+    kv_cache_push_raw(cache, scratch->kv);
+    if (g->ratio == 0) return;
+    if (compressor_update_one(scratch->comp, model,
+                              layer->attn_compressor_ape, layer->attn_compressor_norm,
+                              scratch->comp_kv_cur, scratch->comp_sc_cur,
+                              cache->attn_state_kv, cache->attn_state_score,
+                              DS4_N_HEAD_DIM, g->ratio, g->il, g->pos)) {
+        kv_cache_push_comp(cache->attn_comp_kv, &cache->n_comp, cache->comp_cap,
+                           DS4_N_HEAD_DIM, scratch->comp);
+    }
+    if (g->ratio == 4 &&
+        compressor_update_one(scratch->index_comp, model,
+                              layer->indexer_compressor_ape, layer->indexer_compressor_norm,
+                              scratch->comp_kv_cur + 2u * DS4_N_HEAD_DIM,
+                              scratch->comp_sc_cur + 2u * DS4_N_HEAD_DIM,
+                              cache->index_state_kv, cache->index_state_score,
+                              DS4_N_INDEXER_HEAD_DIM, g->ratio, g->il, g->pos)) {
+        kv_cache_push_comp(cache->index_comp_kv, &cache->n_index_comp, cache->comp_cap,
+                           DS4_N_INDEXER_HEAD_DIM, scratch->index_comp);
+    }
+}
+
+/* Head norm, RoPE and the lane transpose of a group of sixteen heads: every
+ * step works head by head (the norm in groups of eight, which the sixteen
+ * contain whole), so the groups are independent. */
+static void attn_graph_q_tail_worker(void *vctx, uint64_t g0, uint64_t g1) {
+    attn_graph_ctx *g = vctx;
+    ds4_cpu_decode_scratch *scratch = g->scratch;
+    const uint32_t head_dim = DS4_N_HEAD_DIM;
+    for (uint64_t grp = g0; grp < g1; grp++) {
+        const uint32_t h0 = (uint32_t)grp * 16;
+        const uint32_t n = h0 + 16 < DS4_N_HEAD ? 16 : DS4_N_HEAD - h0;
+        float *q = scratch->q + (uint64_t)h0 * head_dim;
+        head_rms_norm_inplace(q, n, head_dim, DS4_RMS_EPS);
+        rope_tail_layer_inplace(q, n, head_dim, DS4_N_ROT, g->pos, g->il, false);
+        attn_lanes_transpose_q(scratch->attn_qt + (uint64_t)h0 * head_dim, q, n, head_dim);
+    }
+}
+
+static void attn_graph_index_weights(void *vctx) {
+    attn_graph_ctx *g = vctx;
+    const float scale = 1.0f / sqrtf((float)(DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD));
+    for (uint32_t h = 0; h < DS4_N_INDEXER_HEAD; h++) g->scratch->index_weights[h] *= scale;
+}
+
+static void attn_graph_index_q(void *vctx) {
+    attn_graph_ctx *g = vctx;
+    ds4_cpu_decode_scratch *scratch = g->scratch;
+    rope_tail_layer_inplace(scratch->index_q, DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM, DS4_N_ROT,
+                            g->pos, g->il, false);
+    dsv4_indexer_qat_rows_inplace_cpu(scratch->index_q, DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM);
+    indexer_transpose_query(scratch->index_qt, scratch->index_q);
+}
+
+/* The attention rows in order: the raw window, then the visible compressed
+ * rows, as layer_attention_lanes() lists them. */
+static void attn_graph_rows(attn_graph_ctx *g) {
+    const ds4_layer_cache *cache = g->cache;
+    const float **rows = g->scratch->attn_rows;
+    const bool *allowed = g->top_k ? g->scratch->index_allowed : NULL;
+    uint32_t n = 0;
+    for (uint32_t r = 0; r < g->n_raw; r++) rows[n++] = cache->raw_kv + (uint64_t)r * DS4_N_HEAD_DIM;
+    for (uint32_t r = 0; r < g->n_comp; r++) {
+        if (allowed && !allowed[r]) continue;
+        rows[n++] = cache->attn_comp_kv + (uint64_t)r * DS4_N_HEAD_DIM;
+    }
+    g->lanes.n_rows = n;
+}
+
+static void attn_graph_index_select(void *vctx) {
+    attn_graph_ctx *g = vctx;
+    ds4_cpu_decode_scratch *scratch = g->scratch;
+    indexer_select_top_k(scratch->index_allowed, scratch->index_cand, scratch->index_scores,
+                         g->n_index, g->top_k);
+    attn_graph_rows(g);
+}
+
+/* Inverse RoPE and the Q8_0 quantization of one output group of heads: the
+ * rotation is per head and the quantization per 32-wide block. */
+static void attn_graph_out_tail_worker(void *vctx, uint64_t g0, uint64_t g1) {
+    attn_graph_ctx *g = vctx;
+    ds4_cpu_decode_scratch *scratch = g->scratch;
+    const uint32_t group_heads = DS4_N_HEAD / DS4_N_OUT_GROUP;
+    const uint64_t group_dim = (uint64_t)group_heads * DS4_N_HEAD_DIM;
+    const uint64_t blocks = group_dim / 32;
+    for (uint64_t grp = g0; grp < g1; grp++) {
+        float *heads = scratch->heads + grp * group_dim;
+        rope_tail_layer_inplace(heads, group_heads, DS4_N_HEAD_DIM, DS4_N_ROT, g->pos, g->il, true);
+        quantize_q8_0_activation(heads, scratch->q8_xq + grp * blocks * 32,
+                                 scratch->q8_xscale + grp * blocks, group_dim);
+    }
+}
+
+static void attn_graph_out_low(void *vctx) {
+    attn_graph_ctx *g = vctx;
+    cpu_decode_quantize_q8_0(g->scratch, g->scratch->attn_low, (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O);
+}
+
+static void attn_graph_post_worker(void *vctx, uint64_t d0, uint64_t d1) {
+    attn_graph_ctx *g = vctx;
+    hc_post_columns(g->scratch->after_attn_hc, g->scratch->attn_out, g->inp_hc, g->post, g->comb, d0, d1);
+}
+
+/* The graph covers the V4 Flash layout (the fused projection, F16 indexer
+ * tensors, Q8_0 q_b and output projections); anything else takes the plain
+ * path. */
+static bool attn_graph_supported(const ds4_layer_weights *layer, uint32_t ratio) {
+    /* The plain path's grouped output projection is written for eight groups
+     * of rank 1024: the graph covers that layout and no other (and never
+     * divides by a zero group count). */
+    if (DS4_N_OUT_GROUP != 8 || DS4_N_LORA_O != 1024 || DS4_N_HEAD % DS4_N_OUT_GROUP != 0) return false;
+    const ds4_tensor *h = layer->hc_attn_fn;
+    const ds4_tensor *qa = layer->attn_q_a, *qb = layer->attn_q_b, *kv = layer->attn_kv;
+    const ds4_tensor *oa = layer->attn_output_a, *ob = layer->attn_output_b;
+    const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
+    const uint64_t low_dim = (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O;
+    const uint64_t group_dim = (uint64_t)(DS4_N_HEAD / DS4_N_OUT_GROUP) * DS4_N_HEAD_DIM;
+    const ds4_tensor *f16[6] = {
+        layer->attn_compressor_kv, layer->attn_compressor_gate,
+        layer->indexer_compressor_kv, layer->indexer_compressor_gate,
+        layer->indexer_proj, layer->indexer_attn_q_b,
+    };
+    const uint64_t f16_in[6] = { DS4_N_EMBD, DS4_N_EMBD, DS4_N_EMBD, DS4_N_EMBD, DS4_N_EMBD, DS4_N_LORA_Q };
+    const uint64_t f16_rows[6] = {
+        2u * DS4_N_HEAD_DIM, 2u * DS4_N_HEAD_DIM, 2u * DS4_N_INDEXER_HEAD_DIM, 2u * DS4_N_INDEXER_HEAD_DIM,
+        DS4_N_INDEXER_HEAD, (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM,
+    };
+    const uint32_t n_f16 = ratio == 0 ? 0u : ratio == 4 ? 6u : 2u;
+    for (uint32_t k = 0; k < n_f16; k++) {
+        const ds4_tensor *w = f16[k];
+        if (!w || w->type != DS4_TENSOR_F16 || w->ndim != 2 || w->dim[0] != f16_in[k]) return false;
+        /* Compressor rows may be fewer than the scratch holds, as the fused
+         * projection allows; the indexer shapes are exact. */
+        if (k < 4 ? w->dim[1] > f16_rows[k] : w->dim[1] != f16_rows[k]) return false;
+    }
+    if (ratio != 0 && (!layer->attn_compressor_ape || !layer->attn_compressor_norm)) return false;
+    if (ratio == 4 && (!layer->indexer_compressor_ape || !layer->indexer_compressor_norm)) return false;
+    return h && h->type == DS4_TENSOR_F16 && h->ndim == 2 &&
+           h->dim[0] == (uint64_t)DS4_N_HC * DS4_N_EMBD &&
+           h->dim[1] == (uint64_t)DS4_N_HC * (2 + DS4_N_HC) && h->dim[1] <= 24 &&
+           layer->hc_attn_scale && layer->hc_attn_base && layer->attn_norm && layer->attn_sinks &&
+           layer->attn_q_a_norm && layer->attn_kv_a_norm &&
+           qa && qa->type == DS4_TENSOR_Q8_0 && qa->ndim == 2 &&
+           qa->dim[0] == DS4_N_EMBD && qa->dim[1] == DS4_N_LORA_Q &&
+           kv && kv->type == DS4_TENSOR_Q8_0 && kv->ndim == 2 &&
+           kv->dim[0] == DS4_N_EMBD && kv->dim[1] == DS4_N_HEAD_DIM &&
+           qb && qb->type == DS4_TENSOR_Q8_0 && qb->ndim == 2 &&
+           qb->dim[0] == DS4_N_LORA_Q && qb->dim[1] == q_dim &&
+           oa && oa->type == DS4_TENSOR_Q8_0 && oa->ndim == 2 &&
+           oa->dim[0] == group_dim && oa->dim[1] == low_dim &&
+           ob && ob->type == DS4_TENSOR_Q8_0 && ob->ndim == 2 &&
+           ob->dim[0] == low_dim && ob->dim[1] == DS4_N_EMBD &&
+           DS4_N_EMBD % 32 == 0 && DS4_N_LORA_Q % 32 == 0 &&
+           group_dim % 32 == 0 && low_dim % 32 == 0 &&
+           DS4_N_EMBD <= DS4_MAX_EMBD;
+}
+
+/* Writes the sublayer's HC state to scratch->after_attn_hc and pushes this
+ * token's rows into the layer cache.  marks is NULL, or receives the ready
+ * times of the HC pre step, the projections, q, the attention sums and the
+ * output projection. */
+static void layer_attention_graph(
         const ds4_model         * model,
         const ds4_layer_weights * layer,
         ds4_layer_cache         * cache,
         const float             * inp_hc,
         uint32_t                  il,
         uint32_t                  pos,
-        int                       token,
         const float             * steering_dirs,
         float                     steering_attn_scale,
-        float                     steering_ffn_scale,
-        ds4_cpu_decode_scratch  * scratch) {
-    const uint32_t n_hc = DS4_N_HC;
-    const bool profile = getenv("DS4_DECODE_PROFILE_DETAIL") != NULL;
-    const double t_start = profile ? now_sec() : 0.0;
-    double t_hc = 0.0;
-    double t_q = 0.0;
-    double t_kv = 0.0;
-    double t_rope_cache = 0.0;
-    double t_compress = 0.0;
-    double t_indexer = 0.0;
-    double t_attn_rows = 0.0;
-    double t_inv_rope = 0.0;
-    double t_out = 0.0;
-    double t_post = 0.0;
-    double t_ffn = 0.0;
+        ds4_cpu_decode_scratch  * scratch,
+        double                  * marks) {
+    attn_graph_ctx g;   /* on the stack: token decode must not touch the heap */
+    const uint32_t ratio = cache->compress_ratio;
+    const uint32_t n_head = DS4_N_HEAD, head_dim = DS4_N_HEAD_DIM;
+    const uint32_t head_groups = (n_head + 15) / 16;
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t q_dim = (uint64_t)n_head * head_dim;
+    const uint64_t group_dim = (uint64_t)(n_head / DS4_N_OUT_GROUP) * head_dim;
+    const uint64_t low_dim = (uint64_t)DS4_N_OUT_GROUP * DS4_N_LORA_O;
+    const uint64_t index_dim = (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM;
+    const bool compress = ratio != 0 && (pos + 1) % ratio == 0;
+    const bool fold_post = !cpu_directional_steering_enabled(steering_dirs, steering_attn_scale);
+    bool comp_done;
 
+    g.model = model;
+    g.layer = layer;
+    g.cache = cache;
+    g.inp_hc = inp_hc;
+    g.scratch = scratch;
+    g.il = il;
+    g.pos = pos;
+    g.ratio = ratio;
+    g.n_raw = cache->n_raw < cache->cap_raw ? cache->n_raw + 1 : cache->cap_raw;
+    g.n_comp = cache->n_comp + (compress ? 1u : 0u);
+    g.n_index = ratio == 4 ? cache->n_index_comp + (compress ? 1u : 0u) : 0u;
+    g.top_k = g.n_index > DS4_N_INDEXER_TOP_K ? DS4_N_INDEXER_TOP_K : 0u;
+    g.profile = marks != NULL;
+    if (g.n_raw + g.n_comp > scratch->attn_score_cap) ds4_die("CPU decode attention score scratch buffer is too small");
+    if (g.n_index > scratch->comp_cap) ds4_die("CPU decode indexer scratch buffer is too small");
+
+    rms_norm_no_weight(scratch->hc_flat, inp_hc, hc_dim, DS4_RMS_EPS);
+    g.hc_mix = (matvec_f16_ctx) {
+        .out = g.mix,
+        .data = tensor_data(model, layer->hc_attn_fn),
+        .x = scratch->hc_flat,
+        .in_dim = hc_dim,
+        .out_dim = layer->hc_attn_fn->dim[1],
+    };
+    const uint64_t n_proj = attn_proj_setup(&g.proj, model, layer, ratio, scratch->attn_norm, scratch, &comp_done);
+    if (n_proj == 0 || (ratio != 0 && !comp_done)) ds4_die("staged attention needs the fused projection");
+    g.q_b = (matvec_q8_0_ctx) {
+        .out = scratch->q,
+        .data = tensor_data(model, layer->attn_q_b),
+        .xq = scratch->q8_xq,
+        .xscale = scratch->q8_xscale,
+        .in_dim = DS4_N_LORA_Q,
+        .row0 = 0,
+        .blocks = DS4_N_LORA_Q / 32,
+    };
+    if (g.top_k) {
+        g.index_weights = (matvec_f16_ctx) {
+            .out = scratch->index_weights,
+            .data = tensor_data(model, layer->indexer_proj),
+            .x = scratch->attn_norm,
+            .in_dim = DS4_N_EMBD,
+            .out_dim = DS4_N_INDEXER_HEAD,
+        };
+        g.index_q = (matvec_f16_ctx) {
+            .out = scratch->index_q,
+            .data = tensor_data(model, layer->indexer_attn_q_b),
+            .x = scratch->qr_norm,
+            .in_dim = DS4_N_LORA_Q,
+            .out_dim = index_dim,
+        };
+        g.index_score = (indexer_score_ctx) {
+            .scores = scratch->index_scores,
+            .q = scratch->index_q,
+            .qt = scratch->index_qt,
+            .weights = scratch->index_weights,
+            .index_comp = cache->index_comp_kv,
+        };
+    }
+    /* n_chunks covers every row that may be listed: the raw window and the
+     * compressed rows, or the top-k of them once the indexer selects; items
+     * past the rows actually listed do nothing, so the list may shrink in
+     * stage 7. */
+    const uint32_t n_visible = g.top_k && g.top_k < g.n_comp ? g.top_k : g.n_comp;
+    g.lanes = (layer_attention_lanes_ctx) {
+        .out_heads = scratch->heads,
+        .sinks = tensor_data(model, layer->attn_sinks),
+        .q = scratch->q,
+        .qt = scratch->attn_qt,
+        .rows = scratch->attn_rows,
+        .score = scratch->attn_score,
+        .inv = scratch->attn_inv,
+        .n_head = n_head,
+        .score_stride = scratch->attn_score_cap,
+        .n_chunks = (g.n_raw + n_visible + ATTN_LANES_ROWS_PER_ITEM - 1) / ATTN_LANES_ROWS_PER_ITEM,
+        .n_dim_chunks = (head_dim + 15) / 16,
+    };
+    if (!g.top_k) attn_graph_rows(&g);
+    g.out_a = (matvec_q8_0_grouped_ctx) {
+        .out = scratch->attn_low,
+        .data = tensor_data(model, layer->attn_output_a),
+        .xq = scratch->q8_xq,
+        .xscale = scratch->q8_xscale,
+        .in_dim = group_dim,
+        .blocks = group_dim / 32,
+        .rank = DS4_N_LORA_O,
+    };
+    g.out_b = (matvec_q8_0_ctx) {
+        .out = scratch->attn_out,
+        .data = tensor_data(model, layer->attn_output_b),
+        .xq = scratch->q8_xq,
+        .xscale = scratch->q8_xscale,
+        .in_dim = low_dim,
+        .row0 = 0,
+        .blocks = low_dim / 32,
+    };
+
+    const uint64_t n_mix_groups = (layer->hc_attn_fn->dim[1] + DS4_F16_ROWS - 1) / DS4_F16_ROWS;
+    const uint64_t n_index_groups = (index_dim + DS4_F16_ROWS - 1) / DS4_F16_ROWS;
+    const uint64_t n_weight_groups = (DS4_N_INDEXER_HEAD + DS4_F16_ROWS - 1) / DS4_F16_ROWS;
+    const uint64_t n_score = (uint64_t)head_groups * g.lanes.n_chunks;
+    const uint64_t n_sum = (uint64_t)head_groups * g.lanes.n_dim_chunks;
+    void (*mark)(void *) = g.profile ? attn_graph_mark : NULL;
+    ds4_pool_stage stages[15] = {
+        { .fn = matvec_f16_group_worker, .ctx = &g.hc_mix,
+          .n_rows = n_mix_groups, .group_rows = n_mix_groups,
+          .finish = attn_graph_hc_pre, .finish_ctx = &g },
+        { .fn = attn_proj_worker, .ctx = &g.proj,
+          .n_rows = n_proj, .group_rows = n_proj,
+          .deps = 1u << 0, .finish = attn_graph_q_a, .finish_ctx = &g },
+        { .fn = attn_graph_kv_worker, .ctx = &g,
+          .n_rows = 1, .group_rows = 1, .deps = 1u << 1 },
+        { .fn = matvec_q8_0_worker, .ctx = &g.q_b,
+          .n_rows = q_dim, .group_rows = q_dim, .deps = 1u << 1 },
+        { .fn = attn_graph_q_tail_worker, .ctx = &g,
+          .n_rows = head_groups, .group_rows = head_groups,
+          .deps = 1u << 3, .finish = mark, .finish_ctx = &g.mark[2] },
+        { .fn = matvec_f16_group_worker, .ctx = &g.index_weights,
+          .n_rows = g.top_k ? n_weight_groups : 0, .group_rows = n_weight_groups,
+          .deps = 1u << 0, .finish = g.top_k ? attn_graph_index_weights : NULL, .finish_ctx = &g },
+        { .fn = matvec_f16_group_worker, .ctx = &g.index_q,
+          .n_rows = g.top_k ? n_index_groups : 0, .group_rows = n_index_groups,
+          .deps = 1u << 1, .finish = g.top_k ? attn_graph_index_q : NULL, .finish_ctx = &g },
+        { .fn = indexer_score_rows_worker, .ctx = &g.index_score,
+          .n_rows = g.top_k ? g.n_index : 0, .group_rows = g.top_k ? g.n_index : 1,
+          .deps = (1u << 2) | (1u << 5) | (1u << 6),
+          .finish = g.top_k ? attn_graph_index_select : NULL, .finish_ctx = &g },
+        { .fn = attn_lanes_score_worker, .ctx = &g.lanes,
+          .n_rows = n_score, .group_rows = n_score, .deps = (1u << 2) | (1u << 4) | (1u << 7) },
+        { .fn = attn_lanes_weight_worker, .ctx = &g.lanes,
+          .n_rows = n_head, .group_rows = n_head, .deps = 1u << 8 },
+        { .fn = attn_lanes_sum_worker, .ctx = &g.lanes,
+          .n_rows = n_sum, .group_rows = n_sum,
+          .deps = 1u << 9, .finish = mark, .finish_ctx = &g.mark[3] },
+        { .fn = attn_graph_out_tail_worker, .ctx = &g,
+          .n_rows = DS4_N_OUT_GROUP, .group_rows = DS4_N_OUT_GROUP, .deps = 1u << 10 },
+        { .fn = matvec_q8_0_grouped_worker, .ctx = &g.out_a,
+          .n_rows = low_dim, .group_rows = low_dim,
+          .deps = 1u << 11, .finish = attn_graph_out_low, .finish_ctx = &g },
+        { .fn = matvec_q8_0_worker, .ctx = &g.out_b,
+          .n_rows = DS4_N_EMBD, .group_rows = DS4_N_EMBD,
+          .deps = 1u << 12, .finish = mark, .finish_ctx = &g.mark[4] },
+        /* Light elementwise work: claims of 256 columns. */
+        { .fn = attn_graph_post_worker, .ctx = &g,
+          .n_rows = DS4_N_EMBD, .group_rows = DS4_N_EMBD, .min_chunk = 256, .deps = 1u << 13 },
+    };
+    ds4_pool_run_stages(stages, fold_post ? 15 : 14);
+    if (!fold_post) {
+        cpu_directional_steering_project_rows(scratch->attn_out, steering_dirs, il, 1, steering_attn_scale);
+        hc_post_one(scratch->after_attn_hc, scratch->attn_out, inp_hc, g.post, g.comb, DS4_N_EMBD, DS4_N_HC);
+    }
+    if (marks) memcpy(marks, g.mark, sizeof(g.mark));
+}
+
+/* The plain decode attention sublayer: the dispatches listed above
+ * layer_attention_graph(), each followed by its serial step on the calling
+ * thread.  Writes the sublayer's HC state to scratch->after_attn_hc.  t is
+ * NULL, or receives the ATTN_T_N phase times of the decode profile. */
+static void layer_attention_plain_one(
+        const ds4_model         * model,
+        const ds4_layer_weights * layer,
+        ds4_layer_cache         * cache,
+        const float             * inp_hc,
+        uint32_t                  il,
+        uint32_t                  pos,
+        const float             * steering_dirs,
+        float                     steering_attn_scale,
+        ds4_cpu_decode_scratch  * scratch,
+        double                  * t) {
     bool *comp_allowed = NULL;
     float post[4];
     float comb[16];
 
-    /* inp_hc stays untouched until the FFN writes out_hc, so it is read
-     * directly as the attention residual. */
-    double t0 = profile ? now_sec() : 0.0;
+    double t0 = t ? now_sec() : 0.0;
     hc_pre_from_state_one_scratch(model,
                                   layer->hc_attn_fn,
                                   layer->hc_attn_scale,
@@ -17437,9 +17924,9 @@ static void layer_forward_raw_swa_one(
                                   inp_hc, scratch->attn_cur, post, comb,
                                   scratch->hc_flat,
                                   false);
-    if (profile) t_hc = now_sec() - t0;
+    if (t) t[ATTN_T_HC] = now_sec() - t0;
 
-    t0 = profile ? now_sec() : 0.0;
+    t0 = t ? now_sec() : 0.0;
     layer_attn_norm_one(scratch->attn_norm, model, layer, scratch->attn_cur);
     const uint32_t ratio = cache->compress_ratio;
     bool comp_projected = false;
@@ -17459,8 +17946,8 @@ static void layer_forward_raw_swa_one(
                                                         scratch->qr_norm,
                                                         scratch);
     }
-    if (profile) t_q = now_sec() - t0;
-    t0 = profile ? now_sec() : 0.0;
+    if (t) t[ATTN_T_Q] = now_sec() - t0;
+    t0 = t ? now_sec() : 0.0;
     if (fused) {
         const float *kv_norm = tensor_data(model, layer->attn_kv_a_norm);
         rms_norm_weight(scratch->kv, scratch->kv_raw, kv_norm, DS4_N_HEAD_DIM, DS4_RMS_EPS);
@@ -17470,18 +17957,18 @@ static void layer_forward_raw_swa_one(
                                                       scratch->kv,
                                                       scratch);
     }
-    if (profile) t_kv = now_sec() - t0;
+    if (t) t[ATTN_T_KV] = now_sec() - t0;
 
-    t0 = profile ? now_sec() : 0.0;
+    t0 = t ? now_sec() : 0.0;
     rope_tail_layer_inplace(scratch->q, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, false);
     rope_tail_layer_inplace(scratch->kv, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, false);
     dsv4_fp8_kv_quantize_row_inplace_cpu(scratch->kv, DS4_N_HEAD_DIM, DS4_N_ROT);
 
     kv_cache_push_raw(cache, scratch->kv);
-    if (profile) t_rope_cache = now_sec() - t0;
+    if (t) t[ATTN_T_ROPE] = now_sec() - t0;
 
     if (ratio != 0) {
-        t0 = profile ? now_sec() : 0.0;
+        t0 = t ? now_sec() : 0.0;
         const bool projected = comp_projected ||
             compressor_project_decode_f16(model, layer, ratio, scratch->attn_norm, scratch);
         if (projected ?
@@ -17535,13 +18022,11 @@ static void layer_forward_raw_swa_one(
                 kv_cache_push_comp(cache->index_comp_kv, &cache->n_index_comp, cache->comp_cap,
                                    DS4_N_INDEXER_HEAD_DIM, scratch->index_comp);
             }
-            if (profile) t_compress = now_sec() - t0;
-        } else if (profile) {
-            t_compress = now_sec() - t0;
         }
+        if (t) t[ATTN_T_COMPRESS] = now_sec() - t0;
     }
     if (ratio == 4) {
-        t0 = profile ? now_sec() : 0.0;
+        t0 = t ? now_sec() : 0.0;
         comp_allowed = indexer_allowed_decode_one_decode_scratch(model, layer,
                                                                  scratch->attn_norm,
                                                                  scratch->qr_norm,
@@ -17549,29 +18034,70 @@ static void layer_forward_raw_swa_one(
                                                                  cache->n_index_comp,
                                                                  il, pos,
                                                                  scratch);
-        if (profile) t_indexer = now_sec() - t0;
+        if (t) t[ATTN_T_INDEXER] = now_sec() - t0;
     }
 
-    t0 = profile ? now_sec() : 0.0;
+    t0 = t ? now_sec() : 0.0;
     layer_attention_mixed_one_decode_scratch(scratch->heads, model, layer, scratch->q,
                                              cache->raw_kv, cache->n_raw,
                                              cache->attn_comp_kv, cache->n_comp,
                                              comp_allowed,
                                              scratch);
-    if (profile) t_attn_rows = now_sec() - t0;
+    if (t) t[ATTN_T_ATTN_ROWS] = now_sec() - t0;
 
-    t0 = profile ? now_sec() : 0.0;
+    t0 = t ? now_sec() : 0.0;
     rope_tail_layer_inplace(scratch->heads, DS4_N_HEAD, DS4_N_HEAD_DIM, DS4_N_ROT, pos, il, true);
-    if (profile) t_inv_rope = now_sec() - t0;
-    t0 = profile ? now_sec() : 0.0;
+    if (t) t[ATTN_T_INV_ROPE] = now_sec() - t0;
+    t0 = t ? now_sec() : 0.0;
     layer_grouped_out_one_decode_scratch(scratch->attn_out, model, layer, scratch->heads, scratch);
     cpu_directional_steering_project_rows(scratch->attn_out, steering_dirs, il, 1, steering_attn_scale);
-    if (profile) t_out = now_sec() - t0;
-    t0 = profile ? now_sec() : 0.0;
-    hc_post_one(scratch->after_attn_hc, scratch->attn_out, inp_hc, post, comb, DS4_N_EMBD, n_hc);
-    if (profile) t_post = now_sec() - t0;
+    if (t) t[ATTN_T_OUT] = now_sec() - t0;
+    t0 = t ? now_sec() : 0.0;
+    hc_post_one(scratch->after_attn_hc, scratch->attn_out, inp_hc, post, comb, DS4_N_EMBD, DS4_N_HC);
+    if (t) t[ATTN_T_POST] = now_sec() - t0;
+}
 
-    t0 = profile ? now_sec() : 0.0;
+static void layer_forward_raw_swa_one(
+        float                   * out_hc,
+        const ds4_model         * model,
+        const ds4_layer_weights * layer,
+        ds4_layer_cache         * cache,
+        const float             * inp_hc,
+        uint32_t                  il,
+        uint32_t                  pos,
+        int                       token,
+        const float             * steering_dirs,
+        float                     steering_attn_scale,
+        float                     steering_ffn_scale,
+        ds4_cpu_decode_scratch  * scratch) {
+    const bool profile = getenv("DS4_DECODE_PROFILE_DETAIL") != NULL;
+    const double t_start = profile ? now_sec() : 0.0;
+    double t[ATTN_T_N] = {0};
+    double t_ffn = 0.0;
+
+    /* inp_hc stays untouched until the FFN writes out_hc, so it is read
+     * directly as the attention residual. */
+    if (attn_graph_supported(layer, cache->compress_ratio)) {
+        double mark[5];
+        layer_attention_graph(model, layer, cache, inp_hc, il, pos,
+                              steering_dirs, steering_attn_scale, scratch, profile ? mark : NULL);
+        if (profile) {
+            /* The critical path of the staged dispatch: q is the HC pre step
+             * to the q_a norm, kv the q_b projection and its tail; the kv
+             * tail and the indexer overlap q_b and are not timed. */
+            t[ATTN_T_HC] = mark[0] - t_start;
+            t[ATTN_T_Q] = mark[1] - mark[0];
+            t[ATTN_T_KV] = mark[2] - mark[1];
+            t[ATTN_T_ATTN_ROWS] = mark[3] - mark[2];
+            t[ATTN_T_OUT] = mark[4] - mark[3];
+            t[ATTN_T_POST] = now_sec() - mark[4];
+        }
+    } else {
+        layer_attention_plain_one(model, layer, cache, inp_hc, il, pos,
+                                  steering_dirs, steering_attn_scale, scratch, profile ? t : NULL);
+    }
+
+    const double t0 = profile ? now_sec() : 0.0;
     layer_ffn_one_decode_scratch(out_hc, model, layer, scratch->after_attn_hc, il, token,
                                  steering_dirs, steering_ffn_scale, scratch);
     if (profile) t_ffn = now_sec() - t0;
@@ -17580,20 +18106,19 @@ static void layer_forward_raw_swa_one(
         fprintf(stderr,
                 "ds4: decode detail layer %u attn hc=%.3f q=%.3f kv=%.3f rope=%.3f compress=%.3f indexer=%.3f attn_rows=%.3f inv_rope=%.3f out=%.3f post=%.3f ffn=%.3f total=%.3f ms\n",
                 il,
-                t_hc * 1000.0,
-                t_q * 1000.0,
-                t_kv * 1000.0,
-                t_rope_cache * 1000.0,
-                t_compress * 1000.0,
-                t_indexer * 1000.0,
-                t_attn_rows * 1000.0,
-                t_inv_rope * 1000.0,
-                t_out * 1000.0,
-                t_post * 1000.0,
+                t[ATTN_T_HC] * 1000.0,
+                t[ATTN_T_Q] * 1000.0,
+                t[ATTN_T_KV] * 1000.0,
+                t[ATTN_T_ROPE] * 1000.0,
+                t[ATTN_T_COMPRESS] * 1000.0,
+                t[ATTN_T_INDEXER] * 1000.0,
+                t[ATTN_T_ATTN_ROWS] * 1000.0,
+                t[ATTN_T_INV_ROPE] * 1000.0,
+                t[ATTN_T_OUT] * 1000.0,
+                t[ATTN_T_POST] * 1000.0,
                 t_ffn * 1000.0,
                 (now_sec() - t_start) * 1000.0);
     }
-
 }
 
 static void output_logits_one_decode_scratch(

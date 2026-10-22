@@ -1717,6 +1717,304 @@ static void check_ffn_graph(void) {
     g_ds4_shape = saved;
 }
 
+/* A layer cache for the staged attention oracle, random rows and state. */
+typedef struct {
+    ds4_layer_cache c;
+    uint32_t state_rows, width, index_width;
+} attn_test_cache;
+
+static void attn_test_cache_alloc(attn_test_cache *tc, uint32_t ratio, uint32_t cap_raw, uint32_t comp_cap) {
+    ds4_layer_cache *c = &tc->c;
+    memset(tc, 0, sizeof(*tc));
+    c->cap_raw = cap_raw;
+    c->raw_kv = xmalloc((size_t)cap_raw * DS4_N_HEAD_DIM * sizeof(float));
+    c->compress_ratio = ratio;
+    if (ratio == 0) return;
+    const uint32_t coff = ratio == 4 ? 2 : 1;
+    tc->width = coff * DS4_N_HEAD_DIM;
+    tc->state_rows = coff * ratio;
+    c->comp_cap = comp_cap;
+    c->attn_comp_kv = xmalloc((size_t)comp_cap * DS4_N_HEAD_DIM * sizeof(float));
+    c->attn_state_kv = xmalloc((size_t)tc->width * tc->state_rows * sizeof(float));
+    c->attn_state_score = xmalloc((size_t)tc->width * tc->state_rows * sizeof(float));
+    if (ratio != 4) return;
+    tc->index_width = 2 * DS4_N_INDEXER_HEAD_DIM;
+    c->index_comp_kv = xmalloc((size_t)comp_cap * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+    c->index_state_kv = xmalloc((size_t)tc->index_width * tc->state_rows * sizeof(float));
+    c->index_state_score = xmalloc((size_t)tc->index_width * tc->state_rows * sizeof(float));
+}
+
+static void attn_test_cache_free(attn_test_cache *tc) {
+    ds4_layer_cache *c = &tc->c;
+    free(c->index_state_score); free(c->index_state_kv); free(c->index_comp_kv);
+    free(c->attn_state_score); free(c->attn_state_kv); free(c->attn_comp_kv); free(c->raw_kv);
+}
+
+static void attn_test_fill(float *x, uint64_t n, float scale) {
+    for (uint64_t i = 0; i < n; i++) x[i] = quant_float() * scale;
+}
+
+static void attn_test_cache_fill(attn_test_cache *tc, uint32_t n_raw, uint32_t n_comp) {
+    ds4_layer_cache *c = &tc->c;
+    attn_test_fill(c->raw_kv, (uint64_t)c->cap_raw * DS4_N_HEAD_DIM, 1.0f);
+    c->n_raw = n_raw;
+    if (c->compress_ratio == 0) return;
+    attn_test_fill(c->attn_comp_kv, (uint64_t)c->comp_cap * DS4_N_HEAD_DIM, 1.0f);
+    attn_test_fill(c->attn_state_kv, (uint64_t)tc->width * tc->state_rows, 1.0f);
+    attn_test_fill(c->attn_state_score, (uint64_t)tc->width * tc->state_rows, 1.0f);
+    c->n_comp = n_comp;
+    if (c->compress_ratio != 4) return;
+    attn_test_fill(c->index_comp_kv, (uint64_t)c->comp_cap * DS4_N_INDEXER_HEAD_DIM, 1.0f);
+    attn_test_fill(c->index_state_kv, (uint64_t)tc->index_width * tc->state_rows, 1.0f);
+    attn_test_fill(c->index_state_score, (uint64_t)tc->index_width * tc->state_rows, 1.0f);
+    c->n_index_comp = n_comp;
+}
+
+static void attn_test_copy(float *dst, const float *src, uint64_t n) {
+    if (n) memcpy(dst, src, n * sizeof(float));
+}
+
+static void attn_test_cache_copy(attn_test_cache *dst, const attn_test_cache *src) {
+    const ds4_layer_cache *a = &src->c;
+    ds4_layer_cache *b = &dst->c;
+    attn_test_copy(b->raw_kv, a->raw_kv, (uint64_t)a->cap_raw * DS4_N_HEAD_DIM);
+    b->n_raw = a->n_raw;
+    b->n_comp = a->n_comp;
+    b->n_index_comp = a->n_index_comp;
+    if (a->compress_ratio == 0) return;
+    attn_test_copy(b->attn_comp_kv, a->attn_comp_kv, (uint64_t)a->comp_cap * DS4_N_HEAD_DIM);
+    attn_test_copy(b->attn_state_kv, a->attn_state_kv, (uint64_t)src->width * src->state_rows);
+    attn_test_copy(b->attn_state_score, a->attn_state_score, (uint64_t)src->width * src->state_rows);
+    if (a->compress_ratio != 4) return;
+    attn_test_copy(b->index_comp_kv, a->index_comp_kv, (uint64_t)a->comp_cap * DS4_N_INDEXER_HEAD_DIM);
+    attn_test_copy(b->index_state_kv, a->index_state_kv, (uint64_t)src->index_width * src->state_rows);
+    attn_test_copy(b->index_state_score, a->index_state_score, (uint64_t)src->index_width * src->state_rows);
+}
+
+static void attn_test_equal(const char *name, const float *expected, const float *actual, uint64_t n) {
+    for (uint64_t i = 0; i < n; i++) quant_bits_equal(name, expected[i], actual[i], (unsigned)i);
+}
+
+static void attn_test_cache_equal(const attn_test_cache *ea, const attn_test_cache *ga) {
+    const ds4_layer_cache *e = &ea->c, *g = &ga->c;
+    CHECK(e->n_raw == g->n_raw && e->n_comp == g->n_comp && e->n_index_comp == g->n_index_comp);
+    attn_test_equal("attention graph raw KV", e->raw_kv, g->raw_kv, (uint64_t)e->cap_raw * DS4_N_HEAD_DIM);
+    if (e->compress_ratio == 0) return;
+    attn_test_equal("attention graph compressed KV", e->attn_comp_kv, g->attn_comp_kv,
+                    (uint64_t)e->n_comp * DS4_N_HEAD_DIM);
+    attn_test_equal("attention graph compressor state", e->attn_state_kv, g->attn_state_kv,
+                    (uint64_t)ea->width * ea->state_rows);
+    attn_test_equal("attention graph compressor scores", e->attn_state_score, g->attn_state_score,
+                    (uint64_t)ea->width * ea->state_rows);
+    if (e->compress_ratio != 4) return;
+    attn_test_equal("attention graph indexer KV", e->index_comp_kv, g->index_comp_kv,
+                    (uint64_t)e->n_index_comp * DS4_N_INDEXER_HEAD_DIM);
+    attn_test_equal("attention graph indexer state", e->index_state_kv, g->index_state_kv,
+                    (uint64_t)ea->index_width * ea->state_rows);
+    attn_test_equal("attention graph indexer scores", e->index_state_score, g->index_state_score,
+                    (uint64_t)ea->index_width * ea->state_rows);
+}
+
+/* The staged decode attention sublayer must reproduce the plain one bit for
+ * bit: q, kv, the heads, the output, the new HC state and every cache row
+ * and state the token pushes, on a dense layer, a ratio-128 layer and a
+ * ratio-4 layer whose indexer selects (its top-k shrunk so that a handful
+ * of compressed rows exercise it), with the raw window filling and full,
+ * with and without a compression step, with the HC post folded in and with
+ * steering keeping it serial, at several thread counts, with and without
+ * the two-cursor NUMA split. */
+static void check_attn_graph(void) {
+    const ds4_shape saved = g_ds4_shape;
+    g_ds4_shape = DS4_SHAPE_FLASH;
+    g_ds4_shape.n_indexer_top_k = 6;
+    const uint64_t E = DS4_N_EMBD, H = DS4_N_HEAD, D = DS4_N_HEAD_DIM, LQ = DS4_N_LORA_Q;
+    const uint64_t OG = DS4_N_OUT_GROUP, LO = DS4_N_LORA_O;
+    const uint64_t IH = DS4_N_INDEXER_HEAD, ID = DS4_N_INDEXER_HEAD_DIM;
+    const uint32_t n_hc = DS4_N_HC;
+    const uint64_t hc_dim = (uint64_t)n_hc * E, n_mix = (uint64_t)n_hc * (2 + n_hc);
+    const uint64_t group_dim = H / OG * D, low_dim = OG * LO, q_dim = H * D;
+    enum { T_HCFN, T_HCSCALE, T_HCBASE, T_NORM, T_QA, T_QANORM, T_QB, T_KV, T_KVNORM, T_SINKS,
+           T_OA, T_OB, T_CKV4, T_CGATE4, T_CAPE4, T_CKV128, T_CGATE128, T_CAPE128, T_CNORM,
+           T_IKV, T_IGATE, T_IAPE, T_INORM, T_IPROJ, T_IQB, N_T };
+    const struct { uint32_t type; uint64_t d0, d1; } spec[N_T] = {
+        [T_HCFN] = {DS4_TENSOR_F16, hc_dim, n_mix},
+        [T_HCSCALE] = {DS4_TENSOR_F32, 3, 0},
+        [T_HCBASE] = {DS4_TENSOR_F32, n_mix, 0},
+        [T_NORM] = {DS4_TENSOR_F32, E, 0},
+        [T_QA] = {DS4_TENSOR_Q8_0, E, LQ},
+        [T_QANORM] = {DS4_TENSOR_F32, LQ, 0},
+        [T_QB] = {DS4_TENSOR_Q8_0, LQ, q_dim},
+        [T_KV] = {DS4_TENSOR_Q8_0, E, D},
+        [T_KVNORM] = {DS4_TENSOR_F32, D, 0},
+        [T_SINKS] = {DS4_TENSOR_F32, H, 0},
+        [T_OA] = {DS4_TENSOR_Q8_0, group_dim, low_dim},
+        [T_OB] = {DS4_TENSOR_Q8_0, low_dim, E},
+        [T_CKV4] = {DS4_TENSOR_F16, E, 2 * D},
+        [T_CGATE4] = {DS4_TENSOR_F16, E, 2 * D},
+        [T_CAPE4] = {DS4_TENSOR_F16, 2 * D, 4},
+        [T_CKV128] = {DS4_TENSOR_F16, E, D},
+        [T_CGATE128] = {DS4_TENSOR_F16, E, D},
+        [T_CAPE128] = {DS4_TENSOR_F16, D, 128},
+        [T_CNORM] = {DS4_TENSOR_F32, D, 0},
+        [T_IKV] = {DS4_TENSOR_F16, E, 2 * ID},
+        [T_IGATE] = {DS4_TENSOR_F16, E, 2 * ID},
+        [T_IAPE] = {DS4_TENSOR_F16, 2 * ID, 4},
+        [T_INORM] = {DS4_TENSOR_F32, ID, 0},
+        [T_IPROJ] = {DS4_TENSOR_F16, E, IH},
+        [T_IQB] = {DS4_TENSOR_F16, LQ, IH * ID},
+    };
+    ds4_tensor t[N_T];
+    uint64_t off[N_T], total = 0;
+    for (int i = 0; i < N_T; i++) {
+        const uint64_t elems = spec[i].d0 * (spec[i].d1 ? spec[i].d1 : 1);
+        const uint64_t bytes = spec[i].type == DS4_TENSOR_Q8_0 ? spec[i].d1 * (spec[i].d0 / 32) * 34
+                             : elems * (spec[i].type == DS4_TENSOR_F16 ? 2 : 4);
+        off[i] = total;
+        total += (bytes + 63) / 64 * 64;
+        memset(&t[i], 0, sizeof(t[i]));
+        t[i].type = spec[i].type;
+        t[i].ndim = spec[i].d1 ? 2 : 1;
+        t[i].dim[0] = spec[i].d0;
+        t[i].dim[1] = spec[i].d1;
+        t[i].abs_offset = off[i];
+        t[i].elements = elems;
+        t[i].bytes = bytes;
+    }
+    quant_buffer wb = quant_alloc(total);
+    uint8_t *w = wb.data;
+    for (int i = 0; i < N_T; i++) {
+        if (spec[i].type == DS4_TENSOR_F16) {
+            uint16_t *p = (uint16_t *)(w + off[i]);
+            const float scale = i == T_HCFN ? 0.01f : 0.05f;
+            for (uint64_t k = 0; k < t[i].elements; k++) p[k] = f32_to_f16(quant_float() * scale);
+        } else if (spec[i].type == DS4_TENSOR_Q8_0) {
+            for (uint64_t b = 0; b < t[i].bytes / 34; b++) {
+                uint8_t *blk = w + off[i] + b * 34;
+                const uint16_t d = ffn_graph_half();
+                memcpy(blk, &d, 2);
+                for (int k = 0; k < 32; k++) blk[2 + k] = (uint8_t)quant_random();
+            }
+        } else {
+            attn_test_fill((float *)(w + off[i]), t[i].elements, 1.0f);
+        }
+    }
+    float *hcscale = (float *)(w + off[T_HCSCALE]);
+    for (int i = 0; i < 3; i++) hcscale[i] = 0.5f + 0.25f * (float)i;
+    ds4_model m = {.map = w, .size = total};
+
+    const uint32_t ratios[3] = {0, 4, 128}, ils[3] = {0, 2, 3};
+    ds4_layer_weights L[3];
+    memset(L, 0, sizeof(L));
+    for (int r = 0; r < 3; r++) {
+        ds4_layer_weights *l = &L[r];
+        l->hc_attn_fn = &t[T_HCFN]; l->hc_attn_scale = &t[T_HCSCALE]; l->hc_attn_base = &t[T_HCBASE];
+        l->attn_norm = &t[T_NORM]; l->attn_sinks = &t[T_SINKS];
+        l->attn_q_a = &t[T_QA]; l->attn_q_a_norm = &t[T_QANORM]; l->attn_q_b = &t[T_QB];
+        l->attn_kv = &t[T_KV]; l->attn_kv_a_norm = &t[T_KVNORM];
+        l->attn_output_a = &t[T_OA]; l->attn_output_b = &t[T_OB];
+        if (ratios[r] == 4) {
+            l->attn_compressor_kv = &t[T_CKV4]; l->attn_compressor_gate = &t[T_CGATE4];
+            l->attn_compressor_ape = &t[T_CAPE4]; l->attn_compressor_norm = &t[T_CNORM];
+            l->indexer_compressor_kv = &t[T_IKV]; l->indexer_compressor_gate = &t[T_IGATE];
+            l->indexer_compressor_ape = &t[T_IAPE]; l->indexer_compressor_norm = &t[T_INORM];
+            l->indexer_proj = &t[T_IPROJ]; l->indexer_attn_q_b = &t[T_IQB];
+        } else if (ratios[r] == 128) {
+            l->attn_compressor_kv = &t[T_CKV128]; l->attn_compressor_gate = &t[T_CGATE128];
+            l->attn_compressor_ape = &t[T_CAPE128]; l->attn_compressor_norm = &t[T_CNORM];
+        }
+        CHECK(attn_graph_supported(l, ratios[r]));
+        g_ds4_compress_ratios[ils[r]] = ratios[r];
+    }
+
+    const uint32_t cap_raw = 16, comp_cap = 24;
+    attn_test_cache ca[3], cb[3];
+    for (int r = 0; r < 3; r++) {
+        attn_test_cache_alloc(&ca[r], ratios[r], cap_raw, comp_cap);
+        attn_test_cache_alloc(&cb[r], ratios[r], cap_raw, comp_cap);
+    }
+    ds4_cpu_decode_scratch scratch;
+    cpu_decode_scratch_init(&scratch, 128);
+    float *res = xmalloc(hc_dim * sizeof(float)), *dirs = xmalloc(4 * E * sizeof(float));
+    float *hc0 = xmalloc(hc_dim * sizeof(float)), *q0 = xmalloc(q_dim * sizeof(float));
+    float *kv0 = xmalloc(D * sizeof(float)), *heads0 = xmalloc(q_dim * sizeof(float));
+    float *out0 = xmalloc(E * sizeof(float));
+    attn_test_fill(dirs, 4 * E, 0.01f);
+
+    const struct { int r; uint32_t pos, n_raw, n_comp; bool steer; } cases[] = {
+        {0, 5, 5, 0, false},       /* dense layer, window filling */
+        {1, 131, 16, 20, false},   /* ratio 4: full window, compression, 21 > top-k rows: indexer */
+        {1, 130, 16, 20, false},   /* ratio 4: the indexer selects without a compression step */
+        {1, 130, 9, 3, false},     /* ratio 4: no compression, every compressed row visible */
+        {2, 255, 16, 1, false},    /* ratio 128: compression */
+        {1, 131, 16, 20, true},    /* steering keeps the HC post serial */
+        {1, 7, 8, 1, false},       /* ratio 4: compression into the second row */
+    };
+    const size_t n_cases = sizeof(cases) / sizeof(*cases);
+
+    ds4_numa_init();
+    const bool numa = g_numa.on;
+    const uint32_t threads[] = {1, 3, 16, 40};
+    for (int mode = numa; mode >= 0; mode--) {
+        g_numa.on = mode;
+        for (size_t ti = 0; ti < sizeof(threads) / sizeof(*threads); ti++) {
+            g_requested_threads = threads[ti];
+            ds4_threads_init();
+            for (size_t ci = 0; ci < n_cases; ci++) {
+                const int r = cases[ci].r;
+                const float *steer = cases[ci].steer ? dirs : NULL;
+                attn_test_cache_fill(&ca[r], cases[ci].n_raw, cases[ci].n_comp);
+                attn_test_cache_copy(&cb[r], &ca[r]);
+                attn_test_fill(res, hc_dim, ci & 1 ? 20.0f : 1.0f);
+
+                layer_attention_plain_one(&m, &L[r], &ca[r].c, res, ils[r], cases[ci].pos,
+                                          steer, 0.1f, &scratch, NULL);
+                memcpy(hc0, scratch.after_attn_hc, hc_dim * sizeof(float));
+                memcpy(q0, scratch.q, q_dim * sizeof(float));
+                memcpy(kv0, scratch.kv, D * sizeof(float));
+                memcpy(heads0, scratch.heads, q_dim * sizeof(float));
+                memcpy(out0, scratch.attn_out, E * sizeof(float));
+                memset(scratch.after_attn_hc, 0xff, hc_dim * sizeof(float));
+                memset(scratch.q, 0xff, q_dim * sizeof(float));
+                memset(scratch.kv, 0xff, D * sizeof(float));
+                memset(scratch.heads, 0xff, q_dim * sizeof(float));
+                memset(scratch.attn_out, 0xff, E * sizeof(float));
+
+                /* Every other case takes the profile marks (the decode
+                 * profile path): the ready times must come in stage order. */
+                double marks[5] = {0, 0, 0, 0, 0};
+                layer_attention_graph(&m, &L[r], &cb[r].c, res, ils[r], cases[ci].pos,
+                                      steer, 0.1f, &scratch, ci & 1 ? marks : NULL);
+                if (ci & 1) {
+                    CHECK(marks[0] > 0.0 && marks[0] <= marks[1] && marks[1] <= marks[2] &&
+                          marks[2] <= marks[3] && marks[3] <= marks[4]);
+                }
+                attn_test_equal("attention graph q", q0, scratch.q, q_dim);
+                attn_test_equal("attention graph kv", kv0, scratch.kv, D);
+                attn_test_equal("attention graph heads", heads0, scratch.heads, q_dim);
+                attn_test_equal("attention graph output", out0, scratch.attn_out, E);
+                attn_test_equal("attention graph HC post", hc0, scratch.after_attn_hc, hc_dim);
+                attn_test_cache_equal(&ca[r], &cb[r]);
+                uint64_t live = 0;
+                for (uint64_t i = 0; i < E; i++) live += isfinite(out0[i]) && out0[i] != 0.0f;
+                CHECK(live > E / 2);   /* the weights exercise real values */
+            }
+            ds4_threads_shutdown();
+            printf("CPU staged decode attention: %u threads%s PASS\n", threads[ti], mode ? " (NUMA)" : "");
+        }
+    }
+    g_numa.on = numa;
+    g_requested_threads = 0;
+    for (int r = 0; r < 3; r++) {
+        g_ds4_compress_ratios[ils[r]] = 0;
+        attn_test_cache_free(&ca[r]);
+        attn_test_cache_free(&cb[r]);
+    }
+    free(out0); free(heads0); free(kv0); free(q0); free(hc0); free(dirs); free(res);
+    cpu_decode_scratch_free(&scratch);
+    quant_free(wb);
+    g_ds4_shape = saved;
+}
+
 /* Prefix prefill attention must match the per-token attention each token
  * would run against its raw window and the compressed rows pushed so far,
  * with and without an indexer mask, for a fresh prompt and for one that
@@ -2121,6 +2419,7 @@ static void check_ds41_q8_grouped(void) {
 
 int main(void) {
     check_ffn_graph();
+    check_attn_graph();
     check_thread_pool();
     check_ds41_q8_grouped();
     puts("CPU V4.1 grouped and paired Q8_0 projections bitwise against the reference PASS");
