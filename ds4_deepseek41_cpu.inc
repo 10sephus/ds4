@@ -86,6 +86,7 @@ typedef struct ds41_cpu_state {
     ds4_engram_layout engram;
     ds4_engram_history history;
     ds4_engram_table table[2];
+    ds4_engram_reader *reader;
     uint32_t *token_map;
     float rows[2][DS4_ENGRAM_COLS * DS4_ENGRAM_DIM];
     float engram_kv[5 * 5120];
@@ -129,6 +130,7 @@ static bool ds41_cpu_read_array(const ds4_model *m, const char *key,
 
 static void ds41_cpu_free(ds41_cpu_state *s) {
     if (!s) return;
+    ds4_engram_reader_free(s->reader);
     ds4_engram_table_close(&s->table[0]);
     ds4_engram_table_close(&s->table[1]);
     ds41_cpu_attention_free(s->attention);
@@ -202,6 +204,12 @@ static ds41_cpu_state *ds41_cpu_create(const ds4_model *m, const ds4_weights *w,
             goto fail;
         }
     }
+    /* Fresh text reads cold rows, 0.3-0.8 ms each here (ZFS reads a 64 KiB
+     * record per 264-byte row). Twelve threads, two columns each, have layer
+     * 1's table ready in ~1.4 ms, under layer 0, and both tables in ~2 ms
+     * (four threads: 2.0-2.6 and 3.7-5 ms; serial: 7-11 and 16-22 ms).
+     * Creation failure falls back to synchronous reads. */
+    s->reader = ds4_engram_reader_create(12);
     ds41_cpu_reset(s);
     return s;
 fail:
@@ -300,11 +308,18 @@ static bool ds41_cpu_forward(ds41_cpu_state *s, int token, float *logits,
     ds4_engram_history next_history = s->history;
     if (!ds4_engram_hash(&s->engram, &next_history, &token, NULL, 1, &ids[0][0]))
         return ds41_cpu_error(error, cap, "V4.1 Engram hash failed");
-    for (uint32_t i = 0; i < 2; i++) {
-        if (!ds4_engram_read(&s->table[i], ids[i], DS4_ENGRAM_COLS, s->rows[i]))
+    /* The rows are read while layer 0 runs; layers 1 and 14 wait for their
+     * own table. The bytes and every use of them are unchanged. */
+    if (s->reader) {
+        if (!ds4_engram_reader_start(s->reader, s->table, ids, &s->rows[0][0]))
             return ds41_cpu_error(error, cap, "V4.1 Engram row read failed");
+    } else {
+        for (uint32_t i = 0; i < 2; i++) {
+            if (!ds4_engram_read(&s->table[i], ids[i], DS4_ENGRAM_COLS, s->rows[i]))
+                return ds41_cpu_error(error, cap, "V4.1 Engram row read failed");
+        }
     }
-    const double read_seconds = profile ? now_sec() - started : 0;
+    double read_seconds = profile ? now_sec() - started : 0;
     ds41_prof(DS41_PROF_GLUE);
     embed_token_any(s->model, s->weights, token, s->x);
     hc_from_plain_embedding(s->residual, s->x, 5120, 4);
@@ -313,8 +328,18 @@ static bool ds41_cpu_forward(ds41_cpu_state *s, int token, float *logits,
     for (uint32_t il = 0; il < 40; il++) {
         const ds4_layer_weights *l = &s->weights->layer[il];
         if (il == 1 || il == 14) {
-            const double phase = profile ? now_sec() : 0;
             const uint32_t i = il == 1 ? 0u : 1u;
+            if (s->reader) {
+                ds41_prof(DS41_PROF_EREAD);
+                const double wait = profile ? now_sec() : 0;
+                if (!ds4_engram_reader_wait(s->reader, i)) {
+                    (void)ds4_engram_reader_wait(s->reader, 1);
+                    s->valid = false;
+                    return ds41_cpu_error(error, cap, "V4.1 Engram row read failed");
+                }
+                if (profile) read_seconds += now_sec() - wait;
+            }
+            const double phase = profile ? now_sec() : 0;
             ds41_prof(DS41_PROF_ENGRAM);
             if (!ds41_cpu_matvec(s->engram_kv, s->model, l->engram_kv, s->rows[i], true))
                 goto layer_fail;
@@ -346,6 +371,8 @@ static bool ds41_cpu_forward(ds41_cpu_state *s, int token, float *logits,
         continue;
 layer_fail:
         s->valid = false;
+        /* The readers write s->rows until the second table is complete. */
+        if (s->reader) (void)ds4_engram_reader_wait(s->reader, 1);
         if (error && cap) snprintf(error, cap, "V4.1 CPU layer %u failed at token position %u", il, s->pos);
         return false;
     }
