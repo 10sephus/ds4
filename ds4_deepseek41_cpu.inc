@@ -407,7 +407,7 @@ static bool ds41_cpu_moe(ds41_cpu_state *s, const ds4_layer_weights *l) {
  * FFN input comes from the attention mixer, so this layer's FFN mixer only
  * feeds the HC post and the next layer: its norm, projection and Sinkhorn
  * split overlap the expert weights.  Every stage runs the row kernels of
- * the plain path (ds41_cpu_hc_mix, ds41_cpu_moe, ds41_cpu_hc_expand) on the
+ * the plain path (ds41_cpu_hc_run, ds41_cpu_moe, ds41_cpu_hc_expand) on the
  * same inputs, the finish steps are its serial code, and the last stage
  * applies its BF16 roundings, shared + routed sum and HC post per column,
  * so every value is bitwise the plain one. */
