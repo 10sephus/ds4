@@ -1483,9 +1483,10 @@ static void check_f16_round_trip(void) {
 
 /* Batched compressor projections must reproduce the per-token dot bit for bit,
  * for F16 weights (batched kernel) and for other types (per-token fallback). */
-static void check_compressor_project_batch(void) {
+/* 9 x 5 takes only the per-token row-group path; 77 rows x 150 tokens takes
+ * the token-lane tiles (partial row group, several tile blocks) and a tail. */
+static void check_compressor_project_batch_shape(uint32_t width, uint32_t n_tok) {
     const uint64_t in_dim = 70;
-    const uint32_t width = 9, n_tok = 5;
     const size_t half_bytes = (size_t)in_dim * width * sizeof(uint16_t);
     const size_t f32_bytes = (size_t)in_dim * width * sizeof(float);
     quant_buffer wb = quant_alloc(2 * half_bytes + 2 * f32_bytes);
@@ -1531,6 +1532,11 @@ static void check_compressor_project_batch(void) {
     }
     free(expected); free(sc_all); free(kv_all); free(x);
     quant_free(wb);
+}
+
+static void check_compressor_project_batch(void) {
+    check_compressor_project_batch_shape(9, 5);
+    check_compressor_project_batch_shape(77, 150);
 }
 
 static uint16_t ffn_graph_half(void) {

@@ -15966,6 +15966,95 @@ static void compressor_project_batch_worker(void *vctx, uint64_t g0, uint64_t g1
     }
 }
 
+#if defined(DS4_NO_GPU) && defined(__AVX512F__) && defined(__F16C__)
+/* Token-lane F16 projection for prefill.  dot_f16_rows keeps one row per lane
+ * and is bound by its single add chain (about 2 MACs per cycle).  Here a lane
+ * is a token: 16 tokens' activations are packed column-major once, a group
+ * of up to 16 weight rows is converted to f32 once per item, and every
+ * column does one broadcast, vmulps and vaddps per row.  Each (row, token)
+ * still computes acc = acc + w[i] * x[i] in index order from 0.0f with
+ * separate multiply and add, i.e. bitwise dot_f16_row (the F16C conversion
+ * gives the products dot_f16_rows gives). */
+enum { COMP_TILE_ROWS = 16, COMP_TILE_BLOCK = 4 };
+
+typedef struct {
+    float          * out;
+    const uint16_t * w;
+    const float    * xt;      /* [tile][in_dim][16] */
+    uint64_t         in_dim;
+    uint32_t         width;
+    uint32_t         n_tiles;
+} compressor_tile_ctx;
+
+static void compressor_tile_pack_worker(void *vctx, uint64_t t0, uint64_t t1) {
+    compressor_tile_ctx *ctx = vctx;
+    const float *x = (const float *)ctx->out;   /* the activations while packing */
+    float *xt = (float *)ctx->xt;
+    for (uint64_t tile = t0; tile < t1; tile++) {
+        float *dst = xt + tile * ctx->in_dim * 16;
+        for (unsigned j = 0; j < 16; j++) {
+            const float *src = x + (tile * 16 + j) * ctx->in_dim;
+            for (uint64_t i = 0; i < ctx->in_dim; i++) dst[i * 16 + j] = src[i];
+        }
+    }
+}
+
+static void compressor_tile_worker(void *vctx, uint64_t i0, uint64_t i1) {
+    const compressor_tile_ctx *ctx = vctx;
+    const uint64_t n = ctx->in_dim;
+    const uint64_t n_tb = (ctx->n_tiles + COMP_TILE_BLOCK - 1) / COMP_TILE_BLOCK;
+    float *wf = xmalloc((size_t)COMP_TILE_ROWS * n * sizeof(float));
+    for (uint64_t item = i0; item < i1; item++) {
+        const uint64_t rg = item / n_tb;
+        const uint64_t tb = item - rg * n_tb;
+        const uint64_t o = rg * COMP_TILE_ROWS;
+        const uint64_t n_rows = ctx->width - o < COMP_TILE_ROWS ? ctx->width - o : COMP_TILE_ROWS;
+        for (uint64_t r = 0; r < COMP_TILE_ROWS; r++) {
+            const uint16_t *row = ctx->w + (o + (r < n_rows ? r : 0)) * n;
+            uint64_t i = 0;
+            for (; i + 8 <= n; i += 8) {
+                _mm256_storeu_ps(wf + r * n + i, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(row + i))));
+            }
+            for (; i < n; i++) wf[r * n + i] = f16_to_f32(row[i]);
+        }
+        const uint64_t tile_hi = (tb + 1) * COMP_TILE_BLOCK < ctx->n_tiles ? (tb + 1) * COMP_TILE_BLOCK : ctx->n_tiles;
+        for (uint64_t tile = tb * COMP_TILE_BLOCK; tile < tile_hi; tile++) {
+            const float *xt = ctx->xt + tile * n * 16;
+            __m512 acc[COMP_TILE_ROWS];
+            for (unsigned r = 0; r < COMP_TILE_ROWS; r++) acc[r] = _mm512_setzero_ps();
+            for (uint64_t i = 0; i < n; i++) {
+                const __m512 xv = _mm512_loadu_ps(xt + i * 16);
+                for (unsigned r = 0; r < COMP_TILE_ROWS; r++) {
+                    acc[r] = _mm512_add_ps(acc[r], _mm512_mul_ps(_mm512_set1_ps(wf[r * n + i]), xv));
+                }
+            }
+            for (uint64_t r = 0; r < n_rows; r++) {
+                float lane[16];
+                _mm512_storeu_ps(lane, acc[r]);
+                for (unsigned j = 0; j < 16; j++) ctx->out[(tile * 16 + j) * ctx->width + o + r] = lane[j];
+            }
+        }
+    }
+    free(wf);
+}
+
+/* Projects the first n_tiles * 16 tokens; returns how many it covered. */
+static uint32_t compressor_project_tiles(float *out, const uint16_t *w, const float *x,
+                                         float *xt, uint64_t in_dim, uint32_t width,
+                                         uint32_t n_tok, bool pack) {
+    compressor_tile_ctx ctx = {
+        .out = (float *)x, .w = w, .xt = xt, .in_dim = in_dim, .width = width, .n_tiles = n_tok / 16,
+    };
+    if (ctx.n_tiles == 0) return 0;
+    if (pack) ds4_parallel_for_min_rows(ctx.n_tiles, compressor_tile_pack_worker, &ctx, 1);
+    ctx.out = out;
+    const uint64_t items = (uint64_t)(width + COMP_TILE_ROWS - 1) / COMP_TILE_ROWS *
+                           ((ctx.n_tiles + COMP_TILE_BLOCK - 1) / COMP_TILE_BLOCK);
+    ds4_parallel_for_min_rows(items, compressor_tile_worker, &ctx, 1);
+    return ctx.n_tiles * 16;
+}
+#endif
+
 /* Prefill compressor projections for all tokens at once, row-outer so each
  * F16 weight row is read once instead of once per token and the thread pool
  * is dispatched once per matrix instead of twice per token.  Every element
@@ -15992,17 +16081,28 @@ static void compressor_project_batch(
         return;
     }
 
+    uint32_t t0 = 0;
+#if defined(DS4_NO_GPU) && defined(__AVX512F__) && defined(__F16C__)
+    if (n_tok >= 16) {
+        float *xt = xmalloc((size_t)(n_tok / 16) * 16 * in_dim * sizeof(float));
+        compressor_project_tiles(kv_all, tensor_data(model, wkv), x, xt, in_dim, width, n_tok, true);
+        t0 = compressor_project_tiles(sc_all, tensor_data(model, wgate), x, xt, in_dim, width, n_tok, false);
+        free(xt);
+    }
+#endif
+    if (t0 == n_tok) return;
+
     compressor_project_batch_ctx ctx = {
-        .out = kv_all,
+        .out = kv_all + (uint64_t)t0 * width,
         .w = tensor_data(model, wkv),
-        .x = x,
+        .x = x + (uint64_t)t0 * in_dim,
         .in_dim = in_dim,
         .width = width,
-        .n_tok = n_tok,
+        .n_tok = n_tok - t0,
     };
     const uint64_t groups = (width + DS4_F16_ROWS - 1) / DS4_F16_ROWS;
     ds4_parallel_for_min_rows(groups, compressor_project_batch_worker, &ctx, 1);
-    ctx.out = sc_all;
+    ctx.out = sc_all + (uint64_t)t0 * width;
     ctx.w = tensor_data(model, wgate);
     ds4_parallel_for_min_rows(groups, compressor_project_batch_worker, &ctx, 1);
 }
