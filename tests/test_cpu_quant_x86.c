@@ -724,7 +724,83 @@ static void check_f16c_scales(void) {
 }
 #endif
 
+
+/* The pool hands rows out in chunks claimed by whichever thread is free, so
+ * check that every row of every dispatch is claimed exactly once and never in
+ * a chunk above the cap, that a nested dispatch runs inline, that the workers
+ * really take part, and that a tight loop of tiny dispatches with pauses long
+ * enough for the workers to fall asleep never loses a wake-up. */
+typedef struct {
+    uint32_t claims[64 * DS4_MAX_THREADS];
+    uint64_t n_rows;
+    uint64_t nested_rows;
+    uint32_t threads_seen;
+    uint32_t round;
+    bool slow;
+} pool_test_ctx;
+
+static __thread uint32_t pool_thread_round;
+
+static void pool_nested_worker(void *vctx, uint64_t row0, uint64_t row1) {
+    pool_test_ctx *ctx = vctx;
+    __atomic_fetch_add(&ctx->nested_rows, row1 - row0, __ATOMIC_RELAXED);
+}
+
+static void pool_claim_worker(void *vctx, uint64_t row0, uint64_t row1) {
+    pool_test_ctx *ctx = vctx;
+    CHECK(row0 < row1 && row1 <= ctx->n_rows && row1 - row0 <= 64);
+    if (pool_thread_round != ctx->round) {
+        pool_thread_round = ctx->round;
+        __atomic_fetch_add(&ctx->threads_seen, 1, __ATOMIC_RELAXED);
+    }
+    for (uint64_t r = row0; r < row1; r++) {
+        __atomic_fetch_add(&ctx->claims[r], 1, __ATOMIC_RELAXED);
+    }
+    if (row0 == 0) ds4_parallel_for_min_rows(1000, pool_nested_worker, ctx, 1);
+    if (ctx->slow) {
+        const double until = now_sec() + 50.0e-6 * (double)(row1 - row0);
+        while (now_sec() < until) ds4_cpu_relax();
+    }
+}
+
+static void pool_dispatch(pool_test_ctx *ctx, uint64_t n_rows, bool slow) {
+    ctx->n_rows = n_rows;
+    ctx->nested_rows = 0;
+    ctx->threads_seen = 0;
+    ctx->slow = slow;
+    ctx->round++;
+    memset(ctx->claims, 0, (size_t)n_rows * sizeof(ctx->claims[0]));
+    ds4_parallel_for_min_rows(n_rows, pool_claim_worker, ctx, 1);
+    for (uint64_t r = 0; r < n_rows; r++) CHECK(ctx->claims[r] == 1);
+    CHECK(ctx->nested_rows == 1000);
+}
+
+static void check_thread_pool(void) {
+    const uint32_t threads[] = {1, 2, 7, DS4_MAX_THREADS};
+    pool_test_ctx *ctx = calloc(1, sizeof(*ctx));
+    CHECK(ctx);
+    alarm(600);   /* a lost wake-up would otherwise hang here forever */
+    CHECK(ds4_default_threads() >= 1 && ds4_default_threads() <= DS4_MAX_THREADS);
+    for (size_t i = 0; i < sizeof(threads) / sizeof(*threads); i++) {
+        g_requested_threads = threads[i];
+        ds4_threads_init();
+        CHECK(g_pool.n_threads == threads[i]);
+        pool_dispatch(ctx, 64 * threads[i], true);
+        CHECK(ctx->threads_seen >= (threads[i] + 1) / 2);
+        const uint32_t rounds = threads[i] == DS4_MAX_THREADS ? 2000 : 100000;
+        for (uint32_t k = 0; k < rounds; k++) {
+            pool_dispatch(ctx, 1 + k % 37, false);
+            if (k % 2000 == 0) usleep(3 * DS4_POOL_SPIN_US);
+        }
+        ds4_threads_shutdown();
+        printf("CPU thread pool: %u threads PASS\n", threads[i]);
+    }
+    g_requested_threads = 0;
+    free(ctx);
+}
+
 int main(void) {
+    check_thread_pool();
     check_integer_dots();
     check_iq2_tables();
 #if defined(DS4_NO_GPU) && defined(__AVX2__) && defined(__F16C__)

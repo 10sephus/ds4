@@ -37,6 +37,9 @@
 #include <dispatch/dispatch.h>
 #include <sys/sysctl.h>
 #endif
+#if defined(__linux__)
+#include <sched.h>
+#endif
 #include <stdarg.h>
 #include <time.h>
 #include <unistd.h>
@@ -2090,7 +2093,15 @@ static void cpu_directional_steering_project_rows(
 
 typedef void (*ds4_parallel_fn)(void *ctx, uint64_t row0, uint64_t row1);
 
-#define DS4_MAX_THREADS 32
+#define DS4_MAX_THREADS 64
+
+/* Microseconds an idle thread polls before parking on a condvar.  Decode
+ * issues several hundred dispatches per token, usually microseconds apart, so
+ * a polling worker picks the next one up for the cost of a cache miss instead
+ * of a futex round trip.  The bound covers the serial hyper-connection and
+ * norm work between dispatches (a few hundred microseconds); the condvar
+ * still frees the core across the serial attention loop and between tokens. */
+#define DS4_POOL_SPIN_US 1000
 
 typedef struct {
     pthread_t threads[DS4_MAX_THREADS];
@@ -2099,57 +2110,136 @@ typedef struct {
     pthread_cond_t done_cond;
     uint32_t n_threads;
     uint32_t n_workers;
-    uint32_t generation;
-    uint32_t done;
     bool initialized;
     bool shutdown;
     ds4_parallel_fn fn;
     void *ctx;
     uint64_t n_rows;
+    uint64_t chunk;
+    /* Each dispatch-hot word gets its own cache line: generation is polled by
+     * every idle worker, cursor is bumped by every chunk claim and pending by
+     * every finishing worker. */
+    uint32_t generation __attribute__((aligned(64)));
+    uint64_t cursor __attribute__((aligned(64)));
+    uint32_t pending __attribute__((aligned(64)));
 } ds4_thread_pool;
 
 static ds4_thread_pool g_pool;
 static __thread int g_parallel_depth;
 static uint32_t g_requested_threads;
 
-static void *ds4_worker_main(void *arg) {
-    const uint32_t tid = (uint32_t)(uintptr_t)arg;
-    uint32_t seen_generation = 0;
+static inline void ds4_cpu_relax(void) {
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#elif defined(__aarch64__)
+    __asm__ __volatile__("yield");
+#endif
+}
 
-    for (;;) {
-        pthread_mutex_lock(&g_pool.mutex);
-        while (seen_generation == g_pool.generation && !g_pool.shutdown) {
-            pthread_cond_wait(&g_pool.work_cond, &g_pool.mutex);
-        }
-        if (g_pool.shutdown) {
-            pthread_mutex_unlock(&g_pool.mutex);
-            return NULL;
-        }
-
-        seen_generation = g_pool.generation;
-        ds4_parallel_fn fn = g_pool.fn;
-        void *ctx = g_pool.ctx;
-        const uint64_t n_rows = g_pool.n_rows;
-        const uint32_t n_threads = g_pool.n_threads;
-        pthread_mutex_unlock(&g_pool.mutex);
-
-        const uint64_t rows_per_thread = (n_rows + n_threads - 1) / n_threads;
-        const uint64_t row0 = (uint64_t)tid * rows_per_thread;
-        uint64_t row1 = row0 + rows_per_thread;
-        if (row1 > n_rows) row1 = n_rows;
-        if (row0 < row1) {
-            g_parallel_depth++;
-            fn(ctx, row0, row1);
-            g_parallel_depth--;
-        }
-
-        pthread_mutex_lock(&g_pool.mutex);
-        g_pool.done++;
-        if (g_pool.done == g_pool.n_workers) {
-            pthread_cond_signal(&g_pool.done_cond);
-        }
-        pthread_mutex_unlock(&g_pool.mutex);
+/* Block until *word reaches target: poll for DS4_POOL_SPIN_US, then sleep on
+ * cond.  Writers update the word outside the mutex and notify inside it, so a
+ * sleeper that rechecks the word under the mutex cannot miss the wake-up. */
+static void ds4_pool_wait(const uint32_t *word, uint32_t target, pthread_cond_t *cond) {
+    const double deadline = now_sec() + DS4_POOL_SPIN_US * 1.0e-6;
+    for (uint32_t spins = 0;; spins++) {
+        if (__atomic_load_n(word, __ATOMIC_ACQUIRE) == target) return;
+        ds4_cpu_relax();
+        if ((spins & 63u) == 63u && now_sec() > deadline) break;
     }
+    pthread_mutex_lock(&g_pool.mutex);
+    while (__atomic_load_n(word, __ATOMIC_ACQUIRE) != target) {
+        pthread_cond_wait(cond, &g_pool.mutex);
+    }
+    pthread_mutex_unlock(&g_pool.mutex);
+}
+
+static void ds4_pool_notify(pthread_cond_t *cond) {
+    pthread_mutex_lock(&g_pool.mutex);
+    pthread_cond_broadcast(cond);
+    pthread_mutex_unlock(&g_pool.mutex);
+}
+
+/* Claim chunks of rows until the shared cursor passes n_rows.  Every row is
+ * still computed whole by exactly one thread, so the result does not depend
+ * on which thread claims which chunk or in what order. */
+static void ds4_pool_work(void) {
+    const uint64_t n_rows = g_pool.n_rows;
+    const uint64_t chunk = g_pool.chunk;
+    for (;;) {
+        const uint64_t row0 = __atomic_fetch_add(&g_pool.cursor, chunk, __ATOMIC_RELAXED);
+        if (row0 >= n_rows) return;
+        g_pool.fn(g_pool.ctx, row0, row0 + chunk < n_rows ? row0 + chunk : n_rows);
+    }
+}
+
+/* The pool generation advances once per dispatch (and once at shutdown), and
+ * a dispatch cannot start before every worker finished the previous one, so a
+ * private counter tracks it exactly. */
+static void *ds4_worker_main(void *arg) {
+    (void)arg;
+    uint32_t generation = 0;
+    g_parallel_depth = 1;   /* a kernel that dispatches again runs it inline */
+    for (;;) {
+        ds4_pool_wait(&g_pool.generation, ++generation, &g_pool.work_cond);
+        if (g_pool.shutdown) return NULL;
+        ds4_pool_work();
+        if (__atomic_sub_fetch(&g_pool.pending, 1, __ATOMIC_RELEASE) == 0) {
+            ds4_pool_notify(&g_pool.done_cond);
+        }
+    }
+}
+
+#if defined(__linux__)
+static int ds4_cpu_topology_id(int cpu, const char *name) {
+    char path[96];
+    snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/%s", cpu, name);
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    int id = -1;
+    if (fscanf(f, "%d", &id) != 1) id = -1;
+    fclose(f);
+    return id;
+}
+#endif
+
+/* One thread per physical core this process may run on.  A hyperthread
+ * sibling adds nothing to a bandwidth-bound matvec, and more polling threads
+ * than free cores would cost more than the condvar pool they replaced. */
+static uint32_t ds4_default_threads(void) {
+    uint32_t cores = 0;
+    uint32_t cpus = 0;
+#if defined(__linux__)
+    cpu_set_t mask;
+    if (sched_getaffinity(0, sizeof(mask), &mask) == 0) {
+        uint32_t seen[DS4_MAX_THREADS];
+        cpus = (uint32_t)CPU_COUNT(&mask);
+        for (int cpu = 0; cpu < CPU_SETSIZE && cores < DS4_MAX_THREADS; cpu++) {
+            if (!CPU_ISSET(cpu, &mask)) continue;
+            const int core = ds4_cpu_topology_id(cpu, "core_id");
+            const int package = ds4_cpu_topology_id(cpu, "physical_package_id");
+            if (core < 0 || package < 0) {
+                cores = 0;
+                break;
+            }
+            const uint32_t key = ((uint32_t)package << 16) | (uint32_t)core;
+            uint32_t i = 0;
+            while (i < cores && seen[i] != key) i++;
+            if (i == cores) seen[cores++] = key;
+        }
+    }
+#elif defined(__APPLE__)
+    int physical = 0;
+    size_t len = sizeof(physical);
+    if (sysctlbyname("hw.physicalcpu", &physical, &len, NULL, 0) == 0 && physical > 0) {
+        cores = (uint32_t)physical;
+    }
+#endif
+    if (cores == 0) {
+        const long online = sysconf(_SC_NPROCESSORS_ONLN);
+        cores = online > 1 ? (uint32_t)(online / 2) : 1;
+    }
+    if (cpus > 0 && cores > cpus) cores = cpus;
+    return cores < DS4_MAX_THREADS ? cores : DS4_MAX_THREADS;
 }
 
 /* Create the persistent CPU worker pool.  Decode reuses these threads instead
@@ -2159,12 +2249,7 @@ static void ds4_threads_init(void) {
 
     pthread_once(&iq2xxs_tables_once, iq2xxs_tables_init);
 
-    uint32_t n_threads = 12;
-    const long online_cpus = sysconf(_SC_NPROCESSORS_ONLN);
-    if (online_cpus > 0) {
-        n_threads = online_cpus < 12 ? (uint32_t)online_cpus : 12;
-    }
-
+    uint32_t n_threads = ds4_default_threads();
     const char *env = getenv("DS4_THREADS");
     if (env && env[0]) {
         long v = strtol(env, NULL, 10);
@@ -2176,20 +2261,16 @@ static void ds4_threads_init(void) {
                 n_threads, (unsigned)DS4_MAX_THREADS);
         n_threads = DS4_MAX_THREADS;
     }
-    if (n_threads == 0) n_threads = 1;
 
     pthread_mutex_init(&g_pool.mutex, NULL);
     pthread_cond_init(&g_pool.work_cond, NULL);
     pthread_cond_init(&g_pool.done_cond, NULL);
     g_pool.n_threads = n_threads;
-    g_pool.n_workers = n_threads > 0 ? n_threads - 1 : 0;
-    g_pool.generation = 0;
-    g_pool.done = 0;
-    g_pool.shutdown = false;
+    g_pool.n_workers = n_threads - 1;
     g_pool.initialized = true;
 
     for (uint32_t i = 1; i < n_threads; i++) {
-        if (pthread_create(&g_pool.threads[i], NULL, ds4_worker_main, (void *)(uintptr_t)i) != 0) {
+        if (pthread_create(&g_pool.threads[i], NULL, ds4_worker_main, NULL) != 0) {
             ds4_die("failed to create worker thread");
         }
     }
@@ -2198,12 +2279,9 @@ static void ds4_threads_init(void) {
 static void ds4_threads_shutdown(void) {
     if (!g_pool.initialized) return;
 
-    pthread_mutex_lock(&g_pool.mutex);
     g_pool.shutdown = true;
-    g_pool.generation++;
-    pthread_cond_broadcast(&g_pool.work_cond);
-    pthread_mutex_unlock(&g_pool.mutex);
-
+    __atomic_add_fetch(&g_pool.generation, 1, __ATOMIC_RELEASE);
+    ds4_pool_notify(&g_pool.work_cond);
     for (uint32_t i = 1; i < g_pool.n_threads; i++) {
         pthread_join(g_pool.threads[i], NULL);
     }
@@ -2224,30 +2302,26 @@ static void ds4_parallel_for_min_rows(uint64_t n_rows, ds4_parallel_fn fn, void 
         return;
     }
 
-    pthread_mutex_lock(&g_pool.mutex);
+    /* About eight claims per thread keep the load balanced when some cores
+     * are busy elsewhere; the 64-row cap keeps the last claim of a big matvec
+     * short. */
+    uint64_t chunk = n_rows / (8u * g_pool.n_threads);
+    if (chunk < 1) chunk = 1;
+    if (chunk > 64) chunk = 64;
     g_pool.fn = fn;
     g_pool.ctx = ctx;
     g_pool.n_rows = n_rows;
-    g_pool.done = 0;
-    g_pool.generation++;
-    pthread_cond_broadcast(&g_pool.work_cond);
+    g_pool.chunk = chunk;
+    __atomic_store_n(&g_pool.cursor, 0, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_pool.pending, g_pool.n_workers, __ATOMIC_RELAXED);
+    __atomic_add_fetch(&g_pool.generation, 1, __ATOMIC_RELEASE);
+    ds4_pool_notify(&g_pool.work_cond);
 
-    const uint64_t rows_per_thread = (n_rows + g_pool.n_threads - 1) / g_pool.n_threads;
-    uint64_t main_row1 = rows_per_thread;
-    if (main_row1 > n_rows) main_row1 = n_rows;
-    pthread_mutex_unlock(&g_pool.mutex);
+    g_parallel_depth++;
+    ds4_pool_work();
+    g_parallel_depth--;
 
-    if (main_row1 > 0) {
-        g_parallel_depth++;
-        fn(ctx, 0, main_row1);
-        g_parallel_depth--;
-    }
-
-    pthread_mutex_lock(&g_pool.mutex);
-    while (g_pool.done < g_pool.n_workers) {
-        pthread_cond_wait(&g_pool.done_cond, &g_pool.mutex);
-    }
-    pthread_mutex_unlock(&g_pool.mutex);
+    ds4_pool_wait(&g_pool.pending, 0, &g_pool.done_cond);
 }
 
 static void ds4_parallel_for(uint64_t n_rows, ds4_parallel_fn fn, void *ctx) {
@@ -37032,9 +37106,9 @@ typedef struct {
     const float *logits;
     uint64_t in_dim;
     uint64_t blocks;
-    uint64_t rows_per_slot;
-    uint32_t best_idx[DS4_MAX_THREADS];
-    float best_val[DS4_MAX_THREADS];
+    pthread_mutex_t merge;
+    uint32_t best_idx;
+    float best_val;
 } dspark_markov_q8_0_argmax_ctx;
 
 static void dspark_markov_q8_0_argmax_worker(
@@ -37042,9 +37116,6 @@ static void dspark_markov_q8_0_argmax_worker(
         uint64_t row0,
         uint64_t row1) {
     dspark_markov_q8_0_argmax_ctx *ctx = vctx;
-    uint64_t slot = ctx->rows_per_slot ? row0 / ctx->rows_per_slot : 0;
-    if (slot >= DS4_MAX_THREADS) slot = DS4_MAX_THREADS - 1u;
-
     float best_v = -FLT_MAX;
     uint32_t best = (uint32_t)row0;
     for (uint64_t row = row0; row < row1; row++) {
@@ -37058,8 +37129,14 @@ static void dspark_markov_q8_0_argmax_worker(
         }
     }
 
-    ctx->best_idx[slot] = best;
-    ctx->best_val[slot] = best_v;
+    /* Chunks arrive in claim order, so resolve ties to the lowest row here
+     * rather than through the scan order. */
+    pthread_mutex_lock(&ctx->merge);
+    if (best_v > ctx->best_val || (best_v == ctx->best_val && best < ctx->best_idx)) {
+        ctx->best_val = best_v;
+        ctx->best_idx = best;
+    }
+    pthread_mutex_unlock(&ctx->merge);
 }
 
 static bool dspark_markov_q8_0_argmax(
@@ -37098,10 +37175,6 @@ static bool dspark_markov_q8_0_argmax(
         xmalloc((size_t)blocks * sizeof(xscale[0]));
     quantize_q8_0_activation(state, xq, xscale, in_dim);
 
-    ds4_threads_init();
-    const uint32_t n_slots =
-        g_pool.n_threads == 0 ? 1u : g_pool.n_threads;
-    const uint64_t rows_per_slot = (out_dim + n_slots - 1u) / n_slots;
     dspark_markov_q8_0_argmax_ctx ctx = {
         .data = tensor_data(model, w),
         .xq = xq,
@@ -37109,31 +37182,17 @@ static bool dspark_markov_q8_0_argmax(
         .logits = logits,
         .in_dim = in_dim,
         .blocks = blocks,
-        .rows_per_slot = rows_per_slot,
+        .merge = PTHREAD_MUTEX_INITIALIZER,
+        .best_idx = 0,
+        .best_val = -FLT_MAX,
     };
-    for (uint32_t i = 0; i < DS4_MAX_THREADS; i++) {
-        ctx.best_idx[i] = 0;
-        ctx.best_val[i] = -FLT_MAX;
-    }
-
     ds4_parallel_for(out_dim, dspark_markov_q8_0_argmax_worker, &ctx);
-
-    uint32_t best = 0;
-    float best_v = -FLT_MAX;
-    for (uint32_t slot = 0; slot < n_slots && slot < DS4_MAX_THREADS; slot++) {
-        const uint64_t row0 = (uint64_t)slot * rows_per_slot;
-        if (row0 >= out_dim) break;
-        if (ctx.best_val[slot] > best_v) {
-            best_v = ctx.best_val[slot];
-            best = ctx.best_idx[slot];
-        }
-    }
 
     if (!use_stack) {
         free(xscale);
         free(xq);
     }
-    *token_out = best;
+    *token_out = ctx.best_idx;
     return true;
 }
 
