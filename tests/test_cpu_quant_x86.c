@@ -2180,6 +2180,7 @@ static void fill_q2_row(block_q2_K *x, unsigned blocks, unsigned *counter) {
  * on dense tiles (vector path) and sparse tiles (per-row path), including
  * padding lanes, odd block counts and adversarial activations. */
 static void check_x16_kernels(void) {
+#if DS4_MOE_X16
     const unsigned counts[] = {1, 2, 3, 5, 8, 16};
     const unsigned lanes[] = {16, 15, 7, DS4_MOE_X16_MIN_LANES, DS4_MOE_X16_MIN_LANES - 1, 1};
     unsigned counter = 0;
@@ -2197,7 +2198,9 @@ static void check_x16_kernels(void) {
         tile.q = malloc((size_t)nb * DS4_MOE_TILE_Q_STRIDE);
         tile.d = malloc((size_t)nb * DS4_MOE_TILE * sizeof(float));
         tile.bsums = malloc((size_t)nb * DS4_MOE_TILE_BS_STRIDE * sizeof(int16_t));
-        CHECK(tile.q && tile.d && tile.bsums);
+        uint8_t *w0 = malloc((size_t)nb * QK_K), *w1 = malloc((size_t)nb * QK_K);
+        int32_t *ls0 = malloc((size_t)nb * (QK_K / 32) * sizeof(int32_t)), *ls1 = malloc((size_t)nb * (QK_K / 32) * sizeof(int32_t));
+        CHECK(tile.q && tile.d && tile.bsums && w0 && w1 && ls0 && ls1);
         for (unsigned p = 0; p < 24; p++) {
             for (unsigned lane = 0; lane < DS4_MOE_TILE; lane++) {
                 fill_q8_k_row(acts + lane * nb, nb, (p + lane) % 8);
@@ -2211,11 +2214,15 @@ static void check_x16_kernels(void) {
                 tile.n = lanes[l];
                 tile.expert = 0;
                 for (unsigned lane = 0; lane < DS4_MOE_TILE; lane++) tile.pair[lane] = lane;
-                moe_tiles_load_ctx load = { .tiles = &tile, .rows = acts, .iq2_rows = acts_iq2, .nb = nb, .pairs_per_row = 1 };
+                if (tile.n < DS4_MOE_X16_MIN_LANES) continue;   /* the workers use the pair kernels */
+                moe_tiles_load_ctx load = { .tiles = &tile, .rows = acts, .iq2_rows = acts_iq2, .nb = nb,
+                                            .pairs_per_row = 1, .iq2_order = true };
                 moe_tiles_load_worker(&load, 0, 1);
 
                 float out0[DS4_MOE_TILE], out1[DS4_MOE_TILE];
-                moe_iq2_xxs_x16(iq0, iq1, &tile, nb, out0, out1);
+                moe_iq2_xxs_decode_row(iq0, nb, w0, ls0);
+                moe_iq2_xxs_decode_row(iq1, nb, w1, ls1);
+                moe_iq2_xxs_x16(iq0, w0, ls0, iq1, w1, ls1, &tile, nb, out0, out1);
                 for (unsigned lane = 0; lane < DS4_MOE_TILE; lane++) {
                     float ref0 = 0.0f, ref1 = 0.0f;
                     if (lane < tile.n) {
@@ -2225,7 +2232,11 @@ static void check_x16_kernels(void) {
                     quant_equal("IQ2_XXS x16 row0", ref0, out0[lane], nb, p * 100 + lane);
                     quant_equal("IQ2_XXS x16 row1", ref1, out1[lane], nb, p * 100 + lane);
                 }
-                moe_q2_k_x16(q20, q21, &tile, nb, out0, out1);
+                load.iq2_order = false;
+                moe_tiles_load_worker(&load, 0, 1);
+                moe_q2_k_decode_row(q20, nb, w0);
+                moe_q2_k_decode_row(q21, nb, w1);
+                moe_q2_k_x16(q20, w0, q21, w1, &tile, nb, out0, out1);
                 for (unsigned lane = 0; lane < DS4_MOE_TILE; lane++) {
                     float ref0 = 0.0f, ref1 = 0.0f;
                     if (lane < tile.n) {
@@ -2237,9 +2248,11 @@ static void check_x16_kernels(void) {
                 }
             }
         }
+        free(ls1); free(ls0); free(w1); free(w0);
         free(acts_iq2); free(tile.bsums); free(tile.d); free(tile.q);
         quant_free(yb); quant_free(qb1); quant_free(qb0); quant_free(ib1); quant_free(ib0);
     }
+#endif
 }
 
 /* The grouped routed FFN against a per-token re-implementation of the decode

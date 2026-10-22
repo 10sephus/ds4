@@ -12296,7 +12296,7 @@ static void matvec_iq2_xxs_experts_accum_prequant(
 /* The x16 kernels always compute sixteen lanes; a sparser tile costs less
  * through the per-row reference dots. */
 #define DS4_MOE_X16_MIN_LANES 3
-/* Rows per pool task: a (tile, row block) pair. */
+/* Rows per pool task: an (expert, row block) pair. */
 #define DS4_MOE_ROW_BLOCK 32
 /* Tokens per moe_grouped_ffn call.  Tokens are independent, so chunking
  * keeps the outputs and only bounds the transient per-pair buffers (mid,
@@ -12317,7 +12317,11 @@ typedef struct {
 #define DS4_MOE_TILE_Q_STRIDE  (QK_K * DS4_MOE_TILE)
 #define DS4_MOE_TILE_BS_STRIDE (QK_K / 16 * DS4_MOE_TILE)
 
-static void moe_tile_pack(ds4_moe_tile *t, uint32_t nb) {
+/* Interleave the lanes' Q8_K rows for vpdpbusd.  Natural order (down): the
+ * 64 four-byte groups m of a superblock hold elements 4m..4m+3.  IQ2_XXS
+ * order (gate/up): group 16s + m holds elements 16m + s + {0, 4, 8, 12},
+ * the dword m of weight vector s that iq2xxs_block_weights() produces. */
+static void moe_tile_pack(ds4_moe_tile *t, uint32_t nb, bool iq2_order) {
     for (uint32_t i = 0; i < nb; i++) {
         int8_t *q = t->q + (size_t)i * DS4_MOE_TILE_Q_STRIDE;
         float *d = t->d + (size_t)i * DS4_MOE_TILE;
@@ -12331,7 +12335,15 @@ static void moe_tile_pack(ds4_moe_tile *t, uint32_t nb) {
             }
             const block_q8_K *b = t->row[lane] + i;
             d[lane] = b->d;
-            for (uint32_t m = 0; m < QK_K / 4; m++) memcpy(q + (m * DS4_MOE_TILE + lane) * 4, b->qs + m * 4, 4);
+            for (uint32_t m = 0; m < QK_K / 4; m++) {
+                int8_t *dst = q + (m * DS4_MOE_TILE + lane) * 4;
+                if (iq2_order) {
+                    const uint32_t e = (m % 16) * 16 + m / 16;
+                    for (uint32_t k = 0; k < 4; k++) dst[k] = b->qs[e + 4 * k];
+                } else {
+                    memcpy(dst, b->qs + m * 4, 4);
+                }
+            }
             for (uint32_t g = 0; g < QK_K / 16; g++) bs[(g / 2 * DS4_MOE_TILE + lane) * 2 + (g & 1)] = b->bsums[g];
         }
     }
@@ -12343,6 +12355,7 @@ typedef struct {
     const iq2xxs_q8 *iq2_rows; /* rows prepared for the IQ2_XXS pair kernel, NULL for the down phase */
     uint32_t nb;
     uint32_t pairs_per_row; /* n_used when rows are per token, 1 when per pair */
+    bool iq2_order;         /* packed for the IQ2_XXS kernel (gate/up) */
 } moe_tiles_load_ctx;
 
 /* Point every lane at its Q8_K row and, with the x16 kernels, interleave it. */
@@ -12355,7 +12368,7 @@ static void moe_tiles_load_worker(void *vctx, uint64_t t0, uint64_t t1) {
             t->row[lane] = lane < t->n ? ctx->rows + r : NULL;
             t->iq2[lane] = lane < t->n && ctx->iq2_rows ? ctx->iq2_rows + r : NULL;
         }
-        if (DS4_MOE_X16) moe_tile_pack(t, ctx->nb);
+        if (DS4_MOE_X16) moe_tile_pack(t, ctx->nb, ctx->iq2_order);
     }
 }
 
@@ -12366,26 +12379,17 @@ static inline __m512i moe_bcast_u8x4(const uint8_t *p) {
     return _mm512_set1_epi32(v);
 }
 
-/* Decode one IQ2_XXS superblock: 256 weights offset by 128 into the unsigned
- * vpdpbusd operand, plus the eight sub-block scales.  Each group of eight is
- * a grid entry whose ksigns bits, spread to byte masks m, negate as
- * (g ^ m) - m; the tables are the constant ones the scalar kernel reads. */
-static inline void moe_iq2_xxs_decode(const block_iq2_xxs *x, uint8_t *w, int32_t *ls) {
-    const __m128i kmask = _mm_set_epi8(0, 0, 0, 0, 0, 0, 0, 0,
-                                       (char)0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x01);
-    const __m128i bias = _mm_set1_epi8((char)0x80);
-    for (int ib = 0; ib < QK_K / 32; ib++) {
-        uint32_t aux32[2];
-        const uint8_t *aux8 = (const uint8_t *)aux32;
-        memcpy(aux32, x->qs + 4 * ib, sizeof(aux32));
-        ls[ib] = (int32_t)(2 * (aux32[1] >> 28) + 1);
-        for (int l = 0; l < 4; l++) {
-            const __m128i signs = _mm_set1_epi8((char)ksigns_iq2xs[(aux32[1] >> (7 * l)) & 127]);
-            const __m128i m = _mm_cmpeq_epi8(_mm_and_si128(signs, kmask), kmask);
-            __m128i g = _mm_loadl_epi64((const __m128i *)(iq2xxs_grid + aux8[l]));
-            g = _mm_xor_si128(_mm_sub_epi8(_mm_xor_si128(g, m), m), bias);
-            _mm_storel_epi64((__m128i *)(w + ib * 32 + l * 8), g);
-        }
+/* Decode nb superblocks of an IQ2_XXS row for the x16 kernel: the weight
+ * bytes 43 + w of iq2xxs_block_weights() (vector s, dword m holds elements
+ * 16m + s + {0, 4, 8, 12}) and the sub-block scales 2 * nibble + 1. */
+static inline void moe_iq2_xxs_decode_row(const block_iq2_xxs *x, uint32_t nb, uint8_t *w, int32_t *ls) {
+    for (uint32_t i = 0; i < nb; i++) {
+        __m512i u[4], lsv;
+        int32_t lanes[16];
+        iq2xxs_block_weights(x + i, u, &lsv);
+        for (int s = 0; s < 4; s++) _mm512_storeu_si512((void *)(w + (size_t)i * QK_K + s * 64), u[s]);
+        _mm512_storeu_si512((void *)lanes, lsv);
+        for (int ib = 0; ib < QK_K / 32; ib++) ls[i * (QK_K / 32) + ib] = lanes[2 * ib];
     }
 }
 
@@ -12416,148 +12420,170 @@ static inline void moe_q2_k_decode(const block_q2_K *x, uint8_t *w) {
         }
     }
 }
+
+static inline void moe_q2_k_decode_row(const block_q2_K *x, uint32_t nb, uint8_t *w) {
+    for (uint32_t i = 0; i < nb; i++) moe_q2_k_decode(x + i, w + (size_t)i * QK_K);
+}
 #endif
 
-/* Two IQ2_XXS rows (gate and up) against a tile: out0[lane], out1[lane] match
- * ds4_vec_dot_iq2_xxs_q8_K(row, tile->row[lane]) bit for bit. */
+#if DS4_MOE_X16
+/* Two decoded IQ2_XXS rows (gate and up) against a tile in IQ2 order:
+ * out0[lane], out1[lane] match ds4_vec_dot_iq2_xxs_q8_K(row, tile->row[lane])
+ * bit for bit. */
 static void moe_iq2_xxs_x16(
         const block_iq2_xxs *x0,
+        const uint8_t       *w0,
+        const int32_t       *ls0,
         const block_iq2_xxs *x1,
+        const uint8_t       *w1,
+        const int32_t       *ls1,
         const ds4_moe_tile  *t,
         uint32_t             nb,
         float               *out0,
         float               *out1) {
-#if DS4_MOE_X16
-    if (t->n >= DS4_MOE_X16_MIN_LANES) {
-        __m512 sumf0 = _mm512_setzero_ps();
-        __m512 sumf1 = _mm512_setzero_ps();
+    __m512 sumf0 = _mm512_setzero_ps();
+    __m512 sumf1 = _mm512_setzero_ps();
+    const __m512i bias = _mm512_set1_epi16(43);
 
-        for (uint32_t i = 0; i < nb; i++) {
-            uint8_t w0[QK_K], w1[QK_K];
-            int32_t ls0[QK_K / 32], ls1[QK_K / 32];
-            moe_iq2_xxs_decode(x0 + i, w0, ls0);
-            moe_iq2_xxs_decode(x1 + i, w1, ls1);
-            const int8_t *q = t->q + (size_t)i * DS4_MOE_TILE_Q_STRIDE;
-            const int16_t *bs = t->bsums + (size_t)i * DS4_MOE_TILE_BS_STRIDE;
-            __m512i bsum0 = _mm512_setzero_si512();
-            __m512i bsum1 = _mm512_setzero_si512();
+    for (uint32_t i = 0; i < nb; i++) {
+        const int8_t *q = t->q + (size_t)i * DS4_MOE_TILE_Q_STRIDE;
+        const int16_t *bs = t->bsums + (size_t)i * DS4_MOE_TILE_BS_STRIDE;
+        const uint8_t *wb0 = w0 + (size_t)i * QK_K;
+        const uint8_t *wb1 = w1 + (size_t)i * QK_K;
+        __m512i bsum0 = _mm512_setzero_si512();
+        __m512i bsum1 = _mm512_setzero_si512();
 
-            for (int ib = 0; ib < QK_K / 32; ib++) {
-                __m512i d0 = _mm512_setzero_si512();
-                __m512i d1 = _mm512_setzero_si512();
-                for (int k = 0; k < 8; k++) {
-                    const __m512i xv = _mm512_loadu_si512((const void *)(q + (ib * 8 + k) * 64));
-                    d0 = _mm512_dpbusd_epi32(d0, moe_bcast_u8x4(w0 + ib * 32 + k * 4), xv);
-                    d1 = _mm512_dpbusd_epi32(d1, moe_bcast_u8x4(w1 + ib * 32 + k * 4), xv);
+        for (int ib = 0; ib < QK_K / 32; ib++) {
+            /* Sub-block ib is dwords 2ib and 2ib + 1 of the four weight
+             * vectors, and tile group 16s + m holds their activations. */
+            __m512i d0 = _mm512_setzero_si512();
+            __m512i d1 = _mm512_setzero_si512();
+            for (int s = 0; s < 4; s++) {
+                for (int m = 2 * ib; m < 2 * ib + 2; m++) {
+                    const __m512i xv = _mm512_loadu_si512((const void *)(q + (16 * s + m) * 64));
+                    d0 = _mm512_dpbusd_epi32(d0, moe_bcast_u8x4(wb0 + s * 64 + m * 4), xv);
+                    d1 = _mm512_dpbusd_epi32(d1, moe_bcast_u8x4(wb1 + s * 64 + m * 4), xv);
                 }
-                /* (w + 128) . q = w . q + 128 * sum(q) over the sub-block. */
-                const __m512i qsum = _mm512_madd_epi16(
-                    _mm512_loadu_si512((const void *)(bs + ib * 2 * DS4_MOE_TILE)), _mm512_set1_epi16(1));
-                const __m512i corr = _mm512_slli_epi32(qsum, 7);
-                d0 = _mm512_sub_epi32(d0, corr);
-                d1 = _mm512_sub_epi32(d1, corr);
-                bsum0 = _mm512_add_epi32(bsum0, _mm512_mullo_epi32(d0, _mm512_set1_epi32(ls0[ib])));
-                bsum1 = _mm512_add_epi32(bsum1, _mm512_mullo_epi32(d1, _mm512_set1_epi32(ls1[ib])));
             }
-
-            const __m512 yd = _mm512_loadu_ps(t->d + (size_t)i * DS4_MOE_TILE);
-            const __m512 dd0 = _mm512_mul_ps(_mm512_set1_ps(f16_to_f32(x0[i].d)), yd);
-            const __m512 dd1 = _mm512_mul_ps(_mm512_set1_ps(f16_to_f32(x1[i].d)), yd);
-            sumf0 = _mm512_add_ps(sumf0, _mm512_mul_ps(dd0, _mm512_cvtepi32_ps(bsum0)));
-            sumf1 = _mm512_add_ps(sumf1, _mm512_mul_ps(dd1, _mm512_cvtepi32_ps(bsum1)));
+            /* (43 + w) . q = w . q + 43 * sum(q) over the sub-block. */
+            const __m512i corr = _mm512_madd_epi16(
+                _mm512_loadu_si512((const void *)(bs + ib * 2 * DS4_MOE_TILE)), bias);
+            d0 = _mm512_sub_epi32(d0, corr);
+            d1 = _mm512_sub_epi32(d1, corr);
+            bsum0 = _mm512_add_epi32(bsum0, _mm512_mullo_epi32(d0, _mm512_set1_epi32(ls0[i * (QK_K / 32) + ib])));
+            bsum1 = _mm512_add_epi32(bsum1, _mm512_mullo_epi32(d1, _mm512_set1_epi32(ls1[i * (QK_K / 32) + ib])));
         }
 
-        _mm512_storeu_ps(out0, _mm512_mul_ps(_mm512_set1_ps(0.125f), sumf0));
-        _mm512_storeu_ps(out1, _mm512_mul_ps(_mm512_set1_ps(0.125f), sumf1));
-        return;
+        const __m512 yd = _mm512_loadu_ps(t->d + (size_t)i * DS4_MOE_TILE);
+        const __m512 dd0 = _mm512_mul_ps(_mm512_set1_ps(f16_to_f32(x0[i].d)), yd);
+        const __m512 dd1 = _mm512_mul_ps(_mm512_set1_ps(f16_to_f32(x1[i].d)), yd);
+        sumf0 = _mm512_add_ps(sumf0, _mm512_mul_ps(dd0, _mm512_cvtepi32_ps(bsum0)));
+        sumf1 = _mm512_add_ps(sumf1, _mm512_mul_ps(dd1, _mm512_cvtepi32_ps(bsum1)));
     }
-#endif
-    for (uint32_t lane = 0; lane < DS4_MOE_TILE; lane++) {
-        out0[lane] = 0.0f;
-        out1[lane] = 0.0f;
-        if (lane < t->n) {
-            ds4_vec_dot_iq2_xxs_pair_q8_K((int)(nb * QK_K), &out0[lane], &out1[lane], x0, x1, t->iq2[lane]);
-        }
-    }
+
+    _mm512_storeu_ps(out0, _mm512_mul_ps(_mm512_set1_ps(0.125f), sumf0));
+    _mm512_storeu_ps(out1, _mm512_mul_ps(_mm512_set1_ps(0.125f), sumf1));
 }
 
-/* Two Q2_K rows against a tile: out0[lane], out1[lane] match
- * ds4_vec_dot_q2_K_q8_K(row, tile->row[lane]) bit for bit. */
+/* Two decoded Q2_K rows against a tile in natural order: out0[lane],
+ * out1[lane] match ds4_vec_dot_q2_K_q8_K(row, tile->row[lane]) bit for bit. */
 static void moe_q2_k_x16(
         const block_q2_K   *x0,
+        const uint8_t      *w0,
         const block_q2_K   *x1,
+        const uint8_t      *w1,
         const ds4_moe_tile *t,
         uint32_t            nb,
         float              *out0,
         float              *out1) {
-#if DS4_MOE_X16
-    if (t->n >= DS4_MOE_X16_MIN_LANES) {
-        __m512 sumf0 = _mm512_setzero_ps();
-        __m512 sumf1 = _mm512_setzero_ps();
+    __m512 sumf0 = _mm512_setzero_ps();
+    __m512 sumf1 = _mm512_setzero_ps();
 
-        for (uint32_t i = 0; i < nb; i++) {
-            uint8_t w0[QK_K], w1[QK_K];
-            moe_q2_k_decode(x0 + i, w0);
-            moe_q2_k_decode(x1 + i, w1);
-            const int8_t *q = t->q + (size_t)i * DS4_MOE_TILE_Q_STRIDE;
-            const int16_t *bs = t->bsums + (size_t)i * DS4_MOE_TILE_BS_STRIDE;
+    for (uint32_t i = 0; i < nb; i++) {
+        const uint8_t *wb0 = w0 + (size_t)i * QK_K;
+        const uint8_t *wb1 = w1 + (size_t)i * QK_K;
+        const int8_t *q = t->q + (size_t)i * DS4_MOE_TILE_Q_STRIDE;
+        const int16_t *bs = t->bsums + (size_t)i * DS4_MOE_TILE_BS_STRIDE;
 
-            /* Four accumulators per row hide the vpdpbusd latency. */
-            __m512i acc0[4], acc1[4];
-            for (int a = 0; a < 4; a++) {
-                acc0[a] = _mm512_setzero_si512();
-                acc1[a] = _mm512_setzero_si512();
-            }
-            for (int m = 0; m < QK_K / 4; m++) {
-                const __m512i xv = _mm512_loadu_si512((const void *)(q + m * 64));
-                acc0[m & 3] = _mm512_dpbusd_epi32(acc0[m & 3], moe_bcast_u8x4(w0 + m * 4), xv);
-                acc1[m & 3] = _mm512_dpbusd_epi32(acc1[m & 3], moe_bcast_u8x4(w1 + m * 4), xv);
-            }
-            const __m512i isum0 = _mm512_add_epi32(_mm512_add_epi32(acc0[0], acc0[1]),
-                                                   _mm512_add_epi32(acc0[2], acc0[3]));
-            const __m512i isum1 = _mm512_add_epi32(_mm512_add_epi32(acc1[0], acc1[1]),
-                                                   _mm512_add_epi32(acc1[2], acc1[3]));
+        /* Four accumulators per row hide the vpdpbusd latency. */
+        __m512i acc0[4], acc1[4];
+        for (int a = 0; a < 4; a++) {
+            acc0[a] = _mm512_setzero_si512();
+            acc1[a] = _mm512_setzero_si512();
+        }
+        for (int m = 0; m < QK_K / 4; m++) {
+            const __m512i xv = _mm512_loadu_si512((const void *)(q + m * 64));
+            acc0[m & 3] = _mm512_dpbusd_epi32(acc0[m & 3], moe_bcast_u8x4(wb0 + m * 4), xv);
+            acc1[m & 3] = _mm512_dpbusd_epi32(acc1[m & 3], moe_bcast_u8x4(wb1 + m * 4), xv);
+        }
+        const __m512i isum0 = _mm512_add_epi32(_mm512_add_epi32(acc0[0], acc0[1]),
+                                               _mm512_add_epi32(acc0[2], acc0[3]));
+        const __m512i isum1 = _mm512_add_epi32(_mm512_add_epi32(acc1[0], acc1[1]),
+                                               _mm512_add_epi32(acc1[2], acc1[3]));
 
-            /* summs = sum over the 16 blocks of bsums * min, two blocks per madd. */
-            __m512i summs0 = _mm512_setzero_si512();
-            __m512i summs1 = _mm512_setzero_si512();
-            for (int p = 0; p < QK_K / 32; p++) {
-                const __m512i bsv = _mm512_loadu_si512((const void *)(bs + p * 2 * DS4_MOE_TILE));
-                const int32_t m0 = (x0[i].scales[2 * p] >> 4) | ((x0[i].scales[2 * p + 1] >> 4) << 16);
-                const int32_t m1 = (x1[i].scales[2 * p] >> 4) | ((x1[i].scales[2 * p + 1] >> 4) << 16);
-                summs0 = _mm512_add_epi32(summs0, _mm512_madd_epi16(bsv, _mm512_set1_epi32(m0)));
-                summs1 = _mm512_add_epi32(summs1, _mm512_madd_epi16(bsv, _mm512_set1_epi32(m1)));
-            }
-
-            const __m512 yd = _mm512_loadu_ps(t->d + (size_t)i * DS4_MOE_TILE);
-            const __m512 dall0 = _mm512_mul_ps(yd, _mm512_set1_ps(f16_to_f32(x0[i].d)));
-            const __m512 dmin0 = _mm512_mul_ps(yd, _mm512_set1_ps(f16_to_f32(x0[i].dmin)));
-            const __m512 dall1 = _mm512_mul_ps(yd, _mm512_set1_ps(f16_to_f32(x1[i].d)));
-            const __m512 dmin1 = _mm512_mul_ps(yd, _mm512_set1_ps(f16_to_f32(x1[i].dmin)));
-            sumf0 = _mm512_add_ps(sumf0, _mm512_sub_ps(_mm512_mul_ps(dall0, _mm512_cvtepi32_ps(isum0)),
-                                                       _mm512_mul_ps(dmin0, _mm512_cvtepi32_ps(summs0))));
-            sumf1 = _mm512_add_ps(sumf1, _mm512_sub_ps(_mm512_mul_ps(dall1, _mm512_cvtepi32_ps(isum1)),
-                                                       _mm512_mul_ps(dmin1, _mm512_cvtepi32_ps(summs1))));
+        /* summs = sum over the 16 blocks of bsums * min, two blocks per madd. */
+        __m512i summs0 = _mm512_setzero_si512();
+        __m512i summs1 = _mm512_setzero_si512();
+        for (int p = 0; p < QK_K / 32; p++) {
+            const __m512i bsv = _mm512_loadu_si512((const void *)(bs + p * 2 * DS4_MOE_TILE));
+            const int32_t m0 = (x0[i].scales[2 * p] >> 4) | ((x0[i].scales[2 * p + 1] >> 4) << 16);
+            const int32_t m1 = (x1[i].scales[2 * p] >> 4) | ((x1[i].scales[2 * p + 1] >> 4) << 16);
+            summs0 = _mm512_add_epi32(summs0, _mm512_madd_epi16(bsv, _mm512_set1_epi32(m0)));
+            summs1 = _mm512_add_epi32(summs1, _mm512_madd_epi16(bsv, _mm512_set1_epi32(m1)));
         }
 
-        _mm512_storeu_ps(out0, sumf0);
-        _mm512_storeu_ps(out1, sumf1);
-        return;
+        const __m512 yd = _mm512_loadu_ps(t->d + (size_t)i * DS4_MOE_TILE);
+        const __m512 dall0 = _mm512_mul_ps(yd, _mm512_set1_ps(f16_to_f32(x0[i].d)));
+        const __m512 dmin0 = _mm512_mul_ps(yd, _mm512_set1_ps(f16_to_f32(x0[i].dmin)));
+        const __m512 dall1 = _mm512_mul_ps(yd, _mm512_set1_ps(f16_to_f32(x1[i].d)));
+        const __m512 dmin1 = _mm512_mul_ps(yd, _mm512_set1_ps(f16_to_f32(x1[i].dmin)));
+        sumf0 = _mm512_add_ps(sumf0, _mm512_sub_ps(_mm512_mul_ps(dall0, _mm512_cvtepi32_ps(isum0)),
+                                                   _mm512_mul_ps(dmin0, _mm512_cvtepi32_ps(summs0))));
+        sumf1 = _mm512_add_ps(sumf1, _mm512_sub_ps(_mm512_mul_ps(dall1, _mm512_cvtepi32_ps(isum1)),
+                                                   _mm512_mul_ps(dmin1, _mm512_cvtepi32_ps(summs1))));
     }
+
+    _mm512_storeu_ps(out0, sumf0);
+    _mm512_storeu_ps(out1, sumf1);
+}
 #endif
-    for (uint32_t lane = 0; lane < DS4_MOE_TILE; lane++) {
-        out0[lane] = 0.0f;
-        out1[lane] = 0.0f;
-        if (lane < t->n) {
-            ds4_vec_dot_q2_K_q8_K((int)(nb * QK_K), &out0[lane], x0, t->row[lane]);
-            ds4_vec_dot_q2_K_q8_K((int)(nb * QK_K), &out1[lane], x1, t->row[lane]);
-        }
+
+/* The tiles of one expert, contiguous in the tile array. */
+typedef struct {
+    uint32_t tile0;
+    uint32_t n_tiles;
+} moe_expert_tiles;
+
+/* Experts with the most tiles first: the pool claims tasks in order, so the
+ * long tasks start early and the sparse experts fill the tail. */
+static int moe_expert_tiles_cmp(const void *a, const void *b) {
+    const uint32_t na = ((const moe_expert_tiles *)a)->n_tiles;
+    const uint32_t nb = ((const moe_expert_tiles *)b)->n_tiles;
+    return na < nb ? 1 : na > nb ? -1 : 0;
+}
+
+/* Task = (expert, row block), lower row halves first: the tasks below the
+ * midpoint cover the half of every expert's rows model_place_weights() put
+ * on node 0, so the pool's node split reads local pages. */
+static void moe_task_split(uint64_t task, uint32_t n_groups, uint32_t n_row_blocks,
+                           uint32_t *group, uint32_t *row_block) {
+    const uint32_t nrb0 = n_row_blocks / 2;
+    const uint64_t n0 = (uint64_t)n_groups * nrb0;
+    if (task < n0) {
+        *group = (uint32_t)(task / nrb0);
+        *row_block = (uint32_t)(task % nrb0);
+    } else {
+        const uint32_t nrb1 = n_row_blocks - nrb0;
+        task -= n0;
+        *group = (uint32_t)(task / nrb1);
+        *row_block = nrb0 + (uint32_t)(task % nrb1);
     }
 }
 
 typedef struct {
     float *mid;                 /* [pair][mid_dim] */
     const ds4_moe_tile *tiles;
+    const moe_expert_tiles *groups;
     const uint8_t *gate;        /* expert 0, row 0 */
     const uint8_t *up;
     const float *pair_weight;
@@ -12565,37 +12591,65 @@ typedef struct {
     uint64_t up_row_bytes;
     uint64_t out_dim;
     uint32_t nb;
+    uint32_t n_groups;
     uint32_t n_row_blocks;
     float clamp;
 } moe_mid_tile_ctx;
 
-/* Task = (tile, row block): gate/up rows of the tile's expert against the
- * tile, then the same clamp, SwiGLU and router weight as the decode path. */
+/* Each gate/up row pair of the task is decoded once and run against every
+ * tile of the expert, then the same clamp, SwiGLU and router weight as the
+ * decode path.  Only a lone tile can be too sparse for the x16 kernel. */
 static void moe_mid_tile_worker(void *vctx, uint64_t task0, uint64_t task1) {
     moe_mid_tile_ctx *ctx = vctx;
+    const uint32_t nb = ctx->nb;
+#if DS4_MOE_X16
+    uint8_t w0[nb * QK_K], w1[nb * QK_K];
+    int32_t ls0[nb * (QK_K / 32)], ls1[nb * (QK_K / 32)];
+#endif
 
     for (uint64_t task = task0; task < task1; task++) {
-        const ds4_moe_tile *t = ctx->tiles + task / ctx->n_row_blocks;
-        const uint64_t row0 = (task % ctx->n_row_blocks) * DS4_MOE_ROW_BLOCK;
+        uint32_t gi, rb;
+        moe_task_split(task, ctx->n_groups, ctx->n_row_blocks, &gi, &rb);
+        const moe_expert_tiles *g = ctx->groups + gi;
+        const ds4_moe_tile *tiles = ctx->tiles + g->tile0;
+        const uint64_t row0 = (uint64_t)rb * DS4_MOE_ROW_BLOCK;
         const uint64_t row1 = row0 + DS4_MOE_ROW_BLOCK < ctx->out_dim ? row0 + DS4_MOE_ROW_BLOCK : ctx->out_dim;
-        const uint8_t *gate = ctx->gate + (uint64_t)t->expert * ctx->out_dim * ctx->gate_row_bytes;
-        const uint8_t *up = ctx->up + (uint64_t)t->expert * ctx->out_dim * ctx->up_row_bytes;
+        const uint8_t *gate = ctx->gate + (uint64_t)tiles->expert * ctx->out_dim * ctx->gate_row_bytes;
+        const uint8_t *up = ctx->up + (uint64_t)tiles->expert * ctx->out_dim * ctx->up_row_bytes;
 
         for (uint64_t row = row0; row < row1; row++) {
-            float g[DS4_MOE_TILE], u[DS4_MOE_TILE];
-            moe_iq2_xxs_x16((const block_iq2_xxs *)(gate + row * ctx->gate_row_bytes),
-                            (const block_iq2_xxs *)(up + row * ctx->up_row_bytes),
-                            t, ctx->nb, g, u);
-            for (uint32_t lane = 0; lane < t->n; lane++) {
-                float gate_v = g[lane];
-                float up_v = u[lane];
-                if (ctx->clamp > 1.0e-6f) {
-                    if (gate_v > ctx->clamp) gate_v = ctx->clamp;
-                    if (up_v > ctx->clamp) up_v = ctx->clamp;
-                    if (up_v < -ctx->clamp) up_v = -ctx->clamp;
+            const block_iq2_xxs *x0 = (const block_iq2_xxs *)(gate + row * ctx->gate_row_bytes);
+            const block_iq2_xxs *x1 = (const block_iq2_xxs *)(up + row * ctx->up_row_bytes);
+#if DS4_MOE_X16
+            if (tiles->n >= DS4_MOE_X16_MIN_LANES) {
+                moe_iq2_xxs_decode_row(x0, nb, w0, ls0);
+                moe_iq2_xxs_decode_row(x1, nb, w1, ls1);
+            }
+#endif
+            for (uint32_t ti = 0; ti < g->n_tiles; ti++) {
+                const ds4_moe_tile *t = tiles + ti;
+                float gv[DS4_MOE_TILE], uv[DS4_MOE_TILE];
+#if DS4_MOE_X16
+                if (t->n >= DS4_MOE_X16_MIN_LANES) {
+                    moe_iq2_xxs_x16(x0, w0, ls0, x1, w1, ls1, t, nb, gv, uv);
+                } else
+#endif
+                {
+                    for (uint32_t lane = 0; lane < t->n; lane++) {
+                        ds4_vec_dot_iq2_xxs_pair_q8_K((int)(nb * QK_K), &gv[lane], &uv[lane], x0, x1, t->iq2[lane]);
+                    }
                 }
-                ctx->mid[(uint64_t)t->pair[lane] * ctx->out_dim + row] =
-                    silu(gate_v) * up_v * ctx->pair_weight[t->pair[lane]];
+                for (uint32_t lane = 0; lane < t->n; lane++) {
+                    float gate_v = gv[lane];
+                    float up_v = uv[lane];
+                    if (ctx->clamp > 1.0e-6f) {
+                        if (gate_v > ctx->clamp) gate_v = ctx->clamp;
+                        if (up_v > ctx->clamp) up_v = ctx->clamp;
+                        if (up_v < -ctx->clamp) up_v = -ctx->clamp;
+                    }
+                    ctx->mid[(uint64_t)t->pair[lane] * ctx->out_dim + row] =
+                        silu(gate_v) * up_v * ctx->pair_weight[t->pair[lane]];
+                }
             }
         }
     }
@@ -12604,32 +12658,61 @@ static void moe_mid_tile_worker(void *vctx, uint64_t task0, uint64_t task1) {
 typedef struct {
     float *down_pair;           /* [pair][out_dim] */
     const ds4_moe_tile *tiles;
+    const moe_expert_tiles *groups;
     const uint8_t *down;        /* expert 0, row 0 */
     uint64_t row_bytes;
     uint64_t out_dim;           /* even */
     uint32_t nb;
+    uint32_t n_groups;
     uint32_t n_row_blocks;
 } moe_down_tile_ctx;
 
-/* Task = (tile, row block): two down rows per pass share the tile loads. */
+/* Two down rows per pass, decoded once, share the tile loads of every tile
+ * of the expert. */
 static void moe_down_tile_worker(void *vctx, uint64_t task0, uint64_t task1) {
     moe_down_tile_ctx *ctx = vctx;
+    const uint32_t nb = ctx->nb;
+#if DS4_MOE_X16
+    uint8_t w0[nb * QK_K], w1[nb * QK_K];
+#endif
 
     for (uint64_t task = task0; task < task1; task++) {
-        const ds4_moe_tile *t = ctx->tiles + task / ctx->n_row_blocks;
-        const uint64_t row0 = (task % ctx->n_row_blocks) * DS4_MOE_ROW_BLOCK;
+        uint32_t gi, rb;
+        moe_task_split(task, ctx->n_groups, ctx->n_row_blocks, &gi, &rb);
+        const moe_expert_tiles *g = ctx->groups + gi;
+        const ds4_moe_tile *tiles = ctx->tiles + g->tile0;
+        const uint64_t row0 = (uint64_t)rb * DS4_MOE_ROW_BLOCK;
         const uint64_t row1 = row0 + DS4_MOE_ROW_BLOCK < ctx->out_dim ? row0 + DS4_MOE_ROW_BLOCK : ctx->out_dim;
-        const uint8_t *down = ctx->down + (uint64_t)t->expert * ctx->out_dim * ctx->row_bytes;
+        const uint8_t *down = ctx->down + (uint64_t)tiles->expert * ctx->out_dim * ctx->row_bytes;
 
         for (uint64_t row = row0; row < row1; row += 2) {
-            float v0[DS4_MOE_TILE], v1[DS4_MOE_TILE];
-            moe_q2_k_x16((const block_q2_K *)(down + row * ctx->row_bytes),
-                         (const block_q2_K *)(down + (row + 1) * ctx->row_bytes),
-                         t, ctx->nb, v0, v1);
-            for (uint32_t lane = 0; lane < t->n; lane++) {
-                float *out = ctx->down_pair + (uint64_t)t->pair[lane] * ctx->out_dim + row;
-                out[0] = v0[lane];
-                out[1] = v1[lane];
+            const block_q2_K *x0 = (const block_q2_K *)(down + row * ctx->row_bytes);
+            const block_q2_K *x1 = (const block_q2_K *)(down + (row + 1) * ctx->row_bytes);
+#if DS4_MOE_X16
+            if (tiles->n >= DS4_MOE_X16_MIN_LANES) {
+                moe_q2_k_decode_row(x0, nb, w0);
+                moe_q2_k_decode_row(x1, nb, w1);
+            }
+#endif
+            for (uint32_t ti = 0; ti < g->n_tiles; ti++) {
+                const ds4_moe_tile *t = tiles + ti;
+                float v0[DS4_MOE_TILE], v1[DS4_MOE_TILE];
+#if DS4_MOE_X16
+                if (t->n >= DS4_MOE_X16_MIN_LANES) {
+                    moe_q2_k_x16(x0, w0, x1, w1, t, nb, v0, v1);
+                } else
+#endif
+                {
+                    for (uint32_t lane = 0; lane < t->n; lane++) {
+                        ds4_vec_dot_q2_K_q8_K((int)(nb * QK_K), &v0[lane], x0, t->row[lane]);
+                        ds4_vec_dot_q2_K_q8_K((int)(nb * QK_K), &v1[lane], x1, t->row[lane]);
+                    }
+                }
+                for (uint32_t lane = 0; lane < t->n; lane++) {
+                    float *out = ctx->down_pair + (uint64_t)t->pair[lane] * ctx->out_dim + row;
+                    out[0] = v0[lane];
+                    out[1] = v1[lane];
+                }
             }
         }
     }
@@ -12732,8 +12815,12 @@ static void moe_grouped_ffn(
     int8_t *tile_q = DS4_MOE_X16 ? xmalloc((size_t)n_tiles * nb_max * DS4_MOE_TILE_Q_STRIDE) : NULL;
     float *tile_d = DS4_MOE_X16 ? xmalloc((size_t)n_tiles * nb_max * DS4_MOE_TILE * sizeof(float)) : NULL;
     int16_t *tile_bs = DS4_MOE_X16 ? xmalloc((size_t)n_tiles * nb_max * DS4_MOE_TILE_BS_STRIDE * sizeof(int16_t)) : NULL;
+    moe_expert_tiles *groups = xmalloc((size_t)DS4_N_EXPERT * sizeof(groups[0]));
+    uint32_t n_groups = 0;
     uint32_t ti = 0;
     for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+        if (counts[e + 1] == counts[e]) continue;
+        groups[n_groups].tile0 = ti;
         for (uint32_t off = counts[e]; off < counts[e + 1]; off += DS4_MOE_TILE, ti++) {
             ds4_moe_tile *t = tiles + ti;
             const uint32_t left = counts[e + 1] - off;
@@ -12746,17 +12833,22 @@ static void moe_grouped_ffn(
             t->d = DS4_MOE_X16 ? tile_d + (size_t)ti * nb_max * DS4_MOE_TILE : NULL;
             t->bsums = DS4_MOE_X16 ? tile_bs + (size_t)ti * nb_max * DS4_MOE_TILE_BS_STRIDE : NULL;
         }
+        groups[n_groups].n_tiles = ti - groups[n_groups].tile0;
+        n_groups++;
     }
+    qsort(groups, n_groups, sizeof(groups[0]), moe_expert_tiles_cmp);
     free(pair_ids);
 
     /* Gate/up over the token activations. */
-    moe_tiles_load_ctx load_ctx = { .tiles = tiles, .rows = xq, .iq2_rows = xq_iq2, .nb = nb_in, .pairs_per_row = n_used };
+    moe_tiles_load_ctx load_ctx = { .tiles = tiles, .rows = xq, .iq2_rows = xq_iq2, .nb = nb_in,
+                                    .pairs_per_row = n_used, .iq2_order = true };
     ds4_parallel_for_min_rows(n_tiles, moe_tiles_load_worker, &load_ctx, 1);
 
     float *mid = pf_buf(PF_MOE_MID, (size_t)total_pairs * mid_dim * sizeof(mid[0]));
     moe_mid_tile_ctx mid_ctx = {
         .mid = mid,
         .tiles = tiles,
+        .groups = groups,
         .gate = gate,
         .up = up,
         .pair_weight = pair_weight,
@@ -12764,10 +12856,11 @@ static void moe_grouped_ffn(
         .up_row_bytes = up_row_bytes,
         .out_dim = mid_dim,
         .nb = nb_in,
+        .n_groups = n_groups,
         .n_row_blocks = (uint32_t)((mid_dim + DS4_MOE_ROW_BLOCK - 1) / DS4_MOE_ROW_BLOCK),
         .clamp = clamp,
     };
-    ds4_parallel_for_min_rows((uint64_t)n_tiles * mid_ctx.n_row_blocks, moe_mid_tile_worker, &mid_ctx, 1);
+    ds4_parallel_for_min_rows((uint64_t)n_groups * mid_ctx.n_row_blocks, moe_mid_tile_worker, &mid_ctx, 1);
 
     /* Down over the requantized mids, one Q8_K row per pair. */
     block_q8_K *midq = pf_buf(PF_MOE_MIDQ, (size_t)total_pairs * nb_mid * sizeof(midq[0]));
@@ -12781,13 +12874,16 @@ static void moe_grouped_ffn(
     moe_down_tile_ctx down_ctx = {
         .down_pair = down_pair,
         .tiles = tiles,
+        .groups = groups,
         .down = down,
         .row_bytes = down_row_bytes,
         .out_dim = out_dim,
         .nb = nb_mid,
+        .n_groups = n_groups,
         .n_row_blocks = (uint32_t)((out_dim + DS4_MOE_ROW_BLOCK - 1) / DS4_MOE_ROW_BLOCK),
     };
-    ds4_parallel_for_min_rows((uint64_t)n_tiles * down_ctx.n_row_blocks, moe_down_tile_worker, &down_ctx, 1);
+    ds4_parallel_for_min_rows((uint64_t)n_groups * down_ctx.n_row_blocks, moe_down_tile_worker, &down_ctx, 1);
+    free(groups);
     free(tile_bs);
     free(tile_d);
     free(tile_q);
