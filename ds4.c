@@ -17026,12 +17026,37 @@ static int indexer_candidate_cmp(const void *a, const void *b) {
     return (x->index > y->index) - (x->index < y->index);
 }
 
+/* Moves the first k candidates in indexer_candidate_cmp order to cand[0..k),
+ * in no particular order among themselves: quickselect around the middle
+ * element, O(n) expected.  The comparator is a strict total order (equal
+ * scores fall back to the index), so the set is the one a full sort gives. */
+static void indexer_select_first(indexer_candidate *cand, uint32_t n, uint32_t k) {
+    uint32_t lo = 0, hi = n;
+    while (hi - lo > 1 && lo < k && k < hi) {
+        /* The lower middle: a pivot at hi - 1 would leave a two-element
+         * range unsplit. */
+        const indexer_candidate pivot = cand[lo + (hi - lo - 1) / 2];
+        uint32_t i = lo, j = hi;
+        for (;;) {
+            while (indexer_candidate_cmp(&cand[i], &pivot) < 0) i++;
+            do j--; while (indexer_candidate_cmp(&cand[j], &pivot) > 0);
+            if (i >= j) break;
+            const indexer_candidate t = cand[i];
+            cand[i++] = cand[j];
+            cand[j] = t;
+        }
+        /* cand[lo..j] precede or equal the pivot, cand[j+1..hi) follow it. */
+        if (k <= j) hi = j + 1; else lo = j + 1;
+    }
+}
+
 /* Same allowed set as the reference selection, top_k argmax rounds each taking
  * the lowest index with the strictly greatest score among the rows not yet
  * chosen, starting from DS4_NEG_INF: a row that never compares greater than
  * DS4_NEG_INF (NaN or lower) is never a candidate, and once the candidates run
- * out every remaining round falls back to row 0.  Sorting the candidates is
- * O(n log n) instead of O(top_k * n).  cand is scratch of n_comp entries. */
+ * out every remaining round falls back to row 0.  Selecting the first top_k
+ * candidates is O(n) instead of O(top_k * n).  cand is scratch of n_comp
+ * entries. */
 static void indexer_select_top_k(
         bool              * allowed,
         indexer_candidate * cand,
@@ -17042,13 +17067,13 @@ static void indexer_select_top_k(
     for (uint32_t c = 0; c < n_comp; c++) {
         if (scores[c] > DS4_NEG_INF) cand[n_cand++] = (indexer_candidate){ scores[c], c };
     }
-    qsort(cand, n_cand, sizeof(cand[0]), indexer_candidate_cmp);
 
     memset(allowed, 0, (size_t)n_comp * sizeof(allowed[0]));
     if (n_cand < top_k) {
         allowed[0] = true;
         top_k = n_cand;
     }
+    indexer_select_first(cand, n_cand, top_k);
     for (uint32_t k = 0; k < top_k; k++) allowed[cand[k].index] = true;
 }
 
