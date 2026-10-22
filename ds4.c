@@ -4007,11 +4007,26 @@ static void ds4_place_worker(void *vctx, uint64_t i0, uint64_t i1) {
                 nodes[k] = r->node;
             }
             if (r->node < 0) continue;
-            if (syscall(SYS_move_pages, 0, n, addrs, nodes, status, DS4_MPOL_MF_MOVE) < 0) {
+            /* Ask where the pages are and move only the misplaced ones: a
+             * move_pages() call that moves drains the LRU caches of every
+             * CPU even when no page has to move, which made a pass over
+             * pages placed by an earlier run take seconds; the query does
+             * not. */
+            if (syscall(SYS_move_pages, 0, n, addrs, NULL, status, 0) < 0) {
                 failed += n;
                 continue;
             }
+            uint64_t m = 0;
             for (uint64_t k = 0; k < n; k++) {
+                if (status[k] == r->node) ok++;
+                else addrs[m++] = addrs[k];
+            }
+            if (m == 0) continue;
+            if (syscall(SYS_move_pages, 0, m, addrs, nodes, status, DS4_MPOL_MF_MOVE) < 0) {
+                failed += m;
+                continue;
+            }
+            for (uint64_t k = 0; k < m; k++) {
                 if (status[k] >= 0) ok++;
                 else if (status[k] == -EACCES) eacces++;
                 else failed++;
