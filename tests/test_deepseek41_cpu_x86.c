@@ -321,6 +321,205 @@ static void check_q4_tails(void) {
 }
 #endif
 
+/* A random V4.1 Q2 layer with eight experts, its tensors packed in one
+ * mapping: what the staged FFN and attention projections read. */
+typedef struct {
+    test_buffer map;
+    ds4_model m;
+    ds4_tensor t[32];
+    uint32_t n;
+    uint64_t used;
+} test_layer;
+
+static const ds4_tensor *test_tensor(test_layer *tl, uint32_t type, uint64_t d0,
+                                     uint64_t d1, uint64_t d2) {
+    ds4_tensor *t = &tl->t[tl->n++];
+    uint64_t row_bytes;
+    CHECK(tl->n <= 32 && tensor_nbytes(type, d0, &row_bytes));
+    *t = (ds4_tensor){.type = type, .ndim = d2 ? 3 : d1 ? 2 : 1, .dim = {d0, d1 ? d1 : 1, d2 ? d2 : 1},
+                      .elements = d0 * (d1 ? d1 : 1) * (d2 ? d2 : 1),
+                      .bytes = row_bytes * (d1 ? d1 : 1) * (d2 ? d2 : 1), .abs_offset = tl->used};
+    tl->used = (tl->used + t->bytes + 63) / 64 * 64;
+    CHECK(tl->used <= tl->map.mapped - (size_t)sysconf(_SC_PAGESIZE));
+    uint8_t *data = tl->map.data + t->abs_offset;
+    if (type == DS4_TENSOR_F32) {
+        for (uint64_t i = 0; i < t->elements; i++) ((float *)data)[i] = test_float();
+    } else if (type == DS4_TENSOR_F16) {
+        for (uint64_t i = 0; i < t->elements; i++) ((uint16_t *)data)[i] = test_half();
+    } else {
+        test_fill_quants(data, t->bytes, type);
+    }
+    return t;
+}
+
+static void test_layer_init(test_layer *tl, ds4_layer_weights *l) {
+    memset(tl, 0, sizeof(*tl));
+    memset(l, 0, sizeof(*l));
+    tl->map = test_alloc((size_t)400 << 20);
+    tl->m = (ds4_model){.map = tl->map.data, .size = (uint64_t)400 << 20};
+    l->hc_attn_fn = test_tensor(tl, DS4_TENSOR_F16, 20480, 24, 0);
+    l->hc_attn_scale = test_tensor(tl, DS4_TENSOR_F32, 3, 0, 0);
+    l->hc_attn_base = test_tensor(tl, DS4_TENSOR_F32, 24, 0, 0);
+    l->hc_ffn_fn = test_tensor(tl, DS4_TENSOR_F16, 20480, 24, 0);
+    l->hc_ffn_scale = test_tensor(tl, DS4_TENSOR_F32, 3, 0, 0);
+    l->hc_ffn_base = test_tensor(tl, DS4_TENSOR_F32, 24, 0, 0);
+    l->ffn_gate_inp = test_tensor(tl, DS4_TENSOR_F32, 5120, 8, 0);
+    l->ffn_exp_probs_b = test_tensor(tl, DS4_TENSOR_F32, 8, 0, 0);
+    l->ffn_gate_shexp = test_tensor(tl, DS4_TENSOR_Q8_0, 5120, 2304, 0);
+    l->ffn_up_shexp = test_tensor(tl, DS4_TENSOR_Q8_0, 5120, 2304, 0);
+    l->ffn_down_shexp = test_tensor(tl, DS4_TENSOR_Q8_0, 2304, 5120, 0);
+    l->ffn_gate_exps = test_tensor(tl, DS4_TENSOR_IQ2_XXS, 5120, 2304, 8);
+    l->ffn_up_exps = test_tensor(tl, DS4_TENSOR_IQ2_XXS, 5120, 2304, 8);
+    l->ffn_down_exps = test_tensor(tl, DS4_TENSOR_Q2_K, 2304, 5120, 8);
+    l->attn_q_a = test_tensor(tl, DS4_TENSOR_Q8_0, 5120, 1280, 0);
+    l->attn_q_a_norm = test_tensor(tl, DS4_TENSOR_F32, 1280, 0, 0);
+    l->attn_q_b = test_tensor(tl, DS4_TENSOR_Q8_0, 1280, 32768, 0);
+    l->attn_kv = test_tensor(tl, DS4_TENSOR_Q8_0, 5120, 512, 0);
+    l->attn_kv_a_norm = test_tensor(tl, DS4_TENSOR_F32, 512, 0, 0);
+    l->attn_compressor_kv = test_tensor(tl, DS4_TENSOR_F16, 5120, 512, 0);
+    l->attn_compressor_gate = test_tensor(tl, DS4_TENSOR_F16, 5120, 512, 0);
+    l->attn_compressor_norm = test_tensor(tl, DS4_TENSOR_F32, 512, 0, 0);
+    l->indexer_attn_k = test_tensor(tl, DS4_TENSOR_F16, 512, 128, 0);
+    l->indexer_k_norm = test_tensor(tl, DS4_TENSOR_F32, 128, 0, 0);
+    l->indexer_attn_q_b = test_tensor(tl, DS4_TENSOR_F16, 1280, 4096, 0);
+    l->indexer_proj = test_tensor(tl, DS4_TENSOR_F16, 5120, 32, 0);
+    l->attn_sinks = test_tensor(tl, DS4_TENSOR_F32, 64, 0, 0);
+    l->attn_output_a = test_tensor(tl, DS4_TENSOR_Q8_0, 4096, 8192, 0);
+    l->attn_output_b = test_tensor(tl, DS4_TENSOR_Q8_0, 8192, 5120, 0);
+    l->ffn_norm = test_tensor(tl, DS4_TENSOR_F32, 5120, 0, 0);
+}
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+/* The staged FFN against the plain path: same split, block and HC state. */
+static void check_ffn_graph(test_layer *tl, const ds4_layer_weights *l) {
+    ds41_cpu_state *a = calloc(1, sizeof(*a)), *b = calloc(1, sizeof(*b));
+    CHECK(a && b);
+    a->model = &tl->m;
+    for (uint32_t i = 0; i < 4 * 5120; i++) a->after_attn[i] = ds41_cpu_bf16(test_float());
+    for (uint32_t i = 0; i < 5120; i++) a->norm[i] = ds41_cpu_bf16(test_float());
+    memcpy(b, a, sizeof(*a));
+    const ds41_cpu_hc_job ha = ds41_cpu_hc_mixer(a, l, true), hb = ds41_cpu_hc_mixer(b, l, true);
+    CHECK(ds41_cpu_hc_run(&ha) && ds41_cpu_moe(a, l));
+    ds41_cpu_hc_expand(a->residual, a->block, a->after_attn, a->ffn_split);
+    CHECK(ds41_cpu_ffn_graph_supported(l, &hb));
+    ds41_cpu_ffn_graph_run(b, l, &hb);
+    test_equal("FFN split", a->ffn_split, b->ffn_split, 24);
+    test_equal("FFN block", a->block, b->block, 5120);
+    test_equal("FFN HC state", a->residual, b->residual, 4 * 5120);
+    for (uint32_t i = 0; i < 4 * 5120; i++) CHECK(isfinite(b->residual[i]));
+    free(b); free(a);
+}
+
+/* The staged attention projections against the plain path for a KV source
+ * layer of each compression ratio and an index-only layer, over enough
+ * positions to publish rows and select from them. */
+static void check_proj_graph(test_layer *tl, const ds4_layer_weights *l) {
+    static const uint32_t layers[] = {2, 20, 24};
+    for (size_t li = 0; li < sizeof(layers) / sizeof(*layers); li++) {
+        const uint32_t il = layers[li];
+        ds41_cpu_attention_state *a = ds41_cpu_attention_create(64);
+        ds41_cpu_attention_state *b = ds41_cpu_attention_create(64);
+        float *norm = malloc(5120 * sizeof(float)), *residual = malloc(4 * 5120 * sizeof(float));
+        float *flat[2], *mix[2], *split[2];
+        CHECK(a && b && norm && residual);
+        for (int k = 0; k < 2; k++) {
+            flat[k] = malloc(4 * 5120 * sizeof(float));
+            mix[k] = malloc(24 * sizeof(float));
+            split[k] = malloc(24 * sizeof(float));
+            CHECK(flat[k] && mix[k] && split[k]);
+        }
+        /* Layers above 20 read the index rows layer 20 published. */
+        for (uint32_t r = 0; r < 64 * 128; r++)
+            a->index_cache[3][r] = b->index_cache[3][r] = ds41_cpu_bf16(test_float());
+        for (uint32_t pos = 0; pos < 12; pos++) {
+            for (uint32_t i = 0; i < 5120; i++) norm[i] = ds41_cpu_bf16(test_float());
+            for (uint32_t i = 0; i < 4 * 5120; i++) residual[i] = ds41_cpu_bf16(test_float());
+            ds41_cpu_hc_job h[2];
+            for (int k = 0; k < 2; k++)
+                h[k] = (ds41_cpu_hc_job){.m = &tl->m, .fn = l->hc_attn_fn,
+                    .scale = l->hc_attn_scale, .base = l->hc_attn_base, .state = residual,
+                    .flat = flat[k], .mix = mix[k], .split = split[k]};
+            const uint32_t ratio = ds4_layer_compress_ratio(il);
+            const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
+            const bool index = n_comp && ds41_index_source(il);
+            const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
+            CHECK(ds41_cpu_attention_project(a, &tl->m, l, il, pos, norm, &h[0]));
+            CHECK(ds41_cpu_proj_graph_supported(l, il, index, &h[1]));
+            CHECK(ds41_cpu_proj_graph_run(b, &tl->m, l, il, pos, norm, index, &h[1]));
+            ds41_cpu_rope(b->q, 512, 64, pos, ratio != 0, false);
+            if (index) ds41_cpu_attention_rank(b, il, owner, n_comp);
+            test_equal("proj split", split[0], split[1], 24);
+            test_equal("proj qr", a->qr, b->qr, 1280);
+            test_equal("proj q", a->q, b->q, 64 * 512);
+            for (uint32_t i = 0; i < 64 * 512; i++) CHECK(isfinite(b->q[i]));
+            for (uint32_t i = 0; i < 24; i++) CHECK(isfinite(split[1][i]));
+            test_equal("proj window", a->window[il], b->window[il], 128 * 512);
+            test_equal("proj compressed", a->compressed[owner], b->compressed[owner],
+                       (size_t)a->comp_cap[owner] * 512);
+            test_equal("proj index cache", a->index_cache[owner], b->index_cache[owner],
+                       (size_t)a->comp_cap[owner] * 128);
+            test_equal("proj previous", a->previous_kv[0], b->previous_kv[0], 3 * 512);
+            if (index) {
+                test_equal("proj index q", a->index_q, b->index_q, 32 * 128);
+                test_equal("proj index weights", a->index_weights, b->index_weights, 32);
+                CHECK(memcmp(a->selected_comp, b->selected_comp, sizeof(a->selected_comp)) == 0);
+            }
+        }
+        for (int k = 0; k < 2; k++) { free(flat[k]); free(mix[k]); free(split[k]); }
+        free(residual); free(norm);
+        ds41_cpu_attention_free(b); ds41_cpu_attention_free(a);
+    }
+}
+#endif
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+/* The staged heads, output projections and HC post against the plain
+ * sequence of ds41_cpu_attention_forward() and ds41_cpu_hc_post_run(). */
+static void check_out_graph(test_layer *tl, const ds4_layer_weights *l) {
+    static const uint32_t rows[] = {1, 17, 130, 640};
+    ds41_cpu_attention_state *a = ds41_cpu_attention_create(64);
+    ds41_cpu_attention_state *b = ds41_cpu_attention_create(64);
+    ds41_cpu_state *sa = calloc(1, sizeof(*sa)), *sb = calloc(1, sizeof(*sb));
+    CHECK(a && b && sa && sb);
+    for (size_t ri = 0; ri < sizeof(rows) / sizeof(*rows); ri++) {
+        const uint32_t n = rows[ri], pos = 700 + (uint32_t)ri;
+        for (uint32_t i = 0; i < n * 512; i++) a->attended_kv[i] = test_float();
+        for (uint32_t i = 0; i < 64 * 512; i++) a->q[i] = test_float();
+        for (uint32_t i = 0; i < 4 * 5120; i++) sa->residual[i] = ds41_cpu_bf16(test_float());
+        for (uint32_t i = 0; i < 24; i++) sa->attn_split[i] = test_float();
+        memcpy(b->attended_kv, a->attended_kv, n * 512 * sizeof(float));
+        memcpy(b->q, a->q, sizeof(a->q));
+        memcpy(sb->residual, sa->residual, sizeof(sa->residual));
+        memcpy(sb->attn_split, sa->attn_split, sizeof(sa->attn_split));
+        ds41_cpu_hc_post_job post[2];
+        ds41_cpu_state *st[2] = {sa, sb};
+        for (int k = 0; k < 2; k++)
+            post[k] = (ds41_cpu_hc_post_job){.m = &tl->m, .norm_weight = l->ffn_norm,
+                .block = st[k]->block, .residual = st[k]->residual, .split = st[k]->attn_split,
+                .after = st[k]->after_attn, .x = st[k]->x, .norm = st[k]->norm};
+        ds41_cpu_attention_heads(a, tensor_data(&tl->m, l->attn_sinks), n);
+        ds41_cpu_bf16_rows(a->heads, 64u * 512u);
+        ds41_cpu_rope(a->heads, 512, 64, pos, true, true);
+        ds41_cpu_matvec_q8_grouped(a->low, &tl->m, l->attn_output_a, a->heads, 1024u, 4096u);
+        ds41_cpu_bf16_rows(a->low, 8192u);
+        CHECK(ds41_cpu_matvec(sa->block, &tl->m, l->attn_output_b, a->low, false));
+        ds41_cpu_bf16_rows(sa->block, 5120);
+        CHECK(ds41_cpu_hc_post_run(&post[0]));
+        CHECK(ds41_cpu_out_graph_supported(l, &post[1]));
+        ds41_cpu_out_graph_run(b, &tl->m, l, pos, true, n, sb->block, &post[1]);
+        test_equal("out heads", a->heads, b->heads, 64 * 512);
+        test_equal("out low", a->low, b->low, 8192);
+        test_equal("out block", sa->block, sb->block, 5120);
+        test_equal("out HC state", sa->after_attn, sb->after_attn, 4 * 5120);
+        test_equal("out FFN input", sa->x, sb->x, 5120);
+        test_equal("out FFN norm", sa->norm, sb->norm, 5120);
+        for (uint32_t i = 0; i < 5120; i++) CHECK(isfinite(sb->norm[i]));
+    }
+    free(sb); free(sa);
+    ds41_cpu_attention_free(b); ds41_cpu_attention_free(a);
+}
+#endif
+
 int main(void) {
     const ds4_shape saved = g_ds4_shape;
 #if defined(__AVX512F__) && defined(__AVX512BW__)
@@ -351,6 +550,28 @@ int main(void) {
     }
     g_numa.on = numa;
     g_requested_threads = 0;
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    {
+        g_ds4_shape = DS4_SHAPE_FLASH41;
+        g_ds4_shape.n_expert = 8;
+        const uint32_t ratios[40] = {[2] = 2, [20] = 1, [24] = 1};
+        memcpy(g_ds4_compress_ratios, ratios, sizeof(ratios));
+        test_layer tl;
+        ds4_layer_weights l;
+        test_layer_init(&tl, &l);
+        for (size_t i = 0; i < sizeof(threads) / sizeof(*threads); i++) {
+            g_requested_threads = threads[i];
+            check_ffn_graph(&tl, &l);
+            check_proj_graph(&tl, &l);
+            check_out_graph(&tl, &l);
+            ds4_threads_shutdown();
+            printf("V4.1 CPU staged FFN, projections and output bitwise checks: %u threads PASS\n",
+                   threads[i]);
+        }
+        g_requested_threads = 0;
+        test_free(tl.map);
+    }
+#endif
     g_ds4_shape = saved;
 #if !defined(__AVX512F__) || !defined(__AVX512BW__)
     puts("AVX512 unavailable at compile time: scalar fallback checked");
