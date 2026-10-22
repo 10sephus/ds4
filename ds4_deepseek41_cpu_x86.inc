@@ -630,6 +630,38 @@ static void ds41_cpu_q8_batch_worker(void *vctx, uint64_t first, uint64_t last) 
     }
 }
 
+/* The same for two tiles (32 rows) at once, which share every x broadcast:
+ * the chunk's x rows, read again for every tile, are the larger stream of
+ * a batched matmul.  group_rows must be a multiple of 32. */
+static void ds41_cpu_q8_batch2_worker(void *vctx, uint64_t first, uint64_t last) {
+    const ds41_cpu_q8_batch_ctx *c = vctx;
+    const __m512i offsets = ds41_cpu_row_offsets(c->row_bytes);
+    __m512 wa[32], wb[32], acca[DS41_CPU_PASS], accb[DS41_CPU_PASS];
+    const float *xp[DS41_CPU_PASS];
+    for (uint64_t unit = first; unit < last; unit++) {
+        const uint64_t row = unit * 32;
+        const uint8_t *rows = c->data + row * c->row_bytes;
+        const float *x = c->x + row / c->group_rows * c->group_in;
+        for (uint32_t t0 = 0; t0 < c->n; t0 += DS41_CPU_PASS) {
+            const uint32_t nt = c->n - t0 < DS41_CPU_PASS ? c->n - t0 : DS41_CPU_PASS;
+            for (uint32_t t = 0; t < nt; t++) {
+                acca[t] = accb[t] = _mm512_setzero_ps();
+                xp[t] = x + (uint64_t)(t0 + t) * c->x_stride;
+            }
+            for (uint64_t b = 0; b < c->in_dim / 32; b++) {
+                ds41_cpu_q8_decode16(wa, rows + b * 34, offsets);
+                ds41_cpu_q8_decode16(wb, rows + 16 * c->row_bytes + b * 34, offsets);
+                ds41_cpu_apply16x2(acca, accb, wa, wb, xp, nt, b * 32, 32);
+            }
+            for (uint32_t t = 0; t < nt; t++) {
+                float *out = c->out + (uint64_t)(t0 + t) * c->out_stride + row;
+                _mm512_storeu_ps(out, c->round ? ds41_cpu_bf16_16(acca[t]) : acca[t]);
+                _mm512_storeu_ps(out + 16, c->round ? ds41_cpu_bf16_16(accb[t]) : accb[t]);
+            }
+        }
+    }
+}
+
 /* out[t * out_stride + r] = row r of an F16 matrix times x[t * x_stride] for
  * n tokens, optionally rounded to BF16, as matvec_f16 computes each token:
  * dot_f16_rows converts a weight with VCVTPH2PS, multiplies it by x and adds
@@ -918,7 +950,12 @@ static bool ds41_cpu_matmul_q8(float *out, uint64_t out_stride, const ds4_model 
         .out_stride = out_stride, .in_dim = t->dim[0], .row_bytes = t->dim[0] / 32 * 34,
         .group_rows = group_rows, .group_in = group_in, .n = n, .round = round,
     };
-    ds4_parallel_for_min_rows(rows / 16, ds41_cpu_q8_batch_worker, &ctx, 1);
+    /* Tile pairs when they still give every thread a unit. */
+    ds4_threads_init();
+    if (group_rows % 32 == 0 && rows / 32 >= g_pool.n_threads)
+        ds4_parallel_for_min_rows(rows / 32, ds41_cpu_q8_batch2_worker, &ctx, 1);
+    else
+        ds4_parallel_for_min_rows(rows / 16, ds41_cpu_q8_batch_worker, &ctx, 1);
     return true;
 #else
     (void)out; (void)out_stride; (void)m; (void)t; (void)x; (void)x_stride;
