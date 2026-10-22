@@ -17232,9 +17232,8 @@ static void layer_attention_raw_swa_batch(
         dsv4_fp8_kv_quantize_row_inplace_cpu(kv_t, DS4_N_HEAD_DIM, DS4_N_ROT);
         /* The raw cache holds F16-rounded rows.  Round the batch row the same
          * way so the prefix attention below reads exactly what decode reads
-         * back from the cache (the push's own rounding is then a no-op). */
+         * back from the cache. */
         for (uint32_t i = 0; i < DS4_N_HEAD_DIM; i++) kv_t[i] = f16_to_f32(f32_to_f16(kv_t[i]));
-        kv_cache_push_raw(cache, kv_t);
         if (profile) t_tl_rope_cache += now_sec() - tx;
 
         if (ratio == 0) continue;
@@ -17295,6 +17294,15 @@ static void layer_attention_raw_swa_batch(
 
         comp_counts[t] = cache->n_comp;
     }
+
+    /* The raw cache ends up holding the last cap_raw rows in position order,
+     * already F16-rounded: write that window once instead of pushing every
+     * row, which slides the whole window per token once it is full. */
+    const uint32_t n_all = raw_base + n_tok;
+    const uint32_t n_keep = n_all < cache->cap_raw ? n_all : cache->cap_raw;
+    memcpy(cache->raw_kv, kv_all + (uint64_t)(n_all - n_keep) * DS4_N_HEAD_DIM,
+           (size_t)n_keep * DS4_N_HEAD_DIM * sizeof(cache->raw_kv[0]));
+    cache->n_raw = n_keep;
 
     tx = profile ? now_sec() : 0.0;
     layer_attention_prefix_batch(heads, model, layer,
