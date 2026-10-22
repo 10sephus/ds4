@@ -1139,6 +1139,7 @@ typedef struct {
 
     bool *index_allowed;
     float *index_q;
+    float *index_qt;
     float *index_weights;
     float *index_scores;
 
@@ -14447,6 +14448,7 @@ static void cpu_decode_scratch_init(ds4_cpu_decode_scratch *scratch, uint32_t ct
 
     scratch->index_allowed = xmalloc((size_t)comp_cap * sizeof(bool));
     scratch->index_q = xmalloc((size_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+    scratch->index_qt = xmalloc((size_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
     scratch->index_weights = xmalloc((size_t)DS4_N_INDEXER_HEAD * sizeof(float));
     scratch->index_scores = xmalloc((size_t)comp_cap * sizeof(float));
 
@@ -14504,6 +14506,7 @@ static void cpu_decode_scratch_free(ds4_cpu_decode_scratch *scratch) {
     free(scratch->ffn_cur);
     free(scratch->index_scores);
     free(scratch->index_weights);
+    free(scratch->index_qt);
     free(scratch->index_q);
     free(scratch->index_allowed);
     free(scratch->comp_pooled);
@@ -15141,7 +15144,132 @@ static void layer_attention_prefix_batch(
 }
 
 /* Ratio-4 layers use an auxiliary indexer to select which compressed rows are
- * visible to attention.  This is the CPU allocation-owning helper. */
+ * visible to attention.  Scoring is row-parallel: each compressed row keeps
+ * the serial per-head accumulation order, so the scores do not depend on how
+ * the rows are split across threads. */
+typedef struct {
+    float       * scores;
+    const float * q;          /* [n_head][head_dim] */
+    const float * qt;         /* [head_dim][n_head]: q transposed for lane-per-head dots */
+    const float * weights;
+    const float * index_comp;
+} indexer_score_ctx;
+
+static void indexer_score_rows_worker(void *vctx, uint64_t row0, uint64_t row1) {
+    const indexer_score_ctx *ctx = vctx;
+    const uint32_t head_dim = DS4_N_INDEXER_HEAD_DIM;
+    const uint32_t n_head = DS4_N_INDEXER_HEAD;
+    for (uint64_t c = row0; c < row1; c++) {
+        const float *kv = ctx->index_comp + c * head_dim;
+        float s = 0.0f;
+        uint32_t h = 0;
+#if defined(DS4_NO_GPU) && defined(__AVX512F__)
+        /* Sixteen heads per vector.  Every lane repeats the scalar dot_f32
+         * sequence (separate multiply and add, ascending i), so the dots are
+         * bitwise identical to the serial path. */
+        for (; h + 16 <= n_head; h += 16) {
+            const float *qt = ctx->qt + h;
+            __m512 acc = _mm512_setzero_ps();
+            for (uint32_t i = 0; i < head_dim; i++) {
+                acc = _mm512_add_ps(acc, _mm512_mul_ps(_mm512_set1_ps(kv[i]),
+                                                       _mm512_loadu_ps(qt + (uint64_t)i * n_head)));
+            }
+            float dots[16];
+            _mm512_storeu_ps(dots, acc);
+            for (uint32_t j = 0; j < 16; j++) {
+                float dot = dots[j];
+                if (dot < 0.0f) dot = 0.0f;
+                s += dot * ctx->weights[h + j];
+            }
+        }
+#endif
+        for (; h < n_head; h++) {
+            const float *qh = ctx->q + (uint64_t)h * head_dim;
+            float dot = dot_f32(kv, qh, head_dim);
+            if (dot < 0.0f) dot = 0.0f;
+            s += dot * ctx->weights[h];
+        }
+        ctx->scores[c] = s;
+    }
+}
+
+/* qt is caller scratch of n_head * head_dim floats for the transposed query. */
+static void indexer_score_rows(
+        float       * scores,
+        float       * qt,
+        const float * q,
+        const float * weights,
+        const float * index_comp,
+        uint32_t      n_comp) {
+#if defined(DS4_NO_GPU) && defined(__AVX512F__)
+    const uint32_t head_dim = DS4_N_INDEXER_HEAD_DIM;
+    const uint32_t n_head = DS4_N_INDEXER_HEAD;
+    for (uint32_t h = 0; h < n_head; h++) {
+        for (uint32_t i = 0; i < head_dim; i++) {
+            qt[(uint64_t)i * n_head + h] = q[(uint64_t)h * head_dim + i];
+        }
+    }
+#endif
+    indexer_score_ctx ctx = {
+        .scores = scores,
+        .q = q,
+        .qt = qt,
+        .weights = weights,
+        .index_comp = index_comp,
+    };
+    ds4_parallel_for_min_rows(n_comp, indexer_score_rows_worker, &ctx, 1);
+}
+
+/* top_k rounds, each taking the lowest index with the strictly greatest score
+ * among the rows not yet chosen. */
+static void indexer_select_top_k(bool *allowed, const float *scores, uint32_t n_comp, uint32_t top_k) {
+    memset(allowed, 0, (size_t)n_comp * sizeof(allowed[0]));
+    for (uint32_t k = 0; k < top_k; k++) {
+        uint32_t best = 0;
+        float best_score = DS4_NEG_INF;
+        for (uint32_t c = 0; c < n_comp; c++) {
+            if (!allowed[c] && scores[c] > best_score) {
+                best = c;
+                best_score = scores[c];
+            }
+        }
+        allowed[best] = true;
+    }
+}
+
+/* Indexer query and head weights for one token.  Decode passes its scratch so
+ * the projections avoid allocation; prefill passes NULL. */
+static void indexer_query_decode_one(
+        float                   * q,
+        float                   * weights,
+        const ds4_model         * model,
+        const ds4_layer_weights * layer,
+        const float             * cur,
+        const float             * qr_norm,
+        uint32_t                  il,
+        uint32_t                  pos,
+        ds4_cpu_decode_scratch  * scratch) {
+    const uint32_t head_dim = DS4_N_INDEXER_HEAD_DIM;
+    const uint32_t n_head = DS4_N_INDEXER_HEAD;
+
+    if (scratch) {
+        matvec_any_decode_scratch(q, model, layer->indexer_attn_q_b, qr_norm, scratch);
+    } else {
+        matvec_any(q, model, layer->indexer_attn_q_b, qr_norm);
+    }
+    rope_tail_layer_inplace(q, n_head, head_dim, DS4_N_ROT, pos, il, false);
+    dsv4_indexer_qat_rows_inplace_cpu(q, n_head, head_dim);
+
+    if (scratch) {
+        matvec_any_decode_scratch(weights, model, layer->indexer_proj, cur, scratch);
+    } else {
+        matvec_any(weights, model, layer->indexer_proj, cur);
+    }
+    const float scale = 1.0f / sqrtf((float)(head_dim * n_head));
+    for (uint32_t h = 0; h < n_head; h++) weights[h] *= scale;
+}
+
+/* CPU allocation-owning helper. */
 static bool *indexer_allowed_decode_one(
         const ds4_model         * model,
         const ds4_layer_weights * layer,
@@ -15160,46 +15288,19 @@ static bool *indexer_allowed_decode_one(
         return allowed;
     }
 
-    const uint32_t head_dim = DS4_N_INDEXER_HEAD_DIM;
-    const uint32_t n_head = DS4_N_INDEXER_HEAD;
-    float *q = xmalloc((size_t)head_dim * n_head * sizeof(q[0]));
-    float *weights = xmalloc((size_t)n_head * sizeof(weights[0]));
+    const size_t q_dim = (size_t)DS4_N_INDEXER_HEAD_DIM * DS4_N_INDEXER_HEAD;
+    float *q = xmalloc(q_dim * sizeof(q[0]));
+    float *qt = xmalloc(q_dim * sizeof(qt[0]));
+    float *weights = xmalloc((size_t)DS4_N_INDEXER_HEAD * sizeof(weights[0]));
     float *scores = xmalloc((size_t)n_comp * sizeof(scores[0]));
 
-    matvec_any(q, model, layer->indexer_attn_q_b, qr_norm);
-    rope_tail_layer_inplace(q, n_head, head_dim, DS4_N_ROT, pos, il, false);
-    dsv4_indexer_qat_rows_inplace_cpu(q, n_head, head_dim);
-
-    matvec_any(weights, model, layer->indexer_proj, cur);
-    const float scale = 1.0f / sqrtf((float)(head_dim * n_head));
-    for (uint32_t h = 0; h < n_head; h++) weights[h] *= scale;
-
-    for (uint32_t c = 0; c < n_comp; c++) {
-        const float *kv = index_comp + (uint64_t)c * head_dim;
-        float s = 0.0f;
-        for (uint32_t h = 0; h < n_head; h++) {
-            const float *qh = q + (uint64_t)h * head_dim;
-            float dot = dot_f32(kv, qh, head_dim);
-            if (dot < 0.0f) dot = 0.0f;
-            s += dot * weights[h];
-        }
-        scores[c] = s;
-    }
-
-    for (uint32_t k = 0; k < top_k; k++) {
-        uint32_t best = 0;
-        float best_score = DS4_NEG_INF;
-        for (uint32_t c = 0; c < n_comp; c++) {
-            if (!allowed[c] && scores[c] > best_score) {
-                best = c;
-                best_score = scores[c];
-            }
-        }
-        allowed[best] = true;
-    }
+    indexer_query_decode_one(q, weights, model, layer, cur, qr_norm, il, pos, NULL);
+    indexer_score_rows(scores, qt, q, weights, index_comp, n_comp);
+    indexer_select_top_k(allowed, scores, n_comp, top_k);
 
     free(scores);
     free(weights);
+    free(qt);
     free(q);
     return allowed;
 }
@@ -15219,51 +15320,17 @@ static bool *indexer_allowed_decode_one_decode_scratch(
     if (n_comp > scratch->comp_cap) ds4_die("CPU decode indexer scratch buffer is too small");
 
     bool *allowed = scratch->index_allowed;
-    memset(allowed, 0, (size_t)n_comp * sizeof(allowed[0]));
     const uint32_t top_k = DS4_N_INDEXER_TOP_K < n_comp ? DS4_N_INDEXER_TOP_K : n_comp;
     if (top_k == n_comp) {
         for (uint32_t i = 0; i < n_comp; i++) allowed[i] = true;
         return allowed;
     }
 
-    const uint32_t head_dim = DS4_N_INDEXER_HEAD_DIM;
-    const uint32_t n_head = DS4_N_INDEXER_HEAD;
-    float *q = scratch->index_q;
-    float *weights = scratch->index_weights;
-    float *scores = scratch->index_scores;
-
-    matvec_any_decode_scratch(q, model, layer->indexer_attn_q_b, qr_norm, scratch);
-    rope_tail_layer_inplace(q, n_head, head_dim, DS4_N_ROT, pos, il, false);
-    dsv4_indexer_qat_rows_inplace_cpu(q, n_head, head_dim);
-
-    matvec_any_decode_scratch(weights, model, layer->indexer_proj, cur, scratch);
-    const float scale = 1.0f / sqrtf((float)(head_dim * n_head));
-    for (uint32_t h = 0; h < n_head; h++) weights[h] *= scale;
-
-    for (uint32_t c = 0; c < n_comp; c++) {
-        const float *kv = index_comp + (uint64_t)c * head_dim;
-        float s = 0.0f;
-        for (uint32_t h = 0; h < n_head; h++) {
-            const float *qh = q + (uint64_t)h * head_dim;
-            float dot = dot_f32(kv, qh, head_dim);
-            if (dot < 0.0f) dot = 0.0f;
-            s += dot * weights[h];
-        }
-        scores[c] = s;
-    }
-
-    for (uint32_t k = 0; k < top_k; k++) {
-        uint32_t best = 0;
-        float best_score = DS4_NEG_INF;
-        for (uint32_t c = 0; c < n_comp; c++) {
-            if (!allowed[c] && scores[c] > best_score) {
-                best = c;
-                best_score = scores[c];
-            }
-        }
-        allowed[best] = true;
-    }
-
+    indexer_query_decode_one(scratch->index_q, scratch->index_weights, model, layer,
+                             cur, qr_norm, il, pos, scratch);
+    indexer_score_rows(scratch->index_scores, scratch->index_qt, scratch->index_q,
+                       scratch->index_weights, index_comp, n_comp);
+    indexer_select_top_k(allowed, scratch->index_scores, n_comp, top_k);
     return allowed;
 }
 

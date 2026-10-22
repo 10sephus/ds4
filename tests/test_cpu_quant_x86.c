@@ -212,8 +212,111 @@ static void check_block_dots(void) {
     }
 }
 
+/* Serial indexer reference: the platform's serial dot_f32 order (scalar
+ * ascending i on x86), per-head accumulation in head order, then the argmax
+ * rounds of the original loop (strict '>' from DS4_NEG_INF, so NaN and -inf
+ * rows are never picked and exhausted rounds fall back to row 0). */
+static void indexer_oracle(bool *allowed, float *scores, const float *q, const float *weights,
+                           const float *comp, unsigned n_comp, unsigned top_k) {
+    const unsigned n_head = DS4_N_INDEXER_HEAD, head_dim = DS4_N_INDEXER_HEAD_DIM;
+    for (unsigned c = 0; c < n_comp; c++) {
+        float s = 0.0f;
+        for (unsigned h = 0; h < n_head; h++) {
+#if defined(__ARM_NEON)
+            float dot = dot_f32(comp + c * head_dim, q + h * head_dim, head_dim);
+#else
+            float dot = 0.0f;
+            for (unsigned i = 0; i < head_dim; i++) dot += comp[c * head_dim + i] * q[h * head_dim + i];
+#endif
+            if (dot < 0.0f) dot = 0.0f;
+            s += dot * weights[h];
+        }
+        scores[c] = s;
+    }
+    memset(allowed, 0, n_comp * sizeof(allowed[0]));
+    for (unsigned k = 0; k < top_k; k++) {
+        unsigned best = 0;
+        float best_score = DS4_NEG_INF;
+        for (unsigned c = 0; c < n_comp; c++) {
+            if (!allowed[c] && scores[c] > best_score) { best = c; best_score = scores[c]; }
+        }
+        allowed[best] = true;
+    }
+}
+
+static float indexer_random_float(void) {
+    return (float)(int32_t)quant_random() * 0x1p-31f;
+}
+
+/* Scores feed comparisons only, so a NaN of any payload is the same score. */
+static void indexer_scores_equal(const float *expected, const float *actual, unsigned n) {
+    for (unsigned c = 0; c < n; c++) {
+        uint32_t a, b;
+        memcpy(&a, &expected[c], sizeof(a)); memcpy(&b, &actual[c], sizeof(b));
+        if (a != b && !(expected[c] != expected[c] && actual[c] != actual[c])) {
+            fprintf(stderr, "indexer score %u: %08x != %08x (%g != %g)\n", c, a, b, expected[c], actual[c]);
+            exit(1);
+        }
+    }
+}
+
+static void check_indexer(void) {
+    const ds4_shape saved = g_ds4_shape;
+    const unsigned counts[] = {513, 600, 1500};
+    const unsigned heads[] = {64, 20};
+    const float specials[] = {NAN, INFINITY, -INFINITY, 0x1p-140f, -0x1p-140f, 0x1p100f};
+    g_ds4_shape.n_indexer_head_dim = 128;
+    for (unsigned hi = 0; hi < sizeof(heads) / sizeof(*heads); hi++) {
+        g_ds4_shape.n_indexer_head = heads[hi];
+        const unsigned n_head = DS4_N_INDEXER_HEAD, dim = DS4_N_INDEXER_HEAD_DIM;
+        float *q = xmalloc((size_t)n_head * dim * sizeof(float));
+        float *qt = xmalloc((size_t)n_head * dim * sizeof(float));
+        float *weights = xmalloc(n_head * sizeof(float));
+        for (unsigned ci = 0; ci < sizeof(counts) / sizeof(*counts); ci++) {
+            const unsigned n_comp = counts[ci], top_k = 512;
+            float *comp = xmalloc((size_t)n_comp * dim * sizeof(float));
+            float *scores = xmalloc(n_comp * sizeof(float));
+            float *expected = xmalloc(n_comp * sizeof(float));
+            bool *allowed = xmalloc(n_comp * sizeof(bool));
+            bool *allowed_expected = xmalloc(n_comp * sizeof(bool));
+            for (unsigned repeat = 0; repeat < 4; repeat++) {
+                /* Random values round at every step, so any reassociation
+                 * or fused multiply-add shows; the coarse pass and the
+                 * duplicated rows make exact score ties common; the last pass
+                 * also plants NaN, infinities, huge and denormal values. */
+                const bool coarse = repeat == 1;
+                for (unsigned j = 0; j < n_head * dim; j++) {
+                    q[j] = coarse ? (float)(int)(indexer_random_float() * 8.0f) * 0.25f : indexer_random_float();
+                }
+                for (unsigned h = 0; h < n_head; h++) weights[h] = (float)(int)(indexer_random_float() * 8.0f) * 0.125f;
+                for (unsigned j = 0; j < n_comp * dim; j++) {
+                    comp[j] = coarse ? (float)(int)(indexer_random_float() * 8.0f) * 0.25f : indexer_random_float();
+                }
+                for (unsigned c = 0; c < n_comp; c += 7) {
+                    memcpy(comp + (size_t)c * dim, comp + (size_t)(c / 2) * dim, dim * sizeof(float));
+                }
+                if (repeat == 3) {
+                    for (unsigned c = 0; c < n_comp; c += 29) {
+                        comp[(size_t)c * dim + c % dim] = specials[(c / 29) % 6];
+                    }
+                }
+                indexer_oracle(allowed_expected, expected, q, weights, comp, n_comp, top_k);
+                indexer_score_rows(scores, qt, q, weights, comp, n_comp);
+                indexer_scores_equal(expected, scores, n_comp);
+                indexer_select_top_k(allowed, scores, n_comp, top_k);
+                CHECK(memcmp(allowed, allowed_expected, n_comp * sizeof(bool)) == 0);
+            }
+            free(allowed_expected); free(allowed); free(expected); free(scores); free(comp);
+        }
+        free(weights); free(qt); free(q);
+    }
+    g_ds4_shape = saved;
+}
+
 int main(void) {
     check_integer_dots();
+    check_indexer();
+    puts("CPU indexer row-parallel scoring and top-k selection oracle PASS");
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     puts("CPU ARM DOTPROD IQ2_XXS/Q2_K integer oracles PASS");
     puts("Block FP oracle skipped: existing ARM DOTPROD accumulation order differs");
