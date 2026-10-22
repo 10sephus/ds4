@@ -594,6 +594,60 @@ static void ds41_cpu_q8_batch_worker(void *vctx, uint64_t first, uint64_t last) 
     }
 }
 
+/* F32 rows times many tokens with matvec_f32_worker's double chain for each
+ * (row, token): (double)w * x added in input order, rounded to float at the
+ * end.  SIMD lanes are eight tokens of xt, the inputs as [group][i][8]
+ * doubles; four rows run at once for independent chains. */
+typedef struct {
+    const float *w, *x;
+    double *xt;
+    float *out;
+    uint64_t in_dim, rows, x_stride, out_stride;
+    uint32_t n, groups;
+} ds41_cpu_f32_batch_ctx;
+
+static void ds41_cpu_f32_transpose_worker(void *vctx, uint64_t first, uint64_t last) {
+    const ds41_cpu_f32_batch_ctx *c = vctx;
+    for (uint64_t g = first; g < last; g++) {
+        double *xt = c->xt + g * c->in_dim * 8;
+        for (uint32_t lane = 0; lane < 8; lane++) {
+            const uint64_t t = g * 8 + lane;
+            const float *x = c->x + t * c->x_stride;
+            for (uint64_t i = 0; i < c->in_dim; i++)
+                xt[i * 8 + lane] = t < c->n ? (double)x[i] : 0.0;
+        }
+    }
+}
+
+static void ds41_cpu_f32_batch_worker(void *vctx, uint64_t first, uint64_t last) {
+    const ds41_cpu_f32_batch_ctx *c = vctx;
+    for (uint64_t unit = first; unit < last; unit++) {
+        const uint64_t g = unit % c->groups, r0 = unit / c->groups * 4;
+        const uint64_t nr = c->rows - r0 < 4 ? c->rows - r0 : 4;
+        const double *x = c->xt + g * c->in_dim * 8;
+        const float *w0 = c->w + r0 * c->in_dim;
+        const float *w1 = nr > 1 ? w0 + c->in_dim : w0;
+        const float *w2 = nr > 2 ? w0 + 2 * c->in_dim : w0;
+        const float *w3 = nr > 3 ? w0 + 3 * c->in_dim : w0;
+        __m512d a0 = _mm512_setzero_pd(), a1 = a0, a2 = a0, a3 = a0;
+        for (uint64_t i = 0; i < c->in_dim; i++) {
+            const __m512d xv = _mm512_loadu_pd(x + i * 8);
+            a0 = _mm512_add_pd(a0, _mm512_mul_pd(_mm512_set1_pd((double)w0[i]), xv));
+            a1 = _mm512_add_pd(a1, _mm512_mul_pd(_mm512_set1_pd((double)w1[i]), xv));
+            a2 = _mm512_add_pd(a2, _mm512_mul_pd(_mm512_set1_pd((double)w2[i]), xv));
+            a3 = _mm512_add_pd(a3, _mm512_mul_pd(_mm512_set1_pd((double)w3[i]), xv));
+        }
+        double acc[4][8];
+        _mm512_storeu_pd(acc[0], a0);
+        _mm512_storeu_pd(acc[1], a1);
+        _mm512_storeu_pd(acc[2], a2);
+        _mm512_storeu_pd(acc[3], a3);
+        for (uint64_t r = 0; r < nr; r++)
+            for (uint64_t lane = 0; lane < 8 && g * 8 + lane < c->n; lane++)
+                c->out[(g * 8 + lane) * c->out_stride + r0 + r] = (float)acc[r][lane];
+    }
+}
+
 /* Routed experts of a token chunk grouped by expert: entries
  * [first[u], first[u + 1]) are token * 6 + slot pairs of the u-th distinct
  * expert, in token order.  mid and partial are indexed by entry. */
@@ -785,6 +839,29 @@ static bool ds41_cpu_matmul_q8(float *out, uint64_t out_stride, const ds4_model 
 #else
     (void)out; (void)out_stride; (void)m; (void)t; (void)x; (void)x_stride;
     (void)n; (void)group_rows; (void)group_in; (void)round;
+    return false;
+#endif
+}
+
+/* n tokens through an F32 matrix, each output bitwise matvec_f32_worker's.
+ * xt holds (n + 7) / 8 * 8 * in_dim doubles of scratch.  Returns false,
+ * having done nothing, when the batched kernel does not apply. */
+static bool ds41_cpu_matmul_f32(float *out, uint64_t out_stride, const ds4_model *m,
+                                const ds4_tensor *t, const float *x, uint64_t x_stride,
+                                uint32_t n, double *xt) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    if (t->type != DS4_TENSOR_F32 || t->ndim != 2 || !t->dim[0] || !t->dim[1] || !n)
+        return false;
+    ds41_cpu_f32_batch_ctx ctx = {
+        .w = tensor_data(m, t), .x = x, .xt = xt, .out = out, .in_dim = t->dim[0],
+        .rows = t->dim[1], .x_stride = x_stride, .out_stride = out_stride,
+        .n = n, .groups = (n + 7) / 8,
+    };
+    ds4_parallel_for_min_rows(ctx.groups, ds41_cpu_f32_transpose_worker, &ctx, 1);
+    ds4_parallel_for_min_rows((ctx.rows + 3) / 4 * ctx.groups, ds41_cpu_f32_batch_worker, &ctx, 1);
+    return true;
+#else
+    (void)out; (void)out_stride; (void)m; (void)t; (void)x; (void)x_stride; (void)n; (void)xt;
     return false;
 #endif
 }

@@ -211,14 +211,15 @@ static void ds41_cpu_hc_post_norm(void *vctx) {
 /* Per-token activations of a layer-major prefill chunk (see ds41_cpu_prefill),
  * allocated with the first chunk: about 1 MB per token. */
 #define DS41_CPU_BATCH 512u
-#define DS41_CPU_BATCH_TOKEN_BYTES (4u * (4u * 4u * 5120u + 3u * 5120u + 52u + 1280u + \
+#define DS41_CPU_BATCH_TOKEN_BYTES (4u * (3u * 4u * 5120u + 4u * 5120u + 52u + 1280u + \
     2u * 64u * 512u + 512u + 8192u + 2u * 24u * 256u + 5u * 5120u + 3u * 2304u + \
-    6u * (2304u + 5120u + 1u) + 6u + 48u + 6u + 512u))
+    6u * (2304u + 5120u + 1u) + 6u + 48u + 6u + 512u + 24u + 384u + 2u * 4u * 5120u))
 typedef struct ds41_cpu_batch {
     float *residual, *after_attn, *flat, *x, *norm, *block, *shared;
     float *pre, *attn_split, *ffn_split, *qr, *q, *kv, *heads, *low;
     float *rows, *engram_kv, *shared_gate, *shared_up, *shared_mid;
-    float *mid, *partial, *weight;
+    float *mid, *partial, *weight, *mix, *probs;
+    double *xt;
     int *selected;
     uint32_t *ids, *entry, *sel;
 } ds41_cpu_batch;
@@ -381,20 +382,6 @@ static ds41_cpu_hc_job ds41_cpu_hc_mixer(ds41_cpu_state *s, const ds4_layer_weig
         .flat = s->flat_norm, .mix = s->mix,
         .split = ffn ? s->ffn_split : s->attn_split,
     };
-}
-
-/* The HC mixer of in (the attention mixer of the HC state, the FFN mixer of
- * the state after attention) into split; flat and mix are scratch. */
-static bool ds41_cpu_hc_mix_into(const ds4_model *m, const ds4_layer_weights *l,
-                                 bool ffn, const float *in, float *flat, float *mix,
-                                 float *split) {
-    const ds41_cpu_hc_job j = {
-        .m = m, .fn = ffn ? l->hc_ffn_fn : l->hc_attn_fn,
-        .scale = ffn ? l->hc_ffn_scale : l->hc_attn_scale,
-        .base = ffn ? l->hc_ffn_base : l->hc_attn_base,
-        .state = in, .flat = flat, .mix = mix, .split = split,
-    };
-    return ds41_cpu_hc_run(&j);
 }
 
 static bool ds41_cpu_moe(ds41_cpu_state *s, const ds4_layer_weights *l) {
@@ -703,7 +690,8 @@ typedef struct {
     ds41_cpu_batch *b;
     const ds4_layer_weights *l;
     uint32_t il;
-    bool routed;    /* partial holds the routed experts' down projections */
+    bool mixed;     /* mix holds the HC mixer projections */
+    bool routed;    /* probs holds the router, partial the routed experts */
     int failed;
 } ds41_cpu_batch_ctx;
 
@@ -720,6 +708,7 @@ static void ds41_cpu_batch_free(ds41_cpu_batch *b) {
     free(b->engram_kv); free(b->shared_gate); free(b->shared_up);
     free(b->shared_mid); free(b->mid); free(b->partial); free(b->weight);
     free(b->selected); free(b->ids); free(b->entry); free(b->sel);
+    free(b->mix); free(b->probs); free(b->xt);
     free(b);
 }
 
@@ -755,12 +744,15 @@ static ds41_cpu_batch *ds41_cpu_batch_create(void) {
     b->ids = malloc(n * 2u * DS4_ENGRAM_COLS * sizeof(uint32_t));
     b->entry = malloc(pairs * sizeof(uint32_t));
     b->sel = malloc(n * 512u * sizeof(uint32_t));
+    b->mix = malloc(n * 24u * f);
+    b->probs = malloc(n * DS4_N_EXPERT * f);
+    b->xt = malloc(n * 4u * 5120u * sizeof(double));
     if (!b->residual || !b->after_attn || !b->flat || !b->x || !b->norm ||
         !b->block || !b->shared || !b->pre || !b->attn_split || !b->ffn_split ||
         !b->qr || !b->q || !b->kv || !b->heads || !b->low || !b->rows ||
         !b->engram_kv || !b->shared_gate || !b->shared_up || !b->shared_mid ||
         !b->mid || !b->partial || !b->weight || !b->selected || !b->ids || !b->entry ||
-        !b->sel) {
+        !b->sel || !b->mix || !b->probs || !b->xt) {
         ds41_cpu_batch_free(b);
         return NULL;
     }
@@ -793,26 +785,46 @@ static void ds41_cpu_batch_read_worker(void *vctx, uint64_t t0, uint64_t t1) {
                 ds41_cpu_batch_fail(c);
 }
 
-/* Engram, the attention HC mixer and the attention norm of each token. */
-static void ds41_cpu_batch_attn_in_worker(void *vctx, uint64_t t0, uint64_t t1) {
+/* Engram and the flat HC input of each token before attention. */
+static void ds41_cpu_batch_attn_flat_worker(void *vctx, uint64_t t0, uint64_t t1) {
     ds41_cpu_batch_ctx *c = vctx;
     ds41_cpu_batch *b = c->b;
     const ds4_model *m = c->s->model;
     const ds4_layer_weights *l = c->l;
-    float mix[24];
     for (uint64_t t = t0; t < t1; t++) {
         float *residual = b->residual + t * 4u * 5120u;
         if (c->il == 1 || c->il == 14)
             ds41_cpu_engram_add(residual, b->engram_kv + t * 5u * 5120u,
                                tensor_data(m, l->engram_q_norm),
                                tensor_data(m, l->engram_k_norm), 5120, DS4_RMS_EPS);
-        if (!ds41_cpu_hc_mix_into(m, l, false, residual, b->flat + t * 4u * 5120u,
-                                  mix, b->attn_split + t * 24u)) {
+        rms_norm_no_weight(b->flat + t * 4u * 5120u, residual, 4u * 5120u, DS4_RMS_EPS);
+    }
+}
+
+/* The HC split of the mixer projection, computed here unless batched. */
+static bool ds41_cpu_batch_split(ds41_cpu_batch_ctx *c, uint64_t t, bool ffn, float *split) {
+    const ds4_model *m = c->s->model;
+    const ds4_layer_weights *l = c->l;
+    float *mix = c->b->mix + t * 24u;
+    if (!c->mixed && !ds41_cpu_matvec(mix, m, ffn ? l->hc_ffn_fn : l->hc_attn_fn,
+                                      c->b->flat + t * 4u * 5120u, false)) return false;
+    hc_split_sinkhorn_one(split, mix, tensor_data(m, ffn ? l->hc_ffn_scale : l->hc_attn_scale),
+                         tensor_data(m, ffn ? l->hc_ffn_base : l->hc_attn_base),
+                         4, DS4_N_HC_SINKHORN_ITER, DS4_HC_EPS);
+    return true;
+}
+
+/* The attention HC split, input and norm of each token. */
+static void ds41_cpu_batch_attn_in_worker(void *vctx, uint64_t t0, uint64_t t1) {
+    ds41_cpu_batch_ctx *c = vctx;
+    ds41_cpu_batch *b = c->b;
+    for (uint64_t t = t0; t < t1; t++) {
+        if (!ds41_cpu_batch_split(c, t, false, b->attn_split + t * 24u)) {
             ds41_cpu_batch_fail(c);
             continue;
         }
-        ds41_cpu_hc_sum(b->x + t * 5120u, residual, b->pre + t * 4u);
-        if (!ds41_cpu_norm(b->norm + t * 5120u, b->x + t * 5120u, m, l->attn_norm))
+        ds41_cpu_hc_sum(b->x + t * 5120u, b->residual + t * 4u * 5120u, b->pre + t * 4u);
+        if (!ds41_cpu_norm(b->norm + t * 5120u, b->x + t * 5120u, c->s->model, c->l->attn_norm))
             ds41_cpu_batch_fail(c);
     }
 }
@@ -827,32 +839,49 @@ static void ds41_cpu_batch_qkv_norm_worker(void *vctx, uint64_t t0, uint64_t t1)
     }
 }
 
-/* HC after attention, the FFN mixer and norm, and the router of each token. */
+/* HC after attention and the flat input of the FFN mixer of each token. */
+static void ds41_cpu_batch_ffn_flat_worker(void *vctx, uint64_t t0, uint64_t t1) {
+    ds41_cpu_batch_ctx *c = vctx;
+    ds41_cpu_batch *b = c->b;
+    for (uint64_t t = t0; t < t1; t++) {
+        float *after = b->after_attn + t * 4u * 5120u;
+        ds41_cpu_hc_expand(after, b->block + t * 5120u, b->residual + t * 4u * 5120u,
+                          b->attn_split + t * 24u);
+        rms_norm_no_weight(b->flat + t * 4u * 5120u, after, 4u * 5120u, DS4_RMS_EPS);
+    }
+}
+
+/* The FFN HC split, input and norm of each token. */
 static void ds41_cpu_batch_ffn_in_worker(void *vctx, uint64_t t0, uint64_t t1) {
     ds41_cpu_batch_ctx *c = vctx;
     ds41_cpu_batch *b = c->b;
-    const ds4_model *m = c->s->model;
-    const ds4_layer_weights *l = c->l;
-    float mix[24], probs[DS4_MAX_EXPERT];
     for (uint64_t t = t0; t < t1; t++) {
-        float *after = b->after_attn + t * 4u * 5120u, *norm = b->norm + t * 5120u;
-        const float *split = b->attn_split + t * 24u;
-        ds41_cpu_hc_expand(after, b->block + t * 5120u, b->residual + t * 4u * 5120u, split);
-        if (!ds41_cpu_hc_mix_into(m, l, true, after, b->flat + t * 4u * 5120u,
-                                  mix, b->ffn_split + t * 24u)) {
+        if (!ds41_cpu_batch_split(c, t, true, b->ffn_split + t * 24u)) {
             ds41_cpu_batch_fail(c);
             continue;
         }
-        ds41_cpu_hc_sum(b->x + t * 5120u, after, split);
-        if (!ds41_cpu_norm(norm, b->x + t * 5120u, m, l->ffn_norm) ||
-            !ds41_cpu_matvec(probs, m, l->ffn_gate_inp, norm, false)) {
+        ds41_cpu_hc_sum(b->x + t * 5120u, b->after_attn + t * 4u * 5120u, b->attn_split + t * 24u);
+        if (!ds41_cpu_norm(b->norm + t * 5120u, b->x + t * 5120u, c->s->model, c->l->ffn_norm))
+            ds41_cpu_batch_fail(c);
+    }
+}
+
+/* Expert selection of each token from the router, computed here unless batched. */
+static void ds41_cpu_batch_router_worker(void *vctx, uint64_t t0, uint64_t t1) {
+    ds41_cpu_batch_ctx *c = vctx;
+    ds41_cpu_batch *b = c->b;
+    const ds4_model *m = c->s->model;
+    for (uint64_t t = t0; t < t1; t++) {
+        float *probs = b->probs + t * DS4_N_EXPERT;
+        if (!c->routed && !ds41_cpu_matvec(probs, m, c->l->ffn_gate_inp,
+                                           b->norm + t * 5120u, false)) {
             ds41_cpu_batch_fail(c);
             continue;
         }
         for (uint32_t i = 0; i < DS4_N_EXPERT; i++)
             probs[i] = sqrtf(softplus_stable(probs[i]));
         layer_topk_selected_experts_from_probs(b->selected + t * DS4_N_EXPERT_USED,
-                                               b->weight + t * DS4_N_EXPERT_USED, m, l, probs);
+                                               b->weight + t * DS4_N_EXPERT_USED, m, c->l, probs);
     }
 }
 
@@ -900,6 +929,12 @@ static bool ds41_cpu_prefill_layer(ds41_cpu_state *s, uint32_t il, uint32_t n,
     if (!l->ffn_exp_probs_b || !l->ffn_gate_exps || !l->ffn_up_exps || !l->ffn_down_exps ||
         !glm_graph_gate_pair_type_supported(l->ffn_gate_exps->type, l->ffn_up_exps->type) ||
         !glm_graph_down_type_supported(l->ffn_down_exps->type)) return false;
+    for (uint32_t ffn = 0; ffn < 2; ffn++) {
+        const ds4_tensor *scale = ffn ? l->hc_ffn_scale : l->hc_attn_scale;
+        const ds4_tensor *base = ffn ? l->hc_ffn_base : l->hc_attn_base;
+        if (!scale || !base || scale->type != DS4_TENSOR_F32 || base->type != DS4_TENSOR_F32)
+            return false;
+    }
     double t = phase ? now_sec() : 0;
 #define DS41_PHASE(i) do { if (phase) { const double now = now_sec(); \
     phase[i] += now - t; t = now; } } while (0)
@@ -908,6 +943,8 @@ static bool ds41_cpu_prefill_layer(ds41_cpu_state *s, uint32_t il, uint32_t n,
         if (!ds41_cpu_matmul(b->engram_kv, 5u * 5120u, m, l->engram_kv,
                              b->rows + (il == 1 ? 0 : cols), 2u * cols, n, true)) return false;
     }
+    ds4_parallel_for_min_rows(n, ds41_cpu_batch_attn_flat_worker, &c, 1);
+    c.mixed = ds41_cpu_matmul_f32(b->mix, 24, m, l->hc_attn_fn, b->flat, 4u * 5120u, n, b->xt);
     ds4_parallel_for_min_rows(n, ds41_cpu_batch_attn_in_worker, &c, 1);
     if (c.failed) return false;
     DS41_PHASE(0);
@@ -945,7 +982,13 @@ static bool ds41_cpu_prefill_layer(ds41_cpu_state *s, uint32_t il, uint32_t n,
         }
     }
     DS41_PHASE(3);
+    ds4_parallel_for_min_rows(n, ds41_cpu_batch_ffn_flat_worker, &c, 1);
+    c.mixed = ds41_cpu_matmul_f32(b->mix, 24, m, l->hc_ffn_fn, b->flat, 4u * 5120u, n, b->xt);
     ds4_parallel_for_min_rows(n, ds41_cpu_batch_ffn_in_worker, &c, 1);
+    if (c.failed) return false;
+    c.routed = ds41_cpu_matmul_f32(b->probs, DS4_N_EXPERT, m, l->ffn_gate_inp, b->norm, 5120,
+                                   n, b->xt);
+    ds4_parallel_for_min_rows(n, ds41_cpu_batch_router_worker, &c, 1);
     if (c.failed) return false;
     DS41_PHASE(4);
     if (!ds41_cpu_matmul(b->shared_gate, 2304, m, l->ffn_gate_shexp, b->norm, 5120, n, true) ||

@@ -560,6 +560,37 @@ static void check_q8_batch(void) {
     }
 }
 
+static void check_f32_batch(void) {
+    const uint64_t dims[] = {1, 7, 256, 5120};
+    const uint64_t rows[] = {1, 3, 4, 5, 24, 384};
+    const uint32_t tokens[] = {1, 7, 8, 9, 33};
+    for (size_t d = 0; d < sizeof(dims) / sizeof(*dims); d++) {
+        for (size_t r = 0; r < sizeof(rows) / sizeof(*rows); r++) {
+            for (size_t tk = 0; tk < sizeof(tokens) / sizeof(*tokens); tk++) {
+                const uint64_t k = dims[d], n = rows[r];
+                const uint32_t nt = tokens[tk];
+                const uint64_t xs = k + 3, os = n + 2;
+                float *w = malloc(k * n * sizeof(float)), *x = malloc(nt * xs * sizeof(float));
+                float *a = calloc(nt * os, sizeof(float)), *b = calloc(nt * os, sizeof(float));
+                double *xt = malloc((nt + 7) / 8 * 8 * k * sizeof(double));
+                CHECK(w && x && a && b && xt);
+                for (uint64_t i = 0; i < k * n; i++) w[i] = test_float() * 3.1f;
+                for (uint64_t i = 0; i < nt * xs; i++) x[i] = test_float();
+                ds4_model m = {.map = (uint8_t *)w, .size = k * n * sizeof(float)};
+                ds4_tensor t = {.type = DS4_TENSOR_F32, .ndim = 2, .dim = {k, n},
+                               .elements = k * n, .bytes = k * n * sizeof(float)};
+                for (uint32_t i = 0; i < nt; i++) {
+                    matvec_f32_ctx ctx = {.out = a + i * os, .data = w, .x = x + i * xs, .in_dim = k};
+                    matvec_f32_worker(&ctx, 0, n);
+                }
+                if (ds41_cpu_matmul_f32(b, os, &m, &t, x, xs, nt, xt))
+                    test_equal("F32 batch", a, b, nt * os);
+                free(xt); free(b); free(a); free(x); free(w);
+            }
+        }
+    }
+}
+
 static void check_routed_batch(uint32_t embd, uint32_t hidden, float clamp) {
     g_ds4_shape = DS4_SHAPE_FLASH41;
     g_ds4_shape.n_embd = embd;
@@ -651,6 +682,7 @@ int main(void) {
             check_moe(512, 768, DS4_TENSOR_IQ2_XXS, DS4_TENSOR_Q2_K, 10.0f);
             check_moe(5120, 2304, DS4_TENSOR_IQ2_XXS, DS4_TENSOR_Q2_K, 10.0f);
             check_q8_batch();
+            check_f32_batch();
             check_routed_batch(256, 512, 10.0f);
             check_routed_batch(512, 256, 0.0f);
             ds4_threads_shutdown();
