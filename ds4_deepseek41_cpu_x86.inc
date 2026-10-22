@@ -405,8 +405,12 @@ static void ds41_cpu_routed_moe(float *out, float *mid, const ds4_model *m,
                 ds4_die("V4.1 CPU routed-MoE found unexpected expert dimensions");
             mc.expert_weight[slot] = weights[slot];
         }
-        ds4_parallel_for_min_rows((uint64_t)mc.n_expert * ((mc.out_dim + 15) / 16),
-                                  ds41_cpu_mid_worker, &mc, 32);
+        /* Every expert is its own NUMA group, so each node takes the first
+         * or second half of every selected expert's gate and up rows, the
+         * halves --numa-place all put on it, instead of three whole experts
+         * read half from the other socket. */
+        const uint64_t tiles = (mc.out_dim + 15) / 16;
+        ds4_pool_dispatch((uint64_t)mc.n_expert * tiles, ds41_cpu_mid_worker, &mc, tiles, 32);
         ds4_parallel_for_min_rows((dc.out_dim + 15) / 16, ds41_cpu_down_worker, &dc, 32);
         return;
     }

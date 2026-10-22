@@ -103,7 +103,13 @@ static void check_q8(void) {
     }
 }
 
-static void check_moe(uint32_t embd, uint32_t hidden, uint32_t type, float clamp) {
+static size_t test_block_bytes(uint32_t type) {
+    return type == DS4_TENSOR_Q4_K ? sizeof(block_q4_K) :
+           type == DS4_TENSOR_IQ2_XXS ? sizeof(block_iq2_xxs) : sizeof(block_q2_K);
+}
+
+/* Gate and up are of type, down of down_type (the Q2 models: IQ2_XXS, Q2_K). */
+static void check_moe(uint32_t embd, uint32_t hidden, uint32_t type, uint32_t down_type, float clamp) {
     g_ds4_shape = DS4_SHAPE_FLASH41;
     g_ds4_shape.n_embd = embd;
     g_ds4_shape.n_ff_exp = hidden;
@@ -112,20 +118,23 @@ static void check_moe(uint32_t embd, uint32_t hidden, uint32_t type, float clamp
     g_ds4_shape.swiglu_clamp_exp = clamp;
     const int selected[] = {6, 2, 0};
     const float weights[] = {0.2173f, -0.6129f, 1.397f};
-    const size_t block_bytes = type == DS4_TENSOR_Q4_K ? sizeof(block_q4_K) : sizeof(block_q2_K);
-    const size_t bytes = (size_t)embd * hidden * 7 / QK_K * block_bytes;
-    test_buffer w = test_alloc(3 * bytes), xb = test_alloc(embd * sizeof(float));
+    const size_t bytes = (size_t)embd * hidden * 7 / QK_K * test_block_bytes(type);
+    const size_t down_bytes = (size_t)embd * hidden * 7 / QK_K * test_block_bytes(down_type);
+    test_buffer w = test_alloc(2 * bytes + down_bytes), xb = test_alloc(embd * sizeof(float));
     test_buffer ma = test_alloc(3 * hidden * sizeof(float)), mb = test_alloc(3 * hidden * sizeof(float));
     test_buffer oa = test_alloc(embd * sizeof(float)), ob = test_alloc(embd * sizeof(float));
-    test_fill_quants(w.data, 3 * bytes, type);
+    test_fill_quants(w.data, 2 * bytes, type);
+    test_fill_quants(w.data + 2 * bytes, down_bytes, down_type);
     float *x = (float *)xb.data;
     for (uint32_t i = 0; i < embd; i++) x[i] = test_float();
-    ds4_model m = {.map = w.data, .size = 3 * bytes};
+    ds4_model m = {.map = w.data, .size = 2 * bytes + down_bytes};
     ds4_tensor gate = {.type = type, .ndim = 3, .dim = {embd, hidden, 7},
                       .elements = (uint64_t)embd * hidden * 7, .bytes = bytes};
     ds4_tensor up = gate, down = gate;
     up.abs_offset = bytes;
+    down.type = down_type;
     down.abs_offset = 2 * bytes;
+    down.bytes = down_bytes;
     down.dim[0] = hidden; down.dim[1] = embd;
     ds4_layer_weights l = {.ffn_gate_exps = &gate, .ffn_up_exps = &up, .ffn_down_exps = &down};
     layer_glm_routed_moe_one_f32_ref((float *)oa.data, (float *)ma.data, &m, &l, x, selected, weights);
@@ -221,16 +230,26 @@ int main(void) {
     check_half();
     check_q4_tails();
 #endif
+    /* Both pool layouts: NUMA halves per group (on a two-node host) and one cursor. */
+    ds4_numa_init();
+    const bool numa = g_numa.on;
     const uint32_t threads[] = {1, 3, 16};
-    for (size_t i = 0; i < sizeof(threads) / sizeof(*threads); i++) {
-        g_requested_threads = threads[i];
-        check_q8();
-        check_moe(256, 512, DS4_TENSOR_Q4_K, 10.0f);
-        check_moe(512, 256, DS4_TENSOR_Q4_K, 0.0f);
-        check_moe(256, 256, DS4_TENSOR_Q2_K, 10.0f);
-        ds4_threads_shutdown();
-        printf("V4.1 CPU Q8/Q4 bitwise reference checks: %u threads PASS\n", threads[i]);
+    for (int mode = numa; mode >= 0; mode--) {
+        g_numa.on = mode;
+        for (size_t i = 0; i < sizeof(threads) / sizeof(*threads); i++) {
+            g_requested_threads = threads[i];
+            check_q8();
+            check_moe(256, 512, DS4_TENSOR_Q4_K, DS4_TENSOR_Q4_K, 10.0f);
+            check_moe(512, 256, DS4_TENSOR_Q4_K, DS4_TENSOR_Q4_K, 0.0f);
+            check_moe(256, 256, DS4_TENSOR_Q2_K, DS4_TENSOR_Q2_K, 10.0f);
+            check_moe(512, 768, DS4_TENSOR_IQ2_XXS, DS4_TENSOR_Q2_K, 10.0f);
+            check_moe(5120, 2304, DS4_TENSOR_IQ2_XXS, DS4_TENSOR_Q2_K, 10.0f);
+            ds4_threads_shutdown();
+            printf("V4.1 CPU Q8/Q4/Q2 bitwise reference checks: %u threads%s PASS\n",
+                   threads[i], mode ? ", NUMA halves" : "");
+        }
     }
+    g_numa.on = numa;
     g_requested_threads = 0;
     g_ds4_shape = saved;
 #if !defined(__AVX512F__) || !defined(__AVX512BW__)
