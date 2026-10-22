@@ -445,7 +445,7 @@ static void check_proj_graph(test_layer *tl, const ds4_layer_weights *l) {
             const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
             CHECK(ds41_cpu_attention_project(a, &tl->m, l, il, pos, norm, &h[0]));
             CHECK(ds41_cpu_proj_graph_supported(l, il, index, &h[1]));
-            CHECK(ds41_cpu_proj_graph_run(b, &tl->m, l, il, pos, norm, index, &h[1]));
+            CHECK(ds41_cpu_proj_graph_run(b, &tl->m, l, il, pos, norm, index, &h[1], NULL, 0));
             ds41_cpu_rope(b->q, 512, 64, pos, ratio != 0, false);
             if (index) ds41_cpu_attention_rank(b, il, owner, n_comp);
             test_equal("proj split", split[0], split[1], 24);
@@ -649,6 +649,82 @@ static void check_out_ffn_graph(test_layer *tl, const ds4_layer_weights *l) {
         test_equal("tail shared", st[0]->shared, st[1]->shared, 5120);
         test_equal("tail block", st[0]->block, st[1]->block, 5120);
         test_equal("tail HC state", st[0]->residual, st[1]->residual, 4 * 5120);
+        for (uint32_t i = 0; i < 4 * 5120; i++) CHECK(isfinite(st[1]->residual[i]));
+    }
+    for (int k = 0; k < 2; k++) {
+        ds41_cpu_attention_free(st[k]->attention);
+        free(st[k]);
+    }
+}
+#endif
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+/* A layer without index ranking as one dispatch (projections, output, FFN)
+ * against the projection, output and FFN dispatches in sequence (each
+ * checked against the plain path above): compressed layers of both ratios,
+ * no compression, and a KV source layer publishing at position 0. */
+static void check_layer_graph(test_layer *tl, const ds4_layer_weights *l) {
+    static const uint32_t cases[][2] = {{3, 40}, {21, 100}, {0, 7}, {2, 0}, {21, 1023}};
+    ds41_cpu_state *st[2];
+    for (int k = 0; k < 2; k++) {
+        st[k] = calloc(1, sizeof(*st[k]));
+        CHECK(st[k]);
+        st[k]->model = &tl->m;
+        st[k]->attention = ds41_cpu_attention_create(1100);
+        CHECK(st[k]->attention);
+    }
+    ds41_cpu_attention_state *a = st[0]->attention, *b = st[1]->attention;
+    for (size_t ci = 0; ci < sizeof(cases) / sizeof(*cases); ci++) {
+        const uint32_t il = cases[ci][0], pos = cases[ci][1];
+        const uint32_t ratio = ds4_layer_compress_ratio(il);
+        const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
+        const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
+        const uint32_t attended = n_comp < 512u ? n_comp : 512u;
+        CHECK(!(n_comp && ds41_index_source(il)));
+        for (uint32_t i = 0; i < 128 * 512; i++) a->window[il][i] = ds41_cpu_bf16(test_float());
+        for (uint32_t i = 0; i < a->comp_cap[owner] * 512; i++) a->compressed[owner][i] = test_float();
+        for (uint32_t r = 0; r < attended; r++) a->selected_comp[r] = test_random() % n_comp;
+        for (uint32_t i = 0; i < 4 * 5120; i++) st[0]->residual[i] = ds41_cpu_bf16(test_float());
+        for (uint32_t i = 0; i < 5120; i++) st[0]->norm[i] = ds41_cpu_bf16(test_float());
+        memcpy(b->window[il], a->window[il], 128 * 512 * sizeof(float));
+        memcpy(b->compressed[owner], a->compressed[owner], (size_t)a->comp_cap[owner] * 512 * sizeof(float));
+        memcpy(b->selected_comp, a->selected_comp, sizeof(a->selected_comp));
+        memcpy(b->previous_kv, a->previous_kv, sizeof(a->previous_kv));
+        memcpy(b->previous_score, a->previous_score, sizeof(a->previous_score));
+        memcpy(st[1]->residual, st[0]->residual, sizeof(st[0]->residual));
+        memcpy(st[1]->norm, st[0]->norm, sizeof(st[0]->norm));
+        ds41_cpu_hc_post_job post[2];
+        ds41_cpu_hc_job hc[2], ffn_hc[2];
+        for (int k = 0; k < 2; k++) {
+            post[k] = (ds41_cpu_hc_post_job){.m = &tl->m, .norm_weight = l->ffn_norm,
+                .block = st[k]->block, .residual = st[k]->residual, .split = st[k]->attn_split,
+                .after = st[k]->after_attn, .x = st[k]->x, .norm = st[k]->norm};
+            hc[k] = ds41_cpu_hc_mixer(st[k], l, false);
+            ffn_hc[k] = ds41_cpu_hc_mixer(st[k], l, true);
+        }
+        CHECK(ds41_cpu_proj_graph_run(a, &tl->m, l, il, pos, st[0]->norm, false, &hc[0], NULL, 0));
+        ds41_cpu_out_graph_run(a, &tl->m, l, il, pos, st[0]->block, &post[0], NULL, 0);
+        ds41_cpu_ffn_graph_run(st[0], l, &ffn_hc[0]);
+        ds41_cpu_ffn_graph g;
+        ds4_pool_stage ffn[8];
+        bool done = false;
+        ds41_cpu_ffn_graph_stages(&g, st[1], l, &ffn_hc[1], ffn);
+        CHECK(ds41_cpu_attention_forward(b, &tl->m, l, il, pos, st[1]->norm, st[1]->block,
+                                         &hc[1], &post[1], ffn, 8, &done));
+        CHECK(done);
+        test_equal("layer q", a->q, b->q, 64 * 512);
+        test_equal("layer window", a->window[il], b->window[il], 128 * 512);
+        test_equal("layer compressed", a->compressed[owner], b->compressed[owner],
+                   (size_t)a->comp_cap[owner] * 512);
+        test_equal("layer previous", a->previous_kv[0], b->previous_kv[0], 3 * 512);
+        test_equal("layer heads", a->heads, b->heads, 64 * 512);
+        test_equal("layer low", a->low, b->low, 8192);
+        test_equal("layer attention split", st[0]->attn_split, st[1]->attn_split, 24);
+        test_equal("layer after attention", st[0]->after_attn, st[1]->after_attn, 4 * 5120);
+        test_equal("layer FFN input", st[0]->x, st[1]->x, 5120);
+        test_equal("layer FFN norm", st[0]->norm, st[1]->norm, 5120);
+        test_equal("layer FFN split", st[0]->ffn_split, st[1]->ffn_split, 24);
+        test_equal("layer block", st[0]->block, st[1]->block, 5120);
+        test_equal("layer HC state", st[0]->residual, st[1]->residual, 4 * 5120);
         for (uint32_t i = 0; i < 4 * 5120; i++) CHECK(isfinite(st[1]->residual[i]));
     }
     for (int k = 0; k < 2; k++) {
@@ -1074,7 +1150,7 @@ int main(void) {
     {
         g_ds4_shape = DS4_SHAPE_FLASH41;
         g_ds4_shape.n_expert = 8;
-        const uint32_t ratios[40] = {[2] = 2, [20] = 1, [24] = 1};
+        const uint32_t ratios[40] = {[2] = 2, [3] = 2, [20] = 1, [21] = 1, [24] = 1};
         memcpy(g_ds4_compress_ratios, ratios, sizeof(ratios));
         test_layer tl;
         ds4_layer_weights l;
@@ -1085,6 +1161,7 @@ int main(void) {
             check_proj_graph(&tl, &l);
             check_out_graph(&tl, &l);
             check_out_ffn_graph(&tl, &l);
+            check_layer_graph(&tl, &l);
             check_batch_kv(&tl, &l);
             ds4_threads_shutdown();
             printf("V4.1 CPU staged FFN, projections, output and batch KV bitwise checks: "

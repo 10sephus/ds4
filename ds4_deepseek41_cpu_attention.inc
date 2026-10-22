@@ -401,15 +401,19 @@ static bool ds41_cpu_proj_graph_supported(const ds4_layer_weights *l, uint32_t i
           ds41_cpu_f16_shape(l->indexer_proj, 5120, 32)));
 }
 
+/* The n_tail stages of tail, numbered from 0 among themselves, run in the
+ * same dispatch after every projection stage: the attention output, when
+ * nothing serial has to run in between. */
 static bool ds41_cpu_proj_graph_run(ds41_cpu_attention_state *s, const ds4_model *m,
                                     const ds4_layer_weights *l, uint32_t il,
                                     uint32_t pos, const float *norm, bool index,
-                                    const ds41_cpu_hc_job *hc) {
+                                    const ds41_cpu_hc_job *hc,
+                                    const ds4_pool_stage *tail, uint32_t n_tail) {
     const uint32_t ratio = ds4_layer_compress_ratio(il);
     const bool source = ds41_kv_source(il);
     ds41_cpu_proj_graph g = {.s = s, .m = m, .l = l, .il = il, .pos = pos,
                              .published = true, .hc = *hc};
-    ds4_pool_stage st[10];
+    ds4_pool_stage st[32];
     uint32_t n = 0, comp = 0;
     st[n++] = ds41_cpu_hc_norm_stage(&g.hc);                         /* 0 */
     st[n] = ds41_cpu_q8_stage(&g.q_a, m, l->attn_q_a, s->qr, norm);  /* 1 */
@@ -443,7 +447,12 @@ static bool ds41_cpu_proj_graph_run(ds41_cpu_attention_state *s, const ds4_model
     }
     st[n] = ds41_cpu_q8_stage(&g.q_b, m, l->attn_q_b, s->q, s->qr);
     st[n++].deps = 1u << 1;
-    ds4_pool_run_stages(st, n);
+    if (n + n_tail > 32) ds4_die("V4.1 CPU attention projection tail is too long");
+    for (uint32_t k = 0; k < n_tail; k++) {
+        st[n + k] = tail[k];
+        st[n + k].deps = tail[k].deps ? tail[k].deps << n : (1u << n) - 1u;
+    }
+    ds4_pool_run_stages(st, n + n_tail);
     if (ds41_prof_on) {
         uint64_t bytes = hc->fn->bytes + l->attn_q_a->bytes + l->attn_kv->bytes +
                          l->attn_q_b->bytes;
@@ -682,42 +691,45 @@ static bool ds41_cpu_out_graph_supported(const ds4_layer_weights *l,
  * n_tail stages of tail, numbered from 0 among themselves, run in the same
  * dispatch after the FFN input: the FFN, whose tail of streams then
  * overlaps the output projections' tail. */
-static void ds41_cpu_out_graph_run(ds41_cpu_attention_state *s, const ds4_model *m,
-                                   const ds4_layer_weights *l, uint32_t il, uint32_t pos,
-                                   float *block, const ds41_cpu_hc_post_job *post,
-                                   const ds4_pool_stage *tail, uint32_t n_tail) {
+static uint32_t ds41_cpu_out_graph_stages(ds41_cpu_out_graph *gp, ds41_cpu_attention_state *s,
+                                          const ds4_model *m, const ds4_layer_weights *l,
+                                          uint32_t il, uint32_t pos, float *block,
+                                          const ds41_cpu_hc_post_job *post,
+                                          const ds4_pool_stage *tail, uint32_t n_tail,
+                                          ds4_pool_stage *stages) {
     const uint32_t ratio = ds4_layer_compress_ratio(il);
     const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
     const uint32_t attended = n_comp < 512u ? n_comp : 512u;
     const uint32_t n_raw = pos < 127u ? pos + 1u : 128u;
     const uint32_t n_rows = n_raw + attended;
-    ds41_cpu_out_graph g = {.s = s, .pos = pos, .compressed = ratio != 0,
+    ds41_cpu_out_graph *g = gp;
+    *g = (ds41_cpu_out_graph){.s = s, .pos = pos, .compressed = ratio != 0,
         .stage = {s, s->window[il], s->compressed[owner], pos + 1u - n_raw, n_raw}};
-    ds41_cpu_attention_lanes(s, &g.lanes, tensor_data(m, l->attn_sinks), n_rows);
-    g.out_a = (ds41_cpu_q8_ctx){
+    ds41_cpu_attention_lanes(s, &g->lanes, tensor_data(m, l->attn_sinks), n_rows);
+    g->out_a = (ds41_cpu_q8_ctx){
         .ref = {.out = s->low, .data = tensor_data(m, l->attn_output_a), .x = s->heads,
                 .in_dim = 4096, .blocks = 4096 / 32},
         .rows = 8192, .group_rows = 1024, .group_in = 4096,
     };
-    const uint64_t scores = 4u * g.lanes.n_chunks, sums = 4u * g.lanes.n_dim_chunks;
+    const uint64_t scores = 4u * g->lanes.n_chunks, sums = 4u * g->lanes.n_dim_chunks;
     /* The query and row stagings are a few hundred nanoseconds per item:
      * claims of 8 and 16 items. */
-    ds4_pool_stage st[8 + 16] = {
-        { .fn = ds41_cpu_out_q_worker, .ctx = &g, .n_rows = 4 * 32, .group_rows = 4 * 32,
+    ds4_pool_stage st[8] = {
+        { .fn = ds41_cpu_out_q_worker, .ctx = g, .n_rows = 4 * 32, .group_rows = 4 * 32,
           .min_chunk = 8 },
-        { .fn = ds41_cpu_stage_worker, .ctx = &g.stage, .n_rows = n_rows, .group_rows = n_rows,
+        { .fn = ds41_cpu_stage_worker, .ctx = &g->stage, .n_rows = n_rows, .group_rows = n_rows,
           .min_chunk = 16 },
-        { .fn = attn_lanes_score_worker, .ctx = &g.lanes, .n_rows = scores,
+        { .fn = attn_lanes_score_worker, .ctx = &g->lanes, .n_rows = scores,
           .group_rows = scores, .deps = (1u << 0) | (1u << 1) },
-        { .fn = ds41_cpu_attention_weight_worker, .ctx = &g.lanes,
+        { .fn = ds41_cpu_attention_weight_worker, .ctx = &g->lanes,
           .n_rows = 64, .group_rows = 64, .deps = 1u << 2 },
-        { .fn = ds41_cpu_out_sum_worker, .ctx = &g, .n_rows = sums, .group_rows = sums,
+        { .fn = ds41_cpu_out_sum_worker, .ctx = g, .n_rows = sums, .group_rows = sums,
           .deps = 1u << 3 },
-        { .fn = ds41_cpu_q8_bf16_worker, .ctx = &g.out_a, .n_rows = 8192 / 16,
+        { .fn = ds41_cpu_q8_bf16_worker, .ctx = &g->out_a, .n_rows = 8192 / 16,
           .group_rows = 8192 / 16, .deps = 1u << 4,
-          .weights = g.out_a.ref.data, .row_bytes = 16 * g.out_a.ref.blocks * 34 },
-        ds41_cpu_q8_stage(&g.out_b, m, l->attn_output_b, block, s->low),
+          .weights = g->out_a.ref.data, .row_bytes = 16 * g->out_a.ref.blocks * 34 },
+        ds41_cpu_q8_stage(&g->out_b, m, l->attn_output_b, block, s->low),
         /* Light elementwise work: claims of 256 columns. */
         { .fn = ds41_cpu_hc_post_worker, .ctx = (void *)post, .n_rows = 5120,
           .group_rows = 5120, .min_chunk = 256, .deps = 1u << 6,
@@ -725,13 +737,24 @@ static void ds41_cpu_out_graph_run(ds41_cpu_attention_state *s, const ds4_model 
     };
     st[6].deps = 1u << 5;
     if (n_tail > 16) ds4_die("V4.1 CPU attention output tail is too long");
+    memcpy(stages, st, sizeof(st));
     for (uint32_t k = 0; k < n_tail; k++) {
-        st[8 + k] = tail[k];
-        st[8 + k].deps = tail[k].deps ? tail[k].deps << 8 : 1u << 7;
+        stages[8 + k] = tail[k];
+        stages[8 + k].deps = tail[k].deps ? tail[k].deps << 8 : 1u << 7;
     }
-    ds4_pool_run_stages(st, 8 + n_tail);
     if (ds41_prof_on)
         ds41_prof_bytes[DS41_PROF_OUT] += l->attn_output_a->bytes + l->attn_output_b->bytes;
+    return 8 + n_tail;
+}
+
+static void ds41_cpu_out_graph_run(ds41_cpu_attention_state *s, const ds4_model *m,
+                                   const ds4_layer_weights *l, uint32_t il, uint32_t pos,
+                                   float *block, const ds41_cpu_hc_post_job *post,
+                                   const ds4_pool_stage *tail, uint32_t n_tail) {
+    ds41_cpu_out_graph g;
+    ds4_pool_stage st[8 + 16];
+    ds4_pool_run_stages(st, ds41_cpu_out_graph_stages(&g, s, m, l, il, pos, block, post,
+                                                      tail, n_tail, st));
 }
 #endif
 
@@ -834,8 +857,19 @@ static bool ds41_cpu_attention_forward(ds41_cpu_attention_state *s,
     const uint32_t n_comp = ratio ? (pos + 1u) / ratio : 0u;
     const bool index = n_comp && ds41_index_source(il);
     if (ds41_cpu_proj_graph_supported(l, il, index, hc)) {
+        if (!index && ds41_cpu_out_graph_supported(l, post)) {
+            /* No index ranking in between: the projections, the output
+             * and the tail in one dispatch. */
+            ds41_cpu_out_graph g;
+            ds4_pool_stage out[8 + 16];
+            ds41_prof(DS41_PROF_OUT);
+            const uint32_t n_out = ds41_cpu_out_graph_stages(&g, s, m, l, il, pos, block, post,
+                                                             tail, n_tail, out);
+            *tail_done = true;
+            return ds41_cpu_proj_graph_run(s, m, l, il, pos, norm, false, hc, out, n_out);
+        }
         ds41_prof(DS41_PROF_PROJ);
-        if (!ds41_cpu_proj_graph_run(s, m, l, il, pos, norm, index, hc)) return false;
+        if (!ds41_cpu_proj_graph_run(s, m, l, il, pos, norm, index, hc, NULL, 0)) return false;
         /* The index ranking does not read the query. */
         ds41_prof(DS41_PROF_INDEX);
         if (index) ds41_cpu_attention_rank(s, il, owner, n_comp);
