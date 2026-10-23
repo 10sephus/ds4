@@ -798,12 +798,18 @@ static int ds41_cpu_desc_u32(const void *a, const void *b) {
     return x < y ? 1 : x > y ? -1 : 0;
 }
 
-/* Routed experts of a token chunk grouped by expert: entries
- * [first[u], first[u + 1]) are token * 6 + slot pairs of the u-th distinct
- * expert, in token order.  mid and partial are indexed by entry. */
+/* Routed experts of a token chunk in tasks of at most one token pass: task
+ * j covers entries [first[j], end[j]), token * 6 + slot pairs of one expert
+ * in token order, with that expert's rows.  mid and partial are indexed by
+ * entry.  A chunk has at most DS41_CPU_ROUTED_TOKENS tokens, so at most
+ * DS41_CPU_ROUTED_TASKS tasks. */
+#define DS41_CPU_ROUTED_TOKENS 512u
+#define DS41_CPU_ROUTED_TASKS (DS4_MAX_EXPERT + \
+    DS41_CPU_ROUTED_TOKENS * DS4_MAX_EXPERT_USED / DS41_CPU_PASS)
 typedef struct {
-    const uint8_t *gate[DS4_MAX_EXPERT], *up[DS4_MAX_EXPERT], *down[DS4_MAX_EXPERT];
-    uint32_t first[DS4_MAX_EXPERT + 1];
+    const uint8_t *gate[DS41_CPU_ROUTED_TASKS], *up[DS41_CPU_ROUTED_TASKS];
+    const uint8_t *down[DS41_CPU_ROUTED_TASKS];
+    uint32_t first[DS41_CPU_ROUTED_TASKS], end[DS41_CPU_ROUTED_TASKS];
     const uint32_t *entry;
     const float *x, *weight;
     float *mid, *partial;
@@ -819,13 +825,12 @@ static void ds41_cpu_routed_mid_batch_worker(void *vctx, uint64_t first, uint64_
     __m512 wg[32], wu[32], ag[DS41_CPU_PASS], au[DS41_CPU_PASS];
     const float *xp[DS41_CPU_PASS];
     for (uint64_t unit = first; unit < last; unit++) {
-        const uint32_t e = (uint32_t)(unit / tiles);
+        const uint32_t j = (uint32_t)(unit / tiles);
         const uint64_t row = (unit % tiles) * 16;
-        const uint8_t *grows = c->gate[e] + row * c->gate_row_bytes;
-        const uint8_t *urows = c->up[e] + row * c->up_row_bytes;
-        for (uint32_t k0 = c->first[e]; k0 < c->first[e + 1]; k0 += DS41_CPU_PASS) {
-            const uint32_t nt = c->first[e + 1] - k0 < DS41_CPU_PASS ?
-                c->first[e + 1] - k0 : DS41_CPU_PASS;
+        const uint8_t *grows = c->gate[j] + row * c->gate_row_bytes;
+        const uint8_t *urows = c->up[j] + row * c->up_row_bytes;
+        for (uint32_t k0 = c->first[j]; k0 < c->end[j]; k0 += DS41_CPU_PASS) {
+            const uint32_t nt = c->end[j] - k0 < DS41_CPU_PASS ? c->end[j] - k0 : DS41_CPU_PASS;
             for (uint32_t t = 0; t < nt; t++) {
                 ag[t] = au[t] = _mm512_setzero_ps();
                 xp[t] = c->x + (uint64_t)(c->entry[k0 + t] / DS4_N_EXPERT_USED) * c->x_stride;
@@ -871,12 +876,11 @@ static void ds41_cpu_routed_down_batch_worker(void *vctx, uint64_t first, uint64
     __m512 w[128], acc[DS41_CPU_PASS];
     const float *xp[DS41_CPU_PASS];
     for (uint64_t unit = first; unit < last; unit++) {
-        const uint32_t e = (uint32_t)(unit / tiles);
+        const uint32_t j = (uint32_t)(unit / tiles);
         const uint64_t row = (unit % tiles) * 16;
-        const uint8_t *rows = c->down[e] + row * c->down_row_bytes;
-        for (uint32_t k0 = c->first[e]; k0 < c->first[e + 1]; k0 += DS41_CPU_PASS) {
-            const uint32_t nt = c->first[e + 1] - k0 < DS41_CPU_PASS ?
-                c->first[e + 1] - k0 : DS41_CPU_PASS;
+        const uint8_t *rows = c->down[j] + row * c->down_row_bytes;
+        for (uint32_t k0 = c->first[j]; k0 < c->end[j]; k0 += DS41_CPU_PASS) {
+            const uint32_t nt = c->end[j] - k0 < DS41_CPU_PASS ? c->end[j] - k0 : DS41_CPU_PASS;
             for (uint32_t t = 0; t < nt; t++) {
                 acc[t] = _mm512_setzero_ps();
                 xp[t] = c->mid + (uint64_t)c->entry[k0 + t] * DS4_N_FF_EXP;
@@ -1066,6 +1070,7 @@ static bool ds41_cpu_routed_moe_batch(float *partial, float *mid, uint32_t *entr
         DS4_N_EMBD % QK_K || DS4_N_FF_EXP % QK_K ||
         DS4_N_EMBD / QK_K > INT32_MAX / (15 * (int)sizeof(block_q2_K)) ||
         DS4_N_FF_EXP / QK_K > INT32_MAX / (15 * (int)sizeof(block_q2_K))) return false;
+    if (n > DS41_CPU_ROUTED_TOKENS) return false;
     ds41_cpu_routed_batch_ctx c = {0};
     uint32_t count[DS4_MAX_EXPERT] = {0}, used[DS4_MAX_EXPERT];
     const uint32_t pairs = n * DS4_N_EXPERT_USED;
@@ -1074,27 +1079,51 @@ static bool ds41_cpu_routed_moe_batch(float *partial, float *mid, uint32_t *entr
             ds4_die("V4.1 CPU routed-MoE selected expert is outside range");
         count[selected[k]]++;
     }
-    /* The experts with the most tokens first: their units cost the most,
-     * so they are claimed early and the light ones even out the end. */
-    uint32_t order[DS4_MAX_EXPERT], n_used = 0, fill[DS4_MAX_EXPERT];
-    for (uint32_t e = 0; e < DS4_N_EXPERT; e++)
-        if (count[e]) order[n_used++] = count[e] << 16 | (0xffffu - e);
-    qsort(order, n_used, sizeof(*order), ds41_cpu_desc_u32);
-    c.first[0] = 0;
-    for (uint32_t u = 0; u < n_used; u++) {
-        const uint32_t e = 0xffffu - (order[u] & 0xffffu);
+    /* Entries grouped by expert in token order. */
+    uint32_t start[DS4_MAX_EXPERT + 1], fill[DS4_MAX_EXPERT], n_used = 0;
+    start[0] = 0;
+    for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
+        if (!count[e]) continue;
+        used[e] = n_used;
+        fill[n_used] = start[n_used];
+        start[n_used + 1] = start[n_used] + count[e];
+        n_used++;
+    }
+    for (uint32_t k = 0; k < pairs; k++) entry[fill[used[selected[k]]]++] = k;
+    /* An expert's entries split into runs of at most one token pass, of
+     * nearly equal sizes.  Real prompts send most of a chunk's tokens to a
+     * few experts, and a claim of one such expert's rows over all its
+     * tokens kept a single thread busy for the whole dispatch; runs bound
+     * a claim to one pass.  The longest runs come first: their units cost
+     * the most, so they are claimed early and the light ones even out the
+     * end. */
+    uint32_t order[DS41_CPU_ROUTED_TASKS], run_first[DS41_CPU_ROUTED_TASKS];
+    uint32_t run_expert[DS41_CPU_ROUTED_TASKS], n_tasks = 0;
+    for (uint32_t u = 0, e = 0; u < n_used; u++, e++) {
+        while (!count[e]) e++;
+        const uint32_t runs = (count[e] + DS41_CPU_PASS - 1) / DS41_CPU_PASS;
+        for (uint32_t r = 0, k = start[u]; r < runs; r++) {
+            const uint32_t len = (start[u + 1] - k + runs - r - 1) / (runs - r);
+            run_first[n_tasks] = k;
+            run_expert[n_tasks] = e;
+            order[n_tasks] = len << 16 | (0xffffu - n_tasks);
+            n_tasks++;
+            k += len;
+        }
+    }
+    qsort(order, n_tasks, sizeof(*order), ds41_cpu_desc_u32);
+    for (uint32_t j = 0; j < n_tasks; j++) {
+        const uint32_t r = 0xffffu - (order[j] & 0xffffu), e = run_expert[r];
         uint64_t gi, go, ui, uo, di, dout;
-        c.gate[u] = tensor_expert_bytes(m, l->ffn_gate_exps, e, &gi, &go, &c.gate_row_bytes);
-        c.up[u] = tensor_expert_bytes(m, l->ffn_up_exps, e, &ui, &uo, &c.up_row_bytes);
-        c.down[u] = tensor_expert_bytes(m, l->ffn_down_exps, e, &di, &dout, &c.down_row_bytes);
+        c.gate[j] = tensor_expert_bytes(m, l->ffn_gate_exps, e, &gi, &go, &c.gate_row_bytes);
+        c.up[j] = tensor_expert_bytes(m, l->ffn_up_exps, e, &ui, &uo, &c.up_row_bytes);
+        c.down[j] = tensor_expert_bytes(m, l->ffn_down_exps, e, &di, &dout, &c.down_row_bytes);
         if (gi != DS4_N_EMBD || ui != DS4_N_EMBD || go != DS4_N_FF_EXP ||
             uo != DS4_N_FF_EXP || di != DS4_N_FF_EXP || dout != DS4_N_EMBD)
             ds4_die("V4.1 CPU routed-MoE found unexpected expert dimensions");
-        used[e] = u;
-        fill[u] = c.first[u];
-        c.first[u + 1] = c.first[u] + count[e];
+        c.first[j] = run_first[r];
+        c.end[j] = run_first[r] + (order[j] >> 16);
     }
-    for (uint32_t k = 0; k < pairs; k++) entry[fill[used[selected[k]]]++] = k;
     c.entry = entry;
     c.x = x;
     c.x_stride = x_stride;
@@ -1105,10 +1134,10 @@ static bool ds41_cpu_routed_moe_batch(float *partial, float *mid, uint32_t *entr
     /* The IQ2_XXS code table of the gate/up decoder; the dispatch
      * publishes it to the workers. */
     pthread_once(&ds41_iq2xxs_once, ds41_iq2xxs_tables_init);
-    /* Each expert is a NUMA group: a node takes the row half placed on it. */
-    ds4_pool_dispatch((uint64_t)n_used * (DS4_N_FF_EXP / 16), ds41_cpu_routed_mid_batch_worker,
+    /* Each task is a NUMA group: a node takes the row half placed on it. */
+    ds4_pool_dispatch((uint64_t)n_tasks * (DS4_N_FF_EXP / 16), ds41_cpu_routed_mid_batch_worker,
                       &c, DS4_N_FF_EXP / 16, 1, 64);
-    ds4_pool_dispatch((uint64_t)n_used * (DS4_N_EMBD / 16), ds41_cpu_routed_down_batch_worker,
+    ds4_pool_dispatch((uint64_t)n_tasks * (DS4_N_EMBD / 16), ds41_cpu_routed_down_batch_worker,
                       &c, DS4_N_EMBD / 16, 1, 64);
     return true;
 #else
