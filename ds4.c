@@ -1535,6 +1535,8 @@ enum {
     PF_FFN_CUR, PF_FFN_NORM, PF_MOE, PF_SHARED,
     PF_SH_GATE, PF_SH_UP, PF_SH_MID,
     PF_MOE_XQ, PF_MOE_XQ_IQ2, PF_MOE_MID, PF_MOE_MIDQ, PF_MOE_DOWN, PF_MOE_SCRATCH,
+    PF_MOE_TILES, PF_MOE_TILE_Q, PF_MOE_TILE_D, PF_MOE_TILE_BS, PF_MOE_GROUPS,
+    PF_Q8_XQ, PF_Q8_XS, PF_Q8_TILES_XQ, PF_Q8_TILES_XS, PF_OUT_LOW, PF_COMP_XT,
     PF_BUF_COUNT
 };
 
@@ -10113,7 +10115,11 @@ typedef struct {
  * tokens][4 bytes] with +128 applied, xs is [tile][block][16 tokens].  A
  * trailing partial tile of at least q8_0_tile_tail_min() tokens is padded
  * with zero lanes whose results are never stored; shorter tails (and builds
- * without AVX-512 VNNI, n_tiles = 0) take the generic per-row path. */
+ * without AVX-512 VNNI, n_tiles = 0) take the generic per-row path.  The
+ * tiles live in the PF_Q8_TILES_* slots, like the quantized activations in
+ * PF_Q8_XQ/PF_Q8_XS: one batch matmul runs at a time, and at 2048 tokens
+ * the output projection's tiles alone are 75 MB, a fresh mapping per layer
+ * that took a page fault per 4 KB while the pack workers wrote it. */
 typedef struct {
     uint8_t *xq;
     float   *xs;
@@ -10564,11 +10570,6 @@ static void quantize_q8_0_activation_batch(
     ds4_parallel_for(n_tok, quantize_q8_0_batch_worker, &ctx);
 }
 
-static void q8_0_tiles_free(q8_0_tiles *tiles) {
-    free(tiles->xq);
-    free(tiles->xs);
-}
-
 #if defined(DS4_NO_GPU) && defined(__AVX512VNNI__)
 /* Batched Q8_0 GEMM for prefill: 8 weight rows x 16 tokens per pass with
  * vpdpbusd, bitwise identical to dot_q8_0_row.  The generic dot computes per
@@ -10663,8 +10664,8 @@ static q8_0_tiles q8_0_tiles_pack(
     const uint64_t total = n_groups * ctx.tiles.n_tiles;
     if (total == 0) return ctx.tiles;
 
-    ctx.tiles.xq = xmalloc(total * blocks * 512);
-    ctx.tiles.xs = xmalloc(total * blocks * 16 * sizeof(float));
+    ctx.tiles.xq = pf_buf(PF_Q8_TILES_XQ, total * blocks * 512);
+    ctx.tiles.xs = pf_buf(PF_Q8_TILES_XS, total * blocks * 16 * sizeof(float));
     ds4_parallel_for_min_rows(total, q8_0_tiles_pack_worker, &ctx, 1);
     return ctx.tiles;
 }
@@ -11135,7 +11136,6 @@ static void matmul_q8_0_batch_prequant(
 #endif
     ctx.grid = q8_0_tile_grid_make(ctx.out_dim, ctx.tiles.n_tiles, ctx.blocks);
     ds4_parallel_for_min_rows(ctx.grid.n_items, matmul_q8_0_batch_worker, &ctx, 2);
-    q8_0_tiles_free(&ctx.tiles);
 }
 
 static void matmul_q8_0_pair_batch_prequant(
@@ -11171,7 +11171,6 @@ static void matmul_q8_0_pair_batch_prequant(
 #endif
     ctx.grid = q8_0_tile_grid_make(ctx.out_dim, ctx.tiles.n_tiles, ctx.blocks);
     ds4_parallel_for_min_rows(ctx.grid.n_items, matmul_q8_0_pair_batch_worker, &ctx, 2);
-    q8_0_tiles_free(&ctx.tiles);
 }
 
 /* Batched Q8_0 matmul for prefill: quantize all token activations, then scan
@@ -11186,14 +11185,12 @@ static void matmul_q8_0_batch(
 
     const uint64_t in_dim = w->dim[0];
     const uint64_t blocks = (in_dim + 31) / 32;
-    int8_t *xq = xmalloc((size_t)n_tok * blocks * 32);
-    float *xscale = xmalloc((size_t)n_tok * blocks * sizeof(xscale[0]));
+    int8_t *xq = pf_buf(PF_Q8_XQ, (size_t)n_tok * blocks * 32);
+    float *xscale = pf_buf(PF_Q8_XS, (size_t)n_tok * blocks * sizeof(xscale[0]));
 
     quantize_q8_0_activation_batch(x, xq, xscale, n_tok, in_dim);
     matmul_q8_0_batch_prequant(out, m, w, xq, xscale, n_tok);
 
-    free(xscale);
-    free(xq);
 }
 
 static void matmul_q8_0_pair_batch(
@@ -11213,14 +11210,12 @@ static void matmul_q8_0_pair_batch(
 
     const uint64_t in_dim = w0->dim[0];
     const uint64_t blocks = (in_dim + 31) / 32;
-    int8_t *xq = xmalloc((size_t)n_tok * blocks * 32);
-    float *xscale = xmalloc((size_t)n_tok * blocks * sizeof(xscale[0]));
+    int8_t *xq = pf_buf(PF_Q8_XQ, (size_t)n_tok * blocks * 32);
+    float *xscale = pf_buf(PF_Q8_XS, (size_t)n_tok * blocks * sizeof(xscale[0]));
 
     quantize_q8_0_activation_batch(x, xq, xscale, n_tok, in_dim);
     matmul_q8_0_pair_batch_prequant(out0, out1, m, w0, w1, xq, xscale, n_tok);
 
-    free(xscale);
-    free(xq);
 }
 
 static void matvec_q8_0_rows(
@@ -11444,8 +11439,8 @@ static void matmul_q8_0_grouped_batch(
     }
 
     const uint64_t blocks = (group_dim + 31) / 32;
-    int8_t *xq = xmalloc((size_t)n_tok * n_groups * blocks * 32);
-    float *xscale = xmalloc((size_t)n_tok * n_groups * blocks * sizeof(xscale[0]));
+    int8_t *xq = pf_buf(PF_Q8_XQ, (size_t)n_tok * n_groups * blocks * 32);
+    float *xscale = pf_buf(PF_Q8_XS, (size_t)n_tok * n_groups * blocks * sizeof(xscale[0]));
 
     /* The [token][group] activations quantize as n_tok * n_groups rows. */
     quantize_q8_0_activation_batch(x, xq, xscale, n_tok * n_groups, group_dim);
@@ -11466,10 +11461,7 @@ static void matmul_q8_0_grouped_batch(
 #endif
     ctx.grid = q8_0_tile_grid_make(rank, ctx.tiles.n_tiles, blocks);
     ds4_parallel_for_min_rows((uint64_t)n_groups * ctx.grid.n_items, matmul_q8_0_grouped_batch_worker, &ctx, 2);
-    q8_0_tiles_free(&ctx.tiles);
 
-    free(xscale);
-    free(xq);
 }
 
 typedef struct {
@@ -12856,11 +12848,11 @@ static void moe_grouped_ffn(
     for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
         n_tiles += (counts[e + 1] - counts[e] + DS4_MOE_TILE - 1) / DS4_MOE_TILE;
     }
-    ds4_moe_tile *tiles = xmalloc((size_t)n_tiles * sizeof(tiles[0]));
-    int8_t *tile_q = DS4_MOE_X16 ? xmalloc((size_t)n_tiles * nb_max * DS4_MOE_TILE_Q_STRIDE) : NULL;
-    float *tile_d = DS4_MOE_X16 ? xmalloc((size_t)n_tiles * nb_max * DS4_MOE_TILE * sizeof(float)) : NULL;
-    int16_t *tile_bs = DS4_MOE_X16 ? xmalloc((size_t)n_tiles * nb_max * DS4_MOE_TILE_BS_STRIDE * sizeof(int16_t)) : NULL;
-    moe_expert_tiles *groups = xmalloc((size_t)DS4_N_EXPERT * sizeof(groups[0]));
+    ds4_moe_tile *tiles = pf_buf(PF_MOE_TILES, (size_t)n_tiles * sizeof(tiles[0]));
+    int8_t *tile_q = DS4_MOE_X16 ? pf_buf(PF_MOE_TILE_Q, (size_t)n_tiles * nb_max * DS4_MOE_TILE_Q_STRIDE) : NULL;
+    float *tile_d = DS4_MOE_X16 ? pf_buf(PF_MOE_TILE_D, (size_t)n_tiles * nb_max * DS4_MOE_TILE * sizeof(float)) : NULL;
+    int16_t *tile_bs = DS4_MOE_X16 ? pf_buf(PF_MOE_TILE_BS, (size_t)n_tiles * nb_max * DS4_MOE_TILE_BS_STRIDE * sizeof(int16_t)) : NULL;
+    moe_expert_tiles *groups = pf_buf(PF_MOE_GROUPS, (size_t)DS4_N_EXPERT * sizeof(groups[0]));
     uint32_t n_groups = 0;
     uint32_t ti = 0;
     for (uint32_t e = 0; e < DS4_N_EXPERT; e++) {
@@ -12939,11 +12931,6 @@ static void moe_grouped_ffn(
         .scratch_stride = scratch_stride,
     };
     ds4_parallel_for_tasks((uint64_t)n_groups * down_ctx.n_row_blocks, moe_down_tile_worker, &down_ctx);
-    free(groups);
-    free(tile_bs);
-    free(tile_d);
-    free(tile_q);
-    free(tiles);
 
     sum_down_pairs_ctx sum_ctx = { .moe = moe, .down_pair = down_pair, .n_tok = n_tok, .out_dim = out_dim };
     ds4_parallel_for((uint64_t)n_tok * out_dim, sum_down_pairs_worker, &sum_ctx);
@@ -14364,13 +14351,12 @@ static void layer_grouped_out_batch(
     const uint32_t group_dim = DS4_N_HEAD_DIM * group_heads;
     const uint32_t rank = 1024;
 
-    float *low = xcalloc((size_t)n_tok * n_groups * rank, sizeof(low[0]));
+    float *low = pf_buf(PF_OUT_LOW, (size_t)n_tok * n_groups * rank * sizeof(low[0]));
 
     matmul_q8_0_grouped_batch(low, model, layer->attn_output_a, heads,
                               n_tok, n_groups, group_dim, rank);
     matmul_q8_0_batch(out, model, layer->attn_output_b, low, n_tok);
 
-    free(low);
 }
 
 /* =========================================================================
@@ -16308,10 +16294,9 @@ static void compressor_project_batch(
     uint32_t t0 = 0;
 #if defined(DS4_NO_GPU) && defined(__AVX512F__) && defined(__F16C__)
     if (n_tok >= 16) {
-        float *xt = xmalloc((size_t)(n_tok / 16) * 16 * in_dim * sizeof(float));
+        float *xt = pf_buf(PF_COMP_XT, (size_t)(n_tok / 16) * 16 * in_dim * sizeof(float));
         compressor_project_tiles(kv_all, tensor_data(model, wkv), x, xt, in_dim, width, n_tok, true);
         t0 = compressor_project_tiles(sc_all, tensor_data(model, wgate), x, xt, in_dim, width, n_tok, false);
-        free(xt);
     }
 #endif
     if (t0 == n_tok) return;
