@@ -515,6 +515,39 @@ static void ds41_cpu_apply16x2(__m512 *a, __m512 *b, const __m512 *wa, const __m
     }
 }
 
+/* acc[4 t + k] += w[32 k + i] * x[t][off + i] for i in [0, n), in order of
+ * i, for the four tiles k of a row block and the g (one or two) tokens of a
+ * group: each broadcast feeds four tiles, still eight chains. */
+static inline __attribute__((always_inline)) void ds41_cpu_apply16x4_group(
+        __m512 *acc, const __m512 *w, const float *const *x, uint64_t off,
+        uint32_t n, const unsigned g) {
+    __m512 a[8];
+    const float *xg[2];
+    for (unsigned t = 0; t < g; t++) {
+        for (unsigned k = 0; k < 4; k++) a[4 * t + k] = acc[4 * t + k];
+        xg[t] = x[t] + off;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        const __m512 w0 = w[i], w1 = w[32 + i], w2 = w[64 + i], w3 = w[96 + i];
+        for (unsigned t = 0; t < g; t++) {
+            const __m512 v = _mm512_set1_ps(xg[t][i]);
+            a[4 * t] = _mm512_add_ps(a[4 * t], _mm512_mul_ps(w0, v));
+            a[4 * t + 1] = _mm512_add_ps(a[4 * t + 1], _mm512_mul_ps(w1, v));
+            a[4 * t + 2] = _mm512_add_ps(a[4 * t + 2], _mm512_mul_ps(w2, v));
+            a[4 * t + 3] = _mm512_add_ps(a[4 * t + 3], _mm512_mul_ps(w3, v));
+        }
+    }
+    for (unsigned t = 0; t < g; t++)
+        for (unsigned k = 0; k < 4; k++) acc[4 * t + k] = a[4 * t + k];
+}
+
+static void ds41_cpu_apply16x4(__m512 *acc, const __m512 *w, const float *const *x,
+                               uint32_t nt, uint64_t off, uint32_t n) {
+    uint32_t t = 0;
+    for (; t + 2 <= nt; t += 2) ds41_cpu_apply16x4_group(acc + 4 * t, w, x + t, off, n, 2);
+    if (t < nt) ds41_cpu_apply16x4_group(acc + 4 * t, w, x + t, off, n, 1);
+}
+
 /* The 32 values d * q of a Q8_0 block of 16 rows, as ds41_cpu_q8_rows16. */
 static inline void ds41_cpu_q8_decode16(__m512 *w, const uint8_t *block, __m512i offsets) {
     const __m512 d = ds41_cpu_half16(_mm512_i32gather_epi32(offsets, block, 1));
@@ -658,6 +691,40 @@ static void ds41_cpu_q8_batch2_worker(void *vctx, uint64_t first, uint64_t last)
                 _mm512_storeu_ps(out, c->round ? ds41_cpu_bf16_16(acca[t]) : acca[t]);
                 _mm512_storeu_ps(out + 16, c->round ? ds41_cpu_bf16_16(accb[t]) : accb[t]);
             }
+        }
+    }
+}
+
+/* Four tiles (64 rows) at once, sharing every x broadcast among them, for
+ * one token pass: a unit is a row block and a pass, so that a matrix of
+ * few row blocks still has units for every thread.  group_rows must be a
+ * multiple of 64. */
+static void ds41_cpu_q8_batch4_worker(void *vctx, uint64_t first, uint64_t last) {
+    const ds41_cpu_q8_batch_ctx *c = vctx;
+    const __m512i offsets = ds41_cpu_row_offsets(c->row_bytes);
+    const uint32_t passes = (c->n + DS41_CPU_PASS - 1) / DS41_CPU_PASS;
+    __m512 w[128], acc[4 * DS41_CPU_PASS];
+    const float *xp[DS41_CPU_PASS];
+    for (uint64_t unit = first; unit < last; unit++) {
+        const uint64_t row = unit / passes * 64;
+        const uint32_t t0 = (uint32_t)(unit % passes) * DS41_CPU_PASS;
+        const uint32_t nt = c->n - t0 < DS41_CPU_PASS ? c->n - t0 : DS41_CPU_PASS;
+        const uint8_t *rows = c->data + row * c->row_bytes;
+        const float *x = c->x + row / c->group_rows * c->group_in;
+        for (uint32_t t = 0; t < nt; t++) {
+            for (unsigned k = 0; k < 4; k++) acc[4 * t + k] = _mm512_setzero_ps();
+            xp[t] = x + (uint64_t)(t0 + t) * c->x_stride;
+        }
+        for (uint64_t b = 0; b < c->in_dim / 32; b++) {
+            for (unsigned k = 0; k < 4; k++)
+                ds41_cpu_q8_decode16(w + 32 * k, rows + 16 * k * c->row_bytes + b * 34, offsets);
+            ds41_cpu_apply16x4(acc, w, xp, nt, b * 32, 32);
+        }
+        for (uint32_t t = 0; t < nt; t++) {
+            float *out = c->out + (uint64_t)(t0 + t) * c->out_stride + row;
+            for (unsigned k = 0; k < 4; k++)
+                _mm512_storeu_ps(out + 16 * k, c->round ? ds41_cpu_bf16_16(acc[4 * t + k]) :
+                                                          acc[4 * t + k]);
         }
     }
 }
@@ -987,9 +1054,13 @@ static bool ds41_cpu_matmul_q8(float *out, uint64_t out_stride, const ds4_model 
         .out_stride = out_stride, .in_dim = t->dim[0], .row_bytes = t->dim[0] / 32 * 34,
         .group_rows = group_rows, .group_in = group_in, .n = n, .round = round,
     };
-    /* Tile pairs when they still give every thread a unit. */
+    /* Row blocks of four tiles by token pass when they give every thread
+     * two units, else tile pairs when they still give every thread one. */
     ds4_threads_init();
-    if (group_rows % 32 == 0 && rows / 32 >= g_pool.n_threads)
+    const uint64_t passes = (n + DS41_CPU_PASS - 1) / DS41_CPU_PASS;
+    if (group_rows % 64 == 0 && rows / 64 * passes >= 2u * g_pool.n_threads)
+        ds4_parallel_for_min_rows(rows / 64 * passes, ds41_cpu_q8_batch4_worker, &ctx, 1);
+    else if (group_rows % 32 == 0 && rows / 32 >= g_pool.n_threads)
         ds4_parallel_for_min_rows(rows / 32, ds41_cpu_q8_batch2_worker, &ctx, 1);
     else
         ds4_parallel_for_min_rows(rows / 16, ds41_cpu_q8_batch_worker, &ctx, 1);
