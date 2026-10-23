@@ -1155,6 +1155,7 @@ typedef struct {
     bool *index_allowed;
     float *index_q;
     float *index_qt;
+    uint32_t *index_head_done;   /* staged attention: indexer query groups done per head */
     float *index_weights;
     float *index_scores;
     indexer_candidate *index_cand;
@@ -16077,6 +16078,7 @@ static void cpu_decode_scratch_init(ds4_cpu_decode_scratch *scratch, uint32_t ct
     scratch->index_allowed = xmalloc((size_t)comp_cap * sizeof(bool));
     scratch->index_q = xmalloc((size_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
     scratch->index_qt = xmalloc((size_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
+    scratch->index_head_done = xcalloc(DS4_N_INDEXER_HEAD, sizeof(uint32_t));
     scratch->index_weights = xmalloc((size_t)DS4_N_INDEXER_HEAD * sizeof(float));
     scratch->index_scores = xmalloc((size_t)comp_cap * sizeof(float));
     scratch->index_cand = xmalloc((size_t)comp_cap * sizeof(indexer_candidate));
@@ -16138,6 +16140,7 @@ static void cpu_decode_scratch_free(ds4_cpu_decode_scratch *scratch) {
     free(scratch->index_cand);
     free(scratch->index_scores);
     free(scratch->index_weights);
+    free(scratch->index_head_done);
     free(scratch->index_qt);
     free(scratch->index_q);
     free(scratch->index_allowed);
@@ -18116,28 +18119,28 @@ static void layer_attention_raw_swa_batch(
  *                                   and the row list when no top-k applies
  *   3  q_b (Q8_0)                   after 1
  *   4  indexer head weights (F16)   after 0 (ratio-4 layers past top-k only)
- *   5  indexer query (F16)          after 1
- *   6  q tail (16-head groups)      after 3: head norms, RoPE, transpose
- *   7  indexer query tail (heads)   after 5: RoPE and the FP4 round trip,
+ *   5  indexer query (F16)          after 1; the claim that completes a
+ *                                   head runs its RoPE and FP4 round trip,
  *                                   then the transpose
- *   8  indexer scores               after 2, 4, 7, then top-k and the row list
- *   9  attention scores             after 2, 6, 8, with the chunk maxima
- *  10  softmax weights              after 9 (the head maxima from the chunk
+ *   6  q tail (16-head groups)      after 3: head norms, RoPE, transpose
+ *   7  indexer scores               after 2, 4, 5, then top-k and the row list
+ *   8  attention scores             after 2, 6, 7, with the chunk maxima
+ *   9  softmax weights              after 8 (the head maxima from the chunk
  *                                   maxima, as layer_attention_lanes() does)
- *  11  softmax denominators         after 10
- *  12  weighted sums                after 11
- *  13  output tail (head groups)    after 12: inverse RoPE and quantization
- *  14  output projection a          after 13, then the low-rank quantization
- *  15  output projection b          after 14
- *  16  HC post                      after 15 (without steering)
+ *  10  softmax denominators         after 9
+ *  11  weighted sums                after 10
+ *  12  output tail (head groups)    after 11: inverse RoPE and quantization
+ *  13  output projection a          after 12, then the low-rank quantization
+ *  14  output projection b          after 13
+ *  15  HC post                      after 14 (without steering)
  *
  * Every row of every stage runs the kernel the plain dispatch runs on the
  * same inputs, the serial steps are the same functions on the same data, and
  * a stage starts only when every buffer it reads is complete, so q, kv, the
  * caches, the heads, attn_out and the new HC state are bitwise the plain
  * path's.  The one Q8_0 activation buffer is reused along the dependency
- * chain (attn_norm for stage 1, the q_a norm for 3, the heads for 12, the
- * low rank for 13): each quantization runs after every reader of the
+ * chain (attn_norm for stage 1, the q_a norm for 3, the heads for 11, the
+ * low rank for 12): each quantization runs after every reader of the
  * previous contents.  What the plain path serializes between its dispatches
  * now overlaps: the kv tail runs beside q_b, the indexer projections stream
  * right behind q_b, and a thread out of rows in one stage moves on instead
@@ -18290,6 +18293,26 @@ static void attn_graph_index_q_tail_worker(void *vctx, uint64_t r0, uint64_t r1)
     }
 }
 
+/* Stage 5: indexer query rows in whole DS4_F16_ROWS groups, which never
+ * straddle a head.  Each claim counts its groups into their heads, and the
+ * claim that completes a head runs that head's tail right away, so the round
+ * trips overlap the rest of the stream instead of waiting for all of it.
+ * The acquire-release count makes every group of the head visible to the
+ * thread that runs the tail, and the stage is done only after every claim,
+ * tails included, has returned. */
+static void attn_graph_index_q_worker(void *vctx, uint64_t g0, uint64_t g1) {
+    attn_graph_ctx *g = vctx;
+    const uint64_t per_head = DS4_N_INDEXER_HEAD_DIM / DS4_F16_ROWS;
+    matvec_f16_group_worker(&g->index_q, g0, g1);
+    for (uint64_t h = g0 / per_head; h * per_head < g1; h++) {
+        const uint64_t a = h * per_head > g0 ? h * per_head : g0;
+        const uint64_t b = (h + 1) * per_head < g1 ? (h + 1) * per_head : g1;
+        if (__atomic_add_fetch(&g->scratch->index_head_done[h], (uint32_t)(b - a), __ATOMIC_ACQ_REL) == per_head) {
+            attn_graph_index_q_tail_worker(g, h, h + 1);
+        }
+    }
+}
+
 static void attn_graph_index_qt(void *vctx) {
     attn_graph_ctx *g = vctx;
     attn_lanes_transpose_q(g->scratch->index_qt, g->scratch->index_q, DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM);
@@ -18369,6 +18392,8 @@ static bool attn_graph_supported(const ds4_layer_weights *layer, uint32_t ratio)
         DS4_N_INDEXER_HEAD, (uint64_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM,
     };
     const uint32_t n_f16 = ratio == 0 ? 0u : ratio == 4 ? 6u : 2u;
+    /* Stage 5 counts whole F16 row groups into the indexer heads. */
+    if (ratio == 4 && DS4_N_INDEXER_HEAD_DIM % DS4_F16_ROWS != 0) return false;
     for (uint32_t k = 0; k < n_f16; k++) {
         const ds4_tensor *w = f16[k];
         if (!w || w->type != DS4_TENSOR_F16 || w->ndim != 2 || w->dim[0] != f16_in[k]) return false;
@@ -18462,6 +18487,7 @@ static void layer_attention_graph(
         .blocks = DS4_N_LORA_Q / 32,
     };
     if (g.top_k) {
+        memset(scratch->index_head_done, 0, DS4_N_INDEXER_HEAD * sizeof(scratch->index_head_done[0]));
         g.index_weights = (matvec_f16_ctx) {
             .out = scratch->index_weights,
             .data = tensor_data(model, layer->indexer_proj),
@@ -18488,7 +18514,7 @@ static void layer_attention_graph(
     /* n_chunks covers every row that may be listed: the raw window and the
      * compressed rows, or the top-k of them once the indexer selects; items
      * past the rows actually listed do nothing, so the list may shrink in
-     * stage 8. */
+     * stage 7. */
     const uint32_t n_visible = g.top_k && g.top_k < g.n_comp ? g.top_k : g.n_comp;
     g.lanes = (layer_attention_lanes_ctx) {
         .out_heads = scratch->heads,
@@ -18530,7 +18556,7 @@ static void layer_attention_graph(
     const uint64_t n_score = (uint64_t)head_groups * g.lanes.n_chunks;
     const uint64_t n_sum = (uint64_t)head_groups * g.lanes.n_dim_chunks;
     void (*mark)(void *) = g.profile ? attn_graph_mark : NULL;
-    ds4_pool_stage stages[17] = {
+    ds4_pool_stage stages[16] = {
         { .fn = matvec_f16_group_worker, .ctx = &g.hc_mix,
           .n_rows = n_mix_groups, .group_rows = n_mix_groups,
           .finish = attn_graph_hc_pre, .finish_ctx = &g },
@@ -18544,40 +18570,38 @@ static void layer_attention_graph(
         { .fn = matvec_f16_group_worker, .ctx = &g.index_weights,
           .n_rows = g.top_k ? n_weight_groups : 0, .group_rows = n_weight_groups,
           .deps = 1u << 0, .finish = g.top_k ? attn_graph_index_weights : NULL, .finish_ctx = &g },
-        { .fn = matvec_f16_group_worker, .ctx = &g.index_q,
-          .n_rows = g.top_k ? n_index_groups : 0, .group_rows = n_index_groups, .deps = 1u << 1 },
+        { .fn = attn_graph_index_q_worker, .ctx = &g,
+          .n_rows = g.top_k ? n_index_groups : 0, .group_rows = n_index_groups,
+          .deps = 1u << 1, .finish = g.top_k ? attn_graph_index_qt : NULL, .finish_ctx = &g },
         { .fn = attn_graph_q_tail_worker, .ctx = &g,
           .n_rows = head_groups, .group_rows = head_groups,
           .deps = 1u << 3, .finish = mark, .finish_ctx = &g.mark[2] },
-        { .fn = attn_graph_index_q_tail_worker, .ctx = &g,
-          .n_rows = g.top_k ? DS4_N_INDEXER_HEAD : 0, .group_rows = DS4_N_INDEXER_HEAD,
-          .deps = 1u << 5, .finish = g.top_k ? attn_graph_index_qt : NULL, .finish_ctx = &g },
         { .fn = indexer_score_rows_worker, .ctx = &g.index_score,
           .n_rows = g.top_k ? n_index_items : 0, .group_rows = g.top_k ? n_index_items : 1,
-          .deps = (1u << 2) | (1u << 4) | (1u << 7),
+          .deps = (1u << 2) | (1u << 4) | (1u << 5),
           .finish = g.top_k ? attn_graph_index_select : NULL, .finish_ctx = &g },
         { .fn = attn_lanes_score_worker, .ctx = &g.lanes,
-          .n_rows = n_score, .group_rows = n_score, .deps = (1u << 2) | (1u << 6) | (1u << 8) },
+          .n_rows = n_score, .group_rows = n_score, .deps = (1u << 2) | (1u << 6) | (1u << 7) },
         { .fn = attn_lanes_weight_worker, .ctx = &g.lanes,
-          .n_rows = n_score, .group_rows = n_score, .deps = 1u << 9 },
+          .n_rows = n_score, .group_rows = n_score, .deps = 1u << 8 },
         { .fn = attn_lanes_denom_worker, .ctx = &g.lanes,
-          .n_rows = head_groups, .group_rows = head_groups, .deps = 1u << 10 },
+          .n_rows = head_groups, .group_rows = head_groups, .deps = 1u << 9 },
         { .fn = attn_lanes_sum_worker, .ctx = &g.lanes,
           .n_rows = n_sum, .group_rows = n_sum,
-          .deps = 1u << 11, .finish = mark, .finish_ctx = &g.mark[3] },
+          .deps = 1u << 10, .finish = mark, .finish_ctx = &g.mark[3] },
         { .fn = attn_graph_out_tail_worker, .ctx = &g,
-          .n_rows = DS4_N_OUT_GROUP, .group_rows = DS4_N_OUT_GROUP, .deps = 1u << 12 },
+          .n_rows = DS4_N_OUT_GROUP, .group_rows = DS4_N_OUT_GROUP, .deps = 1u << 11 },
         { .fn = matvec_q8_0_grouped_worker, .ctx = &g.out_a,
           .n_rows = low_dim, .group_rows = low_dim,
-          .deps = 1u << 13, .finish = attn_graph_out_low, .finish_ctx = &g },
+          .deps = 1u << 12, .finish = attn_graph_out_low, .finish_ctx = &g },
         { .fn = matvec_q8_0_worker, .ctx = &g.out_b,
           .n_rows = DS4_N_EMBD, .group_rows = DS4_N_EMBD,
-          .deps = 1u << 14, .finish = mark, .finish_ctx = &g.mark[4] },
+          .deps = 1u << 13, .finish = mark, .finish_ctx = &g.mark[4] },
         /* Light elementwise work: claims of 256 columns. */
         { .fn = attn_graph_post_worker, .ctx = &g,
-          .n_rows = DS4_N_EMBD, .group_rows = DS4_N_EMBD, .min_chunk = 256, .deps = 1u << 15 },
+          .n_rows = DS4_N_EMBD, .group_rows = DS4_N_EMBD, .min_chunk = 256, .deps = 1u << 14 },
     };
-    ds4_pool_run_stages(stages, fold_post ? 17 : 16);
+    ds4_pool_run_stages(stages, fold_post ? 16 : 15);
     if (!fold_post) {
         cpu_directional_steering_project_rows(scratch->attn_out, steering_dirs, il, 1, steering_attn_scale);
         hc_post_one(scratch->after_attn_hc, scratch->attn_out, inp_hc, g.post, g.comb, DS4_N_EMBD, DS4_N_HC);

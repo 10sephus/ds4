@@ -2065,6 +2065,8 @@ static void check_attn_graph(void) {
     float *hc0 = xmalloc(hc_dim * sizeof(float)), *q0 = xmalloc(q_dim * sizeof(float));
     float *kv0 = xmalloc(D * sizeof(float)), *heads0 = xmalloc(q_dim * sizeof(float));
     float *out0 = xmalloc(E * sizeof(float));
+    float *iq0 = xmalloc(IH * ID * sizeof(float)), *iqt0 = xmalloc(IH * ID * sizeof(float));
+    float *isc0 = xmalloc(comp_cap * sizeof(float));
     attn_test_fill(dirs, 4 * E, 0.01f);
 
     const struct { int r; uint32_t pos, n_raw, n_comp; bool steer; } cases[] = {
@@ -2100,6 +2102,18 @@ static void check_attn_graph(void) {
                 memcpy(kv0, scratch.kv, D * sizeof(float));
                 memcpy(heads0, scratch.heads, q_dim * sizeof(float));
                 memcpy(out0, scratch.attn_out, E * sizeof(float));
+                /* When the indexer selects, its query (after the FP4 round
+                 * trip), the transposed query and the scores must match too. */
+                const uint32_t n_index = ca[r].c.n_index_comp;
+                const bool indexed = ratios[r] == 4 && n_index > DS4_N_INDEXER_TOP_K;
+                if (indexed) {
+                    memcpy(iq0, scratch.index_q, IH * ID * sizeof(float));
+                    memcpy(iqt0, scratch.index_qt, IH * ID * sizeof(float));
+                    memcpy(isc0, scratch.index_scores, n_index * sizeof(float));
+                    memset(scratch.index_q, 0xff, IH * ID * sizeof(float));
+                    memset(scratch.index_qt, 0xff, IH * ID * sizeof(float));
+                    memset(scratch.index_scores, 0xff, n_index * sizeof(float));
+                }
                 memset(scratch.after_attn_hc, 0xff, hc_dim * sizeof(float));
                 memset(scratch.q, 0xff, q_dim * sizeof(float));
                 memset(scratch.kv, 0xff, D * sizeof(float));
@@ -2120,6 +2134,11 @@ static void check_attn_graph(void) {
                 attn_test_equal("attention graph heads", heads0, scratch.heads, q_dim);
                 attn_test_equal("attention graph output", out0, scratch.attn_out, E);
                 attn_test_equal("attention graph HC post", hc0, scratch.after_attn_hc, hc_dim);
+                if (indexed) {
+                    attn_test_equal("attention graph indexer query", iq0, scratch.index_q, IH * ID);
+                    attn_test_equal("attention graph indexer query transpose", iqt0, scratch.index_qt, IH * ID);
+                    attn_test_equal("attention graph indexer scores", isc0, scratch.index_scores, n_index);
+                }
                 attn_test_cache_equal(&ca[r], &cb[r]);
                 uint64_t live = 0;
                 for (uint64_t i = 0; i < E; i++) live += isfinite(out0[i]) && out0[i] != 0.0f;
@@ -2136,6 +2155,7 @@ static void check_attn_graph(void) {
         attn_test_cache_free(&ca[r]);
         attn_test_cache_free(&cb[r]);
     }
+    free(isc0); free(iqt0); free(iq0);
     free(out0); free(heads0); free(kv0); free(q0); free(hc0); free(dirs); free(res);
     cpu_decode_scratch_free(&scratch);
     quant_free(wb);
