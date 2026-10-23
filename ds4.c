@@ -17503,12 +17503,57 @@ typedef struct {
  * cursor as on the dots. */
 #define INDEXER_SCORE_ROWS 8
 
+#if defined(DS4_NO_GPU) && defined(__AVX512F__)
+/* The score of one row from its four sixteen-head dot vectors, in the order
+ * of the per-row loop below: head groups in order, heads in order. */
+static inline float indexer_score_lanes(const indexer_score_ctx *ctx, const __m512 acc[4]) {
+    float s = 0.0f;
+    for (uint32_t g = 0; g < 4; g++) {
+        float dots[16];
+        _mm512_storeu_ps(dots, acc[g]);
+        for (uint32_t j = 0; j < 16; j++) {
+            float dot = dots[j];
+            if (dot < 0.0f) dot = 0.0f;
+            s += dot * ctx->weights[g * 16 + j];
+        }
+    }
+    return s;
+}
+#endif
+
 static void indexer_score_rows_worker(void *vctx, uint64_t g0, uint64_t g1) {
     const indexer_score_ctx *ctx = vctx;
     const uint32_t head_dim = DS4_N_INDEXER_HEAD_DIM;
     const uint32_t n_head = DS4_N_INDEXER_HEAD;
     const uint64_t row1 = g1 * INDEXER_SCORE_ROWS < ctx->n_comp ? g1 * INDEXER_SCORE_ROWS : ctx->n_comp;
-    for (uint64_t c = g0 * INDEXER_SCORE_ROWS; c < row1; c++) {
+    uint64_t c = g0 * INDEXER_SCORE_ROWS;
+#if defined(DS4_NO_GPU) && defined(__AVX512F__)
+    /* The 64-head layout, two rows at a time: the loop below runs one
+     * 128-step add chain per head group, each step waiting on the last, while
+     * here eight chains (two rows by four groups) advance together.  Every
+     * lane still adds kv[i] * q[h][i] for i = 0, 1, ... from +0.0f with
+     * separate multiply and add, so the dots and the scores are the same. */
+    if (n_head == 64) {
+        const uint64_t gs = (uint64_t)16 * head_dim;
+        for (; c + 2 <= row1; c += 2) {
+            const float *kv0 = ctx->index_comp + c * head_dim, *kv1 = kv0 + head_dim;
+            __m512 a0[4], a1[4];
+            for (uint32_t g = 0; g < 4; g++) a0[g] = a1[g] = _mm512_setzero_ps();
+            for (uint32_t i = 0; i < head_dim; i++) {
+                const float *qt = ctx->qt + (uint64_t)i * 16;
+                const __m512 k0 = _mm512_set1_ps(kv0[i]), k1 = _mm512_set1_ps(kv1[i]);
+                for (uint32_t g = 0; g < 4; g++) {
+                    const __m512 qv = _mm512_loadu_ps(qt + g * gs);
+                    a0[g] = _mm512_add_ps(a0[g], _mm512_mul_ps(k0, qv));
+                    a1[g] = _mm512_add_ps(a1[g], _mm512_mul_ps(k1, qv));
+                }
+            }
+            ctx->scores[c] = indexer_score_lanes(ctx, a0);
+            ctx->scores[c + 1] = indexer_score_lanes(ctx, a1);
+        }
+    }
+#endif
+    for (; c < row1; c++) {
         const float *kv = ctx->index_comp + c * head_dim;
         float s = 0.0f;
         uint32_t h = 0;
