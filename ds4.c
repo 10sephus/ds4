@@ -15948,7 +15948,8 @@ static void output_logits_one(
  */
 
 typedef struct {
-    float *raw_kv;
+    float *raw_kv;      /* the window: n_raw rows, oldest first */
+    float *raw_base;    /* room for 2 * cap_raw rows; raw_kv slides through it */
     uint32_t n_raw;
     uint32_t cap_raw;
 
@@ -16179,7 +16180,8 @@ static void kv_cache_init(ds4_kv_cache *cache, uint32_t ctx_size, uint32_t raw_c
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         cache->layer[il].cap_raw = raw_cap;
-        cache->layer[il].raw_kv = xmalloc_zeroed((size_t)raw_cap * DS4_N_HEAD_DIM, sizeof(float));
+        cache->layer[il].raw_base = xmalloc_zeroed((size_t)2 * raw_cap * DS4_N_HEAD_DIM, sizeof(float));
+        cache->layer[il].raw_kv = cache->layer[il].raw_base;
         cache->layer[il].compress_ratio = ratio;
 
         if (ratio != 0) {
@@ -16213,7 +16215,7 @@ static void kv_cache_init(ds4_kv_cache *cache, uint32_t ctx_size, uint32_t raw_c
 static void kv_cache_free(ds4_kv_cache *cache) {
     if (!cache) return;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-        free(cache->layer[il].raw_kv);
+        free(cache->layer[il].raw_base);
         free(cache->layer[il].attn_comp_kv);
         free(cache->layer[il].attn_state_kv);
         free(cache->layer[il].attn_state_score);
@@ -16224,7 +16226,12 @@ static void kv_cache_free(ds4_kv_cache *cache) {
     memset(cache, 0, sizeof(*cache));
 }
 
-/* Append to the raw SWA cache.  Once full, it slides by one row. */
+/* Append to the raw SWA cache.  Once full, every push drops the oldest row:
+ * the window slides forward through a buffer of twice its rows, and the
+ * whole window (256 KB per layer) moves back to the start once every cap_raw
+ * tokens instead of once per token.  The rows the attention reads then stay
+ * clean in the caches of the threads that read them last token instead of
+ * being rewritten by the one thread that runs the push. */
 static void kv_cache_push_raw(ds4_layer_cache *cache, const float *kv) {
     if (cache->n_raw < cache->cap_raw) {
         float *dst = cache->raw_kv + (uint64_t)cache->n_raw * DS4_N_HEAD_DIM;
@@ -16233,10 +16240,16 @@ static void kv_cache_push_raw(ds4_layer_cache *cache, const float *kv) {
         return;
     }
 
-    memmove(cache->raw_kv,
-            cache->raw_kv + DS4_N_HEAD_DIM,
-            (size_t)(cache->cap_raw - 1) * DS4_N_HEAD_DIM * sizeof(cache->raw_kv[0]));
-    float *dst = cache->raw_kv + (uint64_t)(cache->cap_raw - 1) * DS4_N_HEAD_DIM;
+    const uint64_t cap = cache->cap_raw;
+    if (cache->raw_kv + (cap + 1) * DS4_N_HEAD_DIM <= cache->raw_base + 2 * cap * DS4_N_HEAD_DIM) {
+        cache->raw_kv += DS4_N_HEAD_DIM;
+    } else {
+        memmove(cache->raw_base,
+                cache->raw_kv + DS4_N_HEAD_DIM,
+                (size_t)(cap - 1) * DS4_N_HEAD_DIM * sizeof(cache->raw_kv[0]));
+        cache->raw_kv = cache->raw_base;
+    }
+    float *dst = cache->raw_kv + (cap - 1) * DS4_N_HEAD_DIM;
     for (uint32_t i = 0; i < DS4_N_HEAD_DIM; i++) dst[i] = f16_to_f32(f32_to_f16(kv[i]));
 }
 
@@ -18054,7 +18067,8 @@ static void layer_attention_raw_swa_batch(
  *   1  q_a, kv, compressor rows     after 0, then the q_a norm and its
  *                                   quantization
  *   2  kv tail (one item)           after 1: kv norm, RoPE, FP8, the raw
- *                                   push, the compressor updates and pushes
+ *                                   push, the compressor updates and pushes,
+ *                                   and the row list when no top-k applies
  *   3  q_b (Q8_0)                   after 1
  *   4  q tail (16-head groups)      after 3: head norms, RoPE, transpose
  *   5  indexer head weights (F16)   after 0 (ratio-4 layers past top-k only)
@@ -18153,6 +18167,8 @@ static void attn_graph_q_a(void *vctx) {
     if (g->profile) g->mark[1] = now_sec();
 }
 
+static void attn_graph_rows(attn_graph_ctx *g);
+
 /* The serial kv steps of the plain path, as one work item beside q_b. */
 static void attn_graph_kv_worker(void *vctx, uint64_t i0, uint64_t i1) {
     attn_graph_ctx *g = vctx;
@@ -18167,6 +18183,9 @@ static void attn_graph_kv_worker(void *vctx, uint64_t i0, uint64_t i1) {
     rope_tail_layer_inplace(scratch->kv, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, g->pos, g->il, false);
     dsv4_fp8_kv_quantize_row_inplace_cpu(scratch->kv, DS4_N_HEAD_DIM, DS4_N_ROT);
     kv_cache_push_raw(cache, scratch->kv);
+    /* The push may slide the window, so the rows are listed after it (or
+     * after the indexer's selection, which runs later). */
+    if (!g->top_k) attn_graph_rows(g);
     if (g->ratio == 0) return;
     if (compressor_update_one(scratch->comp, model,
                               layer->attn_compressor_ape, layer->attn_compressor_norm,
@@ -18422,7 +18441,7 @@ static void layer_attention_graph(
     /* n_chunks covers every row that may be listed: the raw window and the
      * compressed rows, or the top-k of them once the indexer selects; items
      * past the rows actually listed do nothing, so the list may shrink in
-     * stage 7. */
+     * stage 8. */
     const uint32_t n_visible = g.top_k && g.top_k < g.n_comp ? g.top_k : g.n_comp;
     g.lanes = (layer_attention_lanes_ctx) {
         .out_heads = scratch->heads,
@@ -18438,7 +18457,6 @@ static void layer_attention_graph(
         .n_chunks = (g.n_raw + n_visible + ATTN_LANES_ROWS_PER_ITEM - 1) / ATTN_LANES_ROWS_PER_ITEM,
         .n_dim_chunks = (head_dim + 15) / 16,
     };
-    if (!g.top_k) attn_graph_rows(&g);
     g.out_a = (matvec_q8_0_grouped_ctx) {
         .out = scratch->attn_low,
         .data = tensor_data(model, layer->attn_output_a),
@@ -43338,8 +43356,9 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
                           sizeof(float) +
                           attn_stage_cap * DS4_N_HEAD_DIM * sizeof(float);
     } else {
+        /* The raw window slides through twice its rows (kv_cache_push_raw). */
         m.raw_cap = ds4_default_raw_cap(ctx);
-        m.raw_bytes = (uint64_t)DS4_N_LAYER *
+        m.raw_bytes = 2ull * DS4_N_LAYER *
                       m.raw_cap *
                       DS4_N_HEAD_DIM *
                       sizeof(float);

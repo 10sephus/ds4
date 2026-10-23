@@ -1827,7 +1827,8 @@ static void attn_test_cache_alloc(attn_test_cache *tc, uint32_t ratio, uint32_t 
     ds4_layer_cache *c = &tc->c;
     memset(tc, 0, sizeof(*tc));
     c->cap_raw = cap_raw;
-    c->raw_kv = xmalloc((size_t)cap_raw * DS4_N_HEAD_DIM * sizeof(float));
+    c->raw_base = xmalloc((size_t)2 * cap_raw * DS4_N_HEAD_DIM * sizeof(float));
+    c->raw_kv = c->raw_base;
     c->compress_ratio = ratio;
     if (ratio == 0) return;
     const uint32_t coff = ratio == 4 ? 2 : 1;
@@ -1847,7 +1848,7 @@ static void attn_test_cache_alloc(attn_test_cache *tc, uint32_t ratio, uint32_t 
 static void attn_test_cache_free(attn_test_cache *tc) {
     ds4_layer_cache *c = &tc->c;
     free(c->index_state_score); free(c->index_state_kv); free(c->index_comp_kv);
-    free(c->attn_state_score); free(c->attn_state_kv); free(c->attn_comp_kv); free(c->raw_kv);
+    free(c->attn_state_score); free(c->attn_state_kv); free(c->attn_comp_kv); free(c->raw_base);
 }
 
 static void attn_test_fill(float *x, uint64_t n, float scale) {
@@ -1913,6 +1914,32 @@ static void attn_test_cache_equal(const attn_test_cache *ea, const attn_test_cac
                     (uint64_t)ea->index_width * ea->state_rows);
     attn_test_equal("attention graph indexer scores", e->index_state_score, g->index_state_score,
                     (uint64_t)ea->index_width * ea->state_rows);
+}
+
+/* The raw window slides through twice its rows and moves back once it
+ * reaches the end: after every push it must hold the last cap_raw rows
+ * pushed, oldest first, as the memmove it replaces left them. */
+static void check_raw_window(void) {
+    ds4_kv_cache kc;
+    kv_cache_init(&kc, 64, 4);
+    ds4_layer_cache *c = &kc.layer[0];
+    const uint32_t cap = c->cap_raw, n_push = 5 * cap + 3;
+    CHECK(cap == 4);
+    float *rows = xmalloc((size_t)n_push * DS4_N_HEAD_DIM * sizeof(float));
+    for (uint64_t i = 0; i < (uint64_t)n_push * DS4_N_HEAD_DIM; i++) {
+        rows[i] = f16_to_f32(f32_to_f16(quant_float()));
+    }
+    for (uint32_t t = 0; t < n_push; t++) {
+        kv_cache_push_raw(c, rows + (uint64_t)t * DS4_N_HEAD_DIM);
+        const uint32_t n = t + 1 < cap ? t + 1 : cap;
+        CHECK(c->n_raw == n);
+        CHECK(c->raw_kv >= c->raw_base && c->raw_kv + (uint64_t)cap * DS4_N_HEAD_DIM <=
+                                          c->raw_base + 2ull * cap * DS4_N_HEAD_DIM);
+        attn_test_equal("raw window", rows + (uint64_t)(t + 1 - n) * DS4_N_HEAD_DIM, c->raw_kv,
+                        (uint64_t)n * DS4_N_HEAD_DIM);
+    }
+    free(rows);
+    kv_cache_free(&kc);
 }
 
 /* The staged decode attention sublayer must reproduce the plain one bit for
@@ -2578,6 +2605,8 @@ static void check_ds41_q8_grouped(void) {
 
 int main(void) {
     check_ffn_graph();
+    check_raw_window();
+    puts("CPU raw KV window slides like the memmove it replaces PASS");
     check_attn_graph();
     check_thread_pool();
     check_ds41_q8_grouped();
