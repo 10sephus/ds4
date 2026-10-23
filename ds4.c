@@ -12979,20 +12979,33 @@ typedef struct {
     uint64_t out_dim;
 } sum_down_pairs_ctx;
 
-/* Reduce a token's down partials in router slot order: the same
- * acc = 0; acc += v sequence as matvec_q2_k_experts_accum_prequant on the
- * decode path. */
-static void sum_down_pairs_worker(void *vctx, uint64_t row0, uint64_t row1) {
+/* Reduce the down partials of the tokens [t0, t1) in router slot order: per
+ * output the same acc = 0; acc += v sequence as
+ * matvec_q2_k_experts_accum_prequant on the decode path, sixteen outputs per
+ * vector (every lane adds its own slots in that order, so each sum is the
+ * scalar one bit for bit). */
+static void sum_down_pairs_worker(void *vctx, uint64_t t0, uint64_t t1) {
     sum_down_pairs_ctx *ctx = vctx;
-    for (uint64_t idx = row0; idx < row1; idx++) {
-        const uint32_t token = (uint32_t)(idx / ctx->out_dim);
-        const uint64_t row = idx - (uint64_t)token * ctx->out_dim;
-        float acc = 0.0f;
-        for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
-            const uint64_t pair_id = (uint64_t)token * DS4_N_EXPERT_USED + slot;
-            acc += ctx->down_pair[pair_id * ctx->out_dim + row];
+    const uint64_t out_dim = ctx->out_dim;
+    const uint32_t n_used = DS4_N_EXPERT_USED;
+    for (uint64_t token = t0; token < t1; token++) {
+        const float *src = ctx->down_pair + token * n_used * out_dim;
+        float *dst = ctx->moe + token * out_dim;
+        uint64_t row = 0;
+#if defined(DS4_NO_GPU) && defined(__AVX512F__)
+        for (; row + 16 <= out_dim; row += 16) {
+            __m512 acc = _mm512_setzero_ps();
+            for (uint32_t slot = 0; slot < n_used; slot++) {
+                acc = _mm512_add_ps(acc, _mm512_loadu_ps(src + (uint64_t)slot * out_dim + row));
+            }
+            _mm512_storeu_ps(dst + row, acc);
         }
-        ctx->moe[idx] = acc;
+#endif
+        for (; row < out_dim; row++) {
+            float acc = 0.0f;
+            for (uint32_t slot = 0; slot < n_used; slot++) acc += src[(uint64_t)slot * out_dim + row];
+            dst[row] = acc;
+        }
     }
 }
 
@@ -13136,7 +13149,7 @@ static void moe_grouped_ffn(
     ds4_parallel_for_tasks((uint64_t)n_groups * down_ctx.n_row_blocks, moe_down_tile_worker, &down_ctx);
 
     sum_down_pairs_ctx sum_ctx = { .moe = moe, .down_pair = down_pair, .n_tok = n_tok, .out_dim = out_dim };
-    ds4_parallel_for((uint64_t)n_tok * out_dim, sum_down_pairs_worker, &sum_ctx);
+    ds4_parallel_for_min_rows(n_tok, sum_down_pairs_worker, &sum_ctx, 1);
 }
 
 /* =========================================================================
