@@ -18115,13 +18115,13 @@ static void layer_attention_raw_swa_batch(
  *                                   push, the compressor updates and pushes,
  *                                   and the row list when no top-k applies
  *   3  q_b (Q8_0)                   after 1
- *   4  q tail (16-head groups)      after 3: head norms, RoPE, transpose
- *   5  indexer head weights (F16)   after 0 (ratio-4 layers past top-k only)
- *   6  indexer query (F16)          after 1
- *   7  indexer query tail (heads)   after 6: RoPE and the FP4 round trip,
+ *   4  indexer head weights (F16)   after 0 (ratio-4 layers past top-k only)
+ *   5  indexer query (F16)          after 1
+ *   6  q tail (16-head groups)      after 3: head norms, RoPE, transpose
+ *   7  indexer query tail (heads)   after 5: RoPE and the FP4 round trip,
  *                                   then the transpose
- *   8  indexer scores               after 2, 5, 7, then top-k and the row list
- *   9  attention scores             after 2, 4, 8, with the chunk maxima
+ *   8  indexer scores               after 2, 4, 7, then top-k and the row list
+ *   9  attention scores             after 2, 6, 8, with the chunk maxima
  *  10  softmax weights              after 9 (the head maxima from the chunk
  *                                   maxima, as layer_attention_lanes() does)
  *  11  softmax denominators         after 10
@@ -18139,10 +18139,12 @@ static void layer_attention_raw_swa_batch(
  * chain (attn_norm for stage 1, the q_a norm for 3, the heads for 12, the
  * low rank for 13): each quantization runs after every reader of the
  * previous contents.  What the plain path serializes between its dispatches
- * now overlaps: the kv tail runs beside q_b, the indexer projections beside
- * the q tail (the threads walk the stages in order, so they reach stage 5
- * once q_b is done), and a thread out of rows in one stage moves on instead
- * of waiting at a join. */
+ * now overlaps: the kv tail runs beside q_b, the indexer projections stream
+ * right behind q_b, and a thread out of rows in one stage moves on instead
+ * of waiting at a join.  The threads walk the stages in order and wait at
+ * each one for its inputs, so the q tail, which waits for the last q_b row,
+ * comes after the indexer projections: a thread out of q_b rows starts on
+ * them at once instead of waiting for the slowest q_b claim. */
 
 /* Decode profile phases of the attention sublayer (DS4_DECODE_PROFILE_DETAIL). */
 enum {
@@ -18539,23 +18541,23 @@ static void layer_attention_graph(
           .n_rows = 1, .group_rows = 1, .deps = 1u << 1 },
         { .fn = matvec_q8_0_worker, .ctx = &g.q_b,
           .n_rows = q_dim, .group_rows = q_dim, .deps = 1u << 1 },
-        { .fn = attn_graph_q_tail_worker, .ctx = &g,
-          .n_rows = head_groups, .group_rows = head_groups,
-          .deps = 1u << 3, .finish = mark, .finish_ctx = &g.mark[2] },
         { .fn = matvec_f16_group_worker, .ctx = &g.index_weights,
           .n_rows = g.top_k ? n_weight_groups : 0, .group_rows = n_weight_groups,
           .deps = 1u << 0, .finish = g.top_k ? attn_graph_index_weights : NULL, .finish_ctx = &g },
         { .fn = matvec_f16_group_worker, .ctx = &g.index_q,
           .n_rows = g.top_k ? n_index_groups : 0, .group_rows = n_index_groups, .deps = 1u << 1 },
+        { .fn = attn_graph_q_tail_worker, .ctx = &g,
+          .n_rows = head_groups, .group_rows = head_groups,
+          .deps = 1u << 3, .finish = mark, .finish_ctx = &g.mark[2] },
         { .fn = attn_graph_index_q_tail_worker, .ctx = &g,
           .n_rows = g.top_k ? DS4_N_INDEXER_HEAD : 0, .group_rows = DS4_N_INDEXER_HEAD,
-          .deps = 1u << 6, .finish = g.top_k ? attn_graph_index_qt : NULL, .finish_ctx = &g },
+          .deps = 1u << 5, .finish = g.top_k ? attn_graph_index_qt : NULL, .finish_ctx = &g },
         { .fn = indexer_score_rows_worker, .ctx = &g.index_score,
           .n_rows = g.top_k ? n_index_items : 0, .group_rows = g.top_k ? n_index_items : 1,
-          .deps = (1u << 2) | (1u << 5) | (1u << 7),
+          .deps = (1u << 2) | (1u << 4) | (1u << 7),
           .finish = g.top_k ? attn_graph_index_select : NULL, .finish_ctx = &g },
         { .fn = attn_lanes_score_worker, .ctx = &g.lanes,
-          .n_rows = n_score, .group_rows = n_score, .deps = (1u << 2) | (1u << 4) | (1u << 8) },
+          .n_rows = n_score, .group_rows = n_score, .deps = (1u << 2) | (1u << 6) | (1u << 8) },
         { .fn = attn_lanes_weight_worker, .ctx = &g.lanes,
           .n_rows = n_score, .group_rows = n_score, .deps = 1u << 9 },
         { .fn = attn_lanes_denom_worker, .ctx = &g.lanes,
@@ -18769,8 +18771,9 @@ static void layer_forward_raw_swa_one(
                               steering_dirs, steering_attn_scale, scratch, profile ? mark : NULL);
         if (profile) {
             /* The critical path of the staged dispatch: q is the HC pre step
-             * to the q_a norm, kv the q_b projection and its tail; the kv
-             * tail and the indexer overlap q_b and are not timed. */
+             * to the q_a norm, kv the q_b projection and its tail (with the
+             * indexer projections, which stream before the tail); the kv
+             * tail overlaps q_b and is not timed. */
             t[ATTN_T_HC] = mark[0] - t_start;
             t[ATTN_T_Q] = mark[1] - mark[0];
             t[ATTN_T_KV] = mark[2] - mark[1];
