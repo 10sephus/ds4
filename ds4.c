@@ -63386,7 +63386,8 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) return ds41_cpu_memory(ctx);
 
     m.raw_cap = ds4_default_raw_cap(ctx);
-    m.raw_bytes = (uint64_t)DS4_N_LAYER *
+    /* The raw window slides through twice its rows (kv_cache_push_raw). */
+    m.raw_bytes = 2ull * DS4_N_LAYER *
                   m.raw_cap *
                   DS4_N_HEAD_DIM *
                   sizeof(float);
