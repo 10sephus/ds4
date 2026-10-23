@@ -12306,8 +12306,13 @@ static void matvec_iq2_xxs_experts_accum_prequant(
 /* The x16 kernels always compute sixteen lanes; a sparser tile costs less
  * through the per-row reference dots. */
 #define DS4_MOE_X16_MIN_LANES 3
-/* Rows per pool task: an (expert, row block) pair. */
+/* Rows per pool task: an (expert, row block) pair.  A down task is a
+ * quarter of the work of a gate/up task per row (half the superblocks, one
+ * row per pass instead of a pair), so it takes four times the rows: the
+ * expert's tiles, re-read from L3 by every task, then stream past once per
+ * 128 rows, and the per-task decode and claim costs are spread the same way. */
 #define DS4_MOE_ROW_BLOCK 32
+#define DS4_MOE_DOWN_ROW_BLOCK 128
 /* Tokens per moe_grouped_ffn call.  Tokens are independent, so chunking
  * keeps the outputs and only bounds the transient per-pair buffers (mid,
  * midq, down_pair: about 140 KB per token) to some 300 MB on long prompts. */
@@ -12882,9 +12887,9 @@ typedef struct {
     size_t scratch_stride;
 } moe_down_tile_ctx;
 
-/* Four down rows per pass share the tile loads; the task's rows are decoded
- * once into the thread's L2-resident buffer and every tile of the expert
- * streams past once. */
+/* Four down rows per pass share the tile loads; the task's 128 rows are
+ * decoded once into the thread's L2-resident buffer and every tile of the
+ * expert streams past once per task. */
 static void moe_down_tile_worker(void *vctx, uint64_t task0, uint64_t task1) {
     moe_down_tile_ctx *ctx = vctx;
     const uint32_t nb = ctx->nb;
@@ -12898,8 +12903,8 @@ static void moe_down_tile_worker(void *vctx, uint64_t task0, uint64_t task1) {
         moe_task_split(task, ctx->n_groups, ctx->n_row_blocks, &gi, &rb);
         const moe_expert_tiles *g = ctx->groups + gi;
         const ds4_moe_tile *tiles = ctx->tiles + g->tile0;
-        const uint64_t row0 = (uint64_t)rb * DS4_MOE_ROW_BLOCK;
-        const uint64_t row1 = row0 + DS4_MOE_ROW_BLOCK < ctx->out_dim ? row0 + DS4_MOE_ROW_BLOCK : ctx->out_dim;
+        const uint64_t row0 = (uint64_t)rb * DS4_MOE_DOWN_ROW_BLOCK;
+        const uint64_t row1 = row0 + DS4_MOE_DOWN_ROW_BLOCK < ctx->out_dim ? row0 + DS4_MOE_DOWN_ROW_BLOCK : ctx->out_dim;
         const uint8_t *down = ctx->down + (uint64_t)tiles->expert * ctx->out_dim * ctx->row_bytes;
 #if DS4_MOE_X16
         if (tiles->n >= DS4_MOE_X16_MIN_LANES) {
@@ -13075,7 +13080,9 @@ static void moe_grouped_ffn(
     /* Per-thread decode buffers of the tile workers: a row block of gate/up
      * pairs with their scales, or of down rows. */
     size_t scratch_stride = (size_t)2 * DS4_MOE_ROW_BLOCK * nb_in * (QK_K + QK_K / 32 * sizeof(int32_t));
-    if (scratch_stride < (size_t)DS4_MOE_ROW_BLOCK * nb_mid * QK_K) scratch_stride = (size_t)DS4_MOE_ROW_BLOCK * nb_mid * QK_K;
+    if (scratch_stride < (size_t)DS4_MOE_DOWN_ROW_BLOCK * nb_mid * QK_K) {
+        scratch_stride = (size_t)DS4_MOE_DOWN_ROW_BLOCK * nb_mid * QK_K;
+    }
     scratch_stride = (scratch_stride + 63) & ~(size_t)63;
     uint8_t *scratch = DS4_MOE_X16 ? pf_buf(PF_MOE_SCRATCH, (size_t)ds4_pool_threads() * scratch_stride) : NULL;
 
@@ -13122,7 +13129,7 @@ static void moe_grouped_ffn(
         .out_dim = out_dim,
         .nb = nb_mid,
         .n_groups = n_groups,
-        .n_row_blocks = (uint32_t)((out_dim + DS4_MOE_ROW_BLOCK - 1) / DS4_MOE_ROW_BLOCK),
+        .n_row_blocks = (uint32_t)((out_dim + DS4_MOE_DOWN_ROW_BLOCK - 1) / DS4_MOE_DOWN_ROW_BLOCK),
         .scratch = scratch,
         .scratch_stride = scratch_stride,
     };

@@ -2642,9 +2642,11 @@ int main(void) {
 #endif
     check_decode_glue();
     puts("CPU decode glue (RoPE, HC, head RMS, E4M3) bitwise oracles PASS");
-    /* nb_in > nb_mid with a partial last row block, then nb_in < nb_mid. */
+    /* nb_in > nb_mid with a partial last row block, then nb_in < nb_mid,
+     * then a full down row block followed by a partial one. */
     check_grouped_ffn(2 * QK_K, QK_K, 2 * DS4_MOE_ROW_BLOCK + 6);
     check_grouped_ffn(QK_K, 2 * QK_K, 2 * DS4_MOE_ROW_BLOCK);
+    check_grouped_ffn(QK_K, QK_K, DS4_MOE_DOWN_ROW_BLOCK + 2 * DS4_MOE_ROW_BLOCK + 6);
     puts("CPU grouped routed FFN bitwise with the per-token decode path PASS");
     return 0;
 }
