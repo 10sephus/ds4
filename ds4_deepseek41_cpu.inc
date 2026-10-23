@@ -1153,7 +1153,8 @@ static bool ds41_cpu_prefill_layer(ds41_cpu_state *s, uint32_t il, uint32_t n,
                              b->rows + (il == 1 ? 0 : cols), 2u * cols, n, true)) return false;
     }
     ds4_parallel_for_min_rows(n, ds41_cpu_batch_attn_flat_worker, &c, 1);
-    c.mixed = ds41_cpu_matmul_f32(b->mix, 24, m, l->hc_attn_fn, b->flat, 4u * 5120u, n, b->xt);
+    c.mixed = ds41_cpu_matmul_f32(b->mix, 24, m, l->hc_attn_fn, b->flat, 4u * 5120u, n, b->xt) ||
+        ds41_cpu_matmul_f16(b->mix, 24, m, l->hc_attn_fn, b->flat, 4u * 5120u, n, false);
     ds4_parallel_for_min_rows(n, ds41_cpu_batch_attn_in_worker, &c, 1);
     if (c.failed) return false;
     DS41_PHASE(0);
@@ -1198,7 +1199,8 @@ static bool ds41_cpu_prefill_layer(ds41_cpu_state *s, uint32_t il, uint32_t n,
     }
     DS41_PHASE(3);
     ds4_parallel_for_min_rows(n, ds41_cpu_batch_ffn_flat_worker, &c, 1);
-    c.mixed = ds41_cpu_matmul_f32(b->mix, 24, m, l->hc_ffn_fn, b->flat, 4u * 5120u, n, b->xt);
+    c.mixed = ds41_cpu_matmul_f32(b->mix, 24, m, l->hc_ffn_fn, b->flat, 4u * 5120u, n, b->xt) ||
+        ds41_cpu_matmul_f16(b->mix, 24, m, l->hc_ffn_fn, b->flat, 4u * 5120u, n, false);
     ds4_parallel_for_min_rows(n, ds41_cpu_batch_ffn_in_worker, &c, 1);
     if (c.failed) return false;
     c.routed = ds41_cpu_matmul_f32(b->probs, DS4_N_EXPERT, m, l->ffn_gate_inp, b->norm, 5120,

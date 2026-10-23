@@ -737,7 +737,7 @@ typedef struct {
     const uint8_t *data;
     const float *x;
     float *out;
-    uint64_t x_stride, out_stride, in_dim, row_bytes;
+    uint64_t x_stride, out_stride, in_dim, row_bytes, rows;
     uint32_t n;
     bool round;
 } ds41_cpu_f16_batch_ctx;
@@ -803,6 +803,40 @@ static void ds41_cpu_f16_batch2_worker(void *vctx, uint64_t first, uint64_t last
                 _mm512_storeu_ps(out + 16, c->round ? ds41_cpu_bf16_16(accb[t]) : accb[t]);
             }
         }
+    }
+}
+
+/* Few rows, such as the 24 of an HC mixer or the 32 of the indexer weights,
+ * for many tokens: a unit is a tile and a block of 16 tokens, so the rows
+ * still give every thread work.  Lanes past the last row read that row
+ * again and are not stored. */
+static void ds41_cpu_f16_batch_small_worker(void *vctx, uint64_t first, uint64_t last) {
+    const ds41_cpu_f16_batch_ctx *c = vctx;
+    const uint32_t blocks = (c->n + 15) / 16;
+    __m512 w[32], acc[16];
+    const float *xp[16];
+    for (uint64_t unit = first; unit < last; unit++) {
+        const uint64_t row = unit / blocks * 16;
+        const uint32_t t0 = (uint32_t)(unit % blocks) * 16;
+        const uint32_t nt = c->n - t0 < 16 ? c->n - t0 : 16;
+        const uint32_t valid = c->rows - row < 16 ? (uint32_t)(c->rows - row) : 16;
+        int32_t off[16];
+        for (uint32_t r = 0; r < 16; r++)
+            off[r] = (int32_t)((r < valid ? r : valid - 1) * c->row_bytes);
+        const __m512i offsets = _mm512_loadu_si512(off);
+        const __mmask16 store = (__mmask16)((1u << valid) - 1u);
+        const uint8_t *rows = c->data + row * c->row_bytes;
+        for (uint32_t t = 0; t < nt; t++) {
+            acc[t] = _mm512_setzero_ps();
+            xp[t] = c->x + (uint64_t)(t0 + t) * c->x_stride;
+        }
+        for (uint64_t i = 0; i < c->in_dim; i += 32) {
+            ds41_cpu_f16_decode16(w, rows + 2 * i, offsets);
+            ds41_cpu_apply16(acc, w, xp, nt, i, 32);
+        }
+        for (uint32_t t = 0; t < nt; t++)
+            _mm512_mask_storeu_ps(c->out + (uint64_t)(t0 + t) * c->out_stride + row, store,
+                                  c->round ? ds41_cpu_bf16_16(acc[t]) : acc[t]);
     }
 }
 
@@ -1082,14 +1116,18 @@ static bool ds41_cpu_matmul_f16(float *out, uint64_t out_stride, const ds4_model
     if (t->type != DS4_TENSOR_F16 || t->ndim < 2 || t->dim[0] == 0 || t->dim[0] % 32 ||
         t->dim[0] > (uint64_t)INT32_MAX / 32) return false;
     const uint64_t rows = t->elements / t->dim[0];
-    if (!rows || rows % 16 || !n) return false;
+    if (!rows || !n) return false;
     ds41_cpu_f16_batch_ctx ctx = {
         .data = tensor_data(m, t), .x = x, .out = out, .x_stride = x_stride,
         .out_stride = out_stride, .in_dim = t->dim[0], .row_bytes = t->dim[0] * 2,
-        .n = n, .round = round,
+        .rows = rows, .n = n, .round = round,
     };
+    /* Matrices of fewer tiles than threads by token blocks too. */
     ds4_threads_init();
-    if (rows % 32 == 0 && rows / 32 >= g_pool.n_threads)
+    if (rows % 16 || rows / 16 < g_pool.n_threads)
+        ds4_parallel_for_min_rows((rows + 15) / 16 * ((n + 15) / 16),
+                                  ds41_cpu_f16_batch_small_worker, &ctx, 1);
+    else if (rows % 32 == 0 && rows / 32 >= g_pool.n_threads)
         ds4_parallel_for_min_rows(rows / 32, ds41_cpu_f16_batch2_worker, &ctx, 1);
     else
         ds4_parallel_for_min_rows(rows / 16, ds41_cpu_f16_batch_worker, &ctx, 1);

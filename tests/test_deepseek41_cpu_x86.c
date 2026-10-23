@@ -564,7 +564,7 @@ static void check_q8_batch(void) {
  * without BF16 rounding, special halves included. */
 static void check_f16_batch(void) {
     const uint64_t dims[] = {32, 64, 1280, 6144};
-    const uint64_t rows[] = {16, 48, 512};
+    const uint64_t rows[] = {16, 24, 32, 48, 512};
     const uint32_t tokens[] = {1, 2, 3, 5, 33, 70};
     for (size_t d = 0; d < sizeof(dims) / sizeof(*dims); d++) {
         for (size_t r = 0; r < sizeof(rows) / sizeof(*rows); r++) {
