@@ -473,6 +473,70 @@ static void check_proj_graph(test_layer *tl, const ds4_layer_weights *l) {
 #endif
 
 #if defined(__AVX512F__) && defined(__AVX512BW__)
+/* The batched KV pass of a prefill chunk against the token loop's cache
+ * steps (raw window row, then pooling and publishing), for a ratio 2 and a
+ * ratio 1 source layer, over chunks that start and end at odd and even
+ * positions: the rows, index keys and pooling state must be equal. */
+static void check_batch_kv(test_layer *tl, const ds4_layer_weights *l) {
+    static const uint32_t layers[] = {2, 20};
+    static const uint32_t chunks[] = {1, 4, 7, 1, 2, 16, 33, 3, 1};
+    const size_t f = sizeof(float);
+    for (size_t li = 0; li < sizeof(layers) / sizeof(*layers); li++) {
+        const uint32_t il = layers[li], ratio = ds4_layer_compress_ratio(il);
+        const uint32_t owner = il < 8 ? 0u : 3u;
+        ds41_cpu_attention_state *a = ds41_cpu_attention_create(128);
+        ds41_cpu_attention_state *bs = ds41_cpu_attention_create(128);
+        ds41_cpu_state *s = calloc(1, sizeof(*s));
+        ds41_cpu_batch *b = calloc(1, sizeof(*b));
+        CHECK(a && bs && s && b);
+        b->kv = malloc(64u * 512u * f);
+        b->ckv = malloc(64u * 512u * f);
+        b->cscore = malloc(64u * 512u * f);
+        b->prev_window = malloc(128u * 512u * f);
+        CHECK(b->kv && b->ckv && b->cscore && b->prev_window);
+        s->model = &tl->m;
+        s->attention = bs;
+        uint32_t pos = 0;
+        for (size_t k = 0; k < sizeof(chunks) / sizeof(*chunks); k++) {
+            const uint32_t n = chunks[k];
+            for (uint32_t i = 0; i < n * 512u; i++) {
+                b->kv[i] = ds41_cpu_bf16(test_float());
+                b->ckv[i] = ds41_cpu_bf16(test_float());
+                b->cscore[i] = test_float();
+            }
+            for (uint32_t i = 0; i < n; i++) {
+                float kv[512];
+                memcpy(kv, b->kv + (size_t)i * 512u, sizeof(kv));
+                ds41_cpu_rope(kv, 512, 1, pos + i, ratio != 0, false);
+                ds41_cpu_quantize(kv, 512, 1, DS41_CPU_FP8_E8M0);
+                memcpy(a->window[il] + (size_t)((pos + i) % 128u) * 512u, kv, sizeof(kv));
+                memcpy(a->pool_kv, b->ckv + (size_t)i * 512u, sizeof(a->pool_kv));
+                if (ratio == 2u)
+                    memcpy(a->pool_score, b->cscore + (size_t)i * 512u, sizeof(a->pool_score));
+                CHECK(ds41_cpu_attention_publish(a, &tl->m, l, il, pos + i));
+            }
+            s->pos = pos;
+            ds41_cpu_batch_ctx c = {.s = s, .b = b, .l = l, .il = il};
+            CHECK(ds41_cpu_batch_attention_kv(&c, n));
+            pos += n;
+            test_equal("batch KV window", a->window[il], bs->window[il], 128 * 512);
+            test_equal("batch KV compressed", a->compressed[owner], bs->compressed[owner],
+                       (size_t)a->comp_cap[owner] * 512);
+            test_equal("batch KV index cache", a->index_cache[owner], bs->index_cache[owner],
+                       (size_t)a->comp_cap[owner] * 128);
+            test_equal("batch KV previous", a->previous_kv[0], bs->previous_kv[0], 3 * 512);
+            test_equal("batch KV previous score", a->previous_score[0], bs->previous_score[0],
+                       3 * 512);
+        }
+        CHECK(pos / ratio <= a->comp_cap[owner]);
+        free(b->prev_window); free(b->cscore); free(b->ckv); free(b->kv);
+        free(b); free(s);
+        ds41_cpu_attention_free(bs); ds41_cpu_attention_free(a);
+    }
+}
+#endif
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
 /* The staged heads, output projections and HC post against the plain
  * sequence of ds41_cpu_attention_forward() and ds41_cpu_hc_post_run(). */
 static void check_out_graph(test_layer *tl, const ds4_layer_weights *l) {
@@ -750,8 +814,10 @@ int main(void) {
             check_ffn_graph(&tl, &l);
             check_proj_graph(&tl, &l);
             check_out_graph(&tl, &l);
+            check_batch_kv(&tl, &l);
             ds4_threads_shutdown();
-            printf("V4.1 CPU staged FFN, projections and output bitwise checks: %u threads PASS\n",
+            printf("V4.1 CPU staged FFN, projections, output and batch KV bitwise checks: "
+                   "%u threads PASS\n",
                    threads[i]);
         }
         g_requested_threads = 0;

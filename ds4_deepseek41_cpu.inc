@@ -682,12 +682,12 @@ layer_fail:
 
 /* Layer-major prefill.  Each layer runs over a chunk of prompt tokens before
  * the next one, so a dense tile or a routed expert is decoded once for all
- * the chunk's tokens that use it.  The KV side of attention (raw window,
- * compression) runs per token in position order on the shared caches; the
- * query side (indexing, staging, the heads), HC, norms, the router and the
- * other glue run per token in parallel.  Every value is computed by the
- * same operations as in ds41_cpu_forward, so the logits are bitwise those
- * of the token loop. */
+ * the chunk's tokens that use it.  The raw window rows are copied in
+ * position order and the compressed rows published in parallel, each from
+ * its own tokens; the query side (indexing, staging, the heads), HC, norms,
+ * the router and the other glue run per token in parallel.  Every value is
+ * computed by the same operations as in ds41_cpu_forward, so the logits
+ * are bitwise those of the token loop. */
 typedef struct {
     ds41_cpu_state *s;
     ds41_cpu_batch *b;
@@ -1000,17 +1000,47 @@ static void ds41_cpu_batch_kv_rope_worker(void *vctx, uint64_t t0, uint64_t t1) 
     }
 }
 
+/* The compressed rows a KV source layer completes in the chunk, in
+ * parallel: row r is completed by the token at pos = first + r * ratio.
+ * Pooling and publishing a row read only its tokens' compressor
+ * projections, so each row is the one ds41_cpu_attention_publish computes
+ * at pos.  A ratio 2 row completed by the chunk's first token pools it
+ * with the previous chunk's last token, kept in previous_kv. */
+static void ds41_cpu_batch_publish_worker(void *vctx, uint64_t r0, uint64_t r1) {
+    ds41_cpu_batch_ctx *c = vctx;
+    ds41_cpu_state *s = c->s;
+    ds41_cpu_batch *b = c->b;
+    ds41_cpu_attention_state *as = s->attention;
+    const uint32_t il = c->il, ratio = ds4_layer_compress_ratio(il);
+    const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
+    const uint32_t first = ratio == 2u ? s->pos | 1u : s->pos;
+    float latent[512], index_k[128];
+    for (uint64_t r = r0; r < r1; r++) {
+        const uint32_t pos = first + (uint32_t)r * ratio, i = pos - s->pos;
+        if (ratio == 2u) {
+            float *kv = b->ckv + (size_t)i * 512u, *score = b->cscore + (size_t)i * 512u;
+            ds41_cpu_attention_pool2(latent, i ? kv - 512 : as->previous_kv[owner],
+                                     i ? score - 512 : as->previous_score[owner],
+                                     kv, score, pos);
+        } else memcpy(latent, b->ckv + (size_t)i * 512u, sizeof(latent));
+        if (!ds41_cpu_attention_publish_row(as, s->model, c->l, owner, ratio, pos,
+                                            latent, index_k))
+            ds41_cpu_batch_fail(c);
+    }
+}
+
 /* The KV side of the chunk's attention: RoPE and quantization of each
  * token's KV (in parallel), then in position order its copy into the
- * layer's raw window and, on the KV source layers, the compressor pooling,
- * the compressed row and its indexer key, as ds41_cpu_attention_cache does
- * them token by token. */
+ * layer's raw window and, on the KV source layers, the compressed rows and
+ * their indexer keys, as ds41_cpu_attention_cache does them token by
+ * token.  A ratio 2 layer then keeps the chunk's last even position's
+ * projections as the first half of the next pair, as the token loop's
+ * pooling leaves them. */
 static bool ds41_cpu_batch_attention_kv(ds41_cpu_batch_ctx *c, uint32_t n) {
     ds41_cpu_state *s = c->s;
     ds41_cpu_batch *b = c->b;
     ds41_cpu_attention_state *as = s->attention;
     const uint32_t il = c->il, ratio = ds4_layer_compress_ratio(il);
-    const bool kv_source = ds41_kv_source(il);
     /* The raw rows before the chunk, which the chunk's rows overwrite. */
     memcpy(b->prev_window, as->window[il], 128u * 512u * sizeof(float));
     ds4_parallel_for_min_rows(n, ds41_cpu_batch_kv_rope_worker, c, 1);
@@ -1018,13 +1048,20 @@ static bool ds41_cpu_batch_attention_kv(ds41_cpu_batch_ctx *c, uint32_t n) {
         const uint32_t pos = s->pos + i;
         const float *kv = b->kv + (size_t)i * 512u;
         memcpy(as->window[il] + (size_t)(pos % 128u) * 512u, kv, 512u * sizeof(float));
-        if (!kv_source) continue;
-        memcpy(as->pool_kv, b->ckv + (size_t)i * 512u, sizeof(as->pool_kv));
-        if (ratio == 2u)
-            memcpy(as->pool_score, b->cscore + (size_t)i * 512u, sizeof(as->pool_score));
-        if (!ds41_cpu_attention_publish(as, s->model, c->l, il, pos)) return false;
     }
-    return true;
+    if (!ds41_kv_source(il) || !n) return true;
+    if (ratio != 1u && ratio != 2u) return false;
+    const uint32_t rows = (s->pos + n) / ratio - s->pos / ratio;
+    ds4_parallel_for_min_rows(rows, ds41_cpu_batch_publish_worker, c, 2);
+    const uint32_t last_even = (s->pos + n - 1u) & ~1u;
+    if (ratio == 2u && last_even >= s->pos) {
+        const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : 2u;
+        const size_t i = last_even - s->pos;
+        memcpy(as->previous_kv[owner], b->ckv + i * 512u, sizeof(as->previous_kv[owner]));
+        memcpy(as->previous_score[owner], b->cscore + i * 512u,
+               sizeof(as->previous_score[owner]));
+    }
+    return !c->failed;
 }
 
 typedef struct {

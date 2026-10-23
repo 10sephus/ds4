@@ -133,6 +133,29 @@ static bool ds41_cpu_attention_pool2(float *out, float *previous_kv,
     return true;
 }
 
+/* Publish the pooled latent of a KV source layer completed at pos as a
+ * compressed row of owner, with its index key.  latent (512) and index_k
+ * (128) are the caller's scratch, so that rows can be published in
+ * parallel. */
+static bool ds41_cpu_attention_publish_row(ds41_cpu_attention_state *s,
+                                           const ds4_model *m, const ds4_layer_weights *l,
+                                           uint32_t owner, uint32_t ratio, uint32_t pos,
+                                           float *latent, float *index_k) {
+    const uint32_t row = (pos + 1u) / ratio - 1u;
+    const uint32_t rope_pos = pos + 1u - ratio;
+    if (row >= s->comp_cap[owner] ||
+        !ds41_cpu_norm(latent, latent, m, l->attn_compressor_norm) ||
+        !ds41_cpu_matvec(index_k, m, l->indexer_attn_k, latent, true) ||
+        !ds41_cpu_norm(index_k, index_k, m, l->indexer_k_norm)) return false;
+    ds41_cpu_rope(index_k, 128, 1, rope_pos, true, false);
+    ds41_cpu_quantize(index_k, 128, 1, DS41_CPU_FP4_E8M0);
+    memcpy(s->index_cache[owner] + (size_t)row * 128u, index_k, 128u * sizeof(float));
+    ds41_cpu_rope(latent, 512, 1, rope_pos, true, false);
+    ds41_cpu_quantize(latent, 512, 1, DS41_CPU_FP4_E4M3);
+    memcpy(s->compressed[owner] + (size_t)row * 512u, latent, 512u * sizeof(float));
+    return true;
+}
+
 /* Pool the compressor projections in pool_kv and pool_score of a KV source
  * layer and, when a row completes, publish it with its index key. */
 static bool ds41_cpu_attention_publish(ds41_cpu_attention_state *s,
@@ -144,19 +167,7 @@ static bool ds41_cpu_attention_publish(ds41_cpu_attention_state *s,
         if (!ds41_cpu_attention_pool2(s->latent, s->previous_kv[owner],
                 s->previous_score[owner], s->pool_kv, s->pool_score, pos)) return true;
     } else memcpy(s->latent, s->pool_kv, sizeof(s->latent));
-    const uint32_t row = (pos + 1u) / ratio - 1u;
-    const uint32_t rope_pos = pos + 1u - ratio;
-    if (row >= s->comp_cap[owner] ||
-        !ds41_cpu_norm(s->latent, s->latent, m, l->attn_compressor_norm) ||
-        !ds41_cpu_matvec(s->index_k, m, l->indexer_attn_k, s->latent, true) ||
-        !ds41_cpu_norm(s->index_k, s->index_k, m, l->indexer_k_norm)) return false;
-    ds41_cpu_rope(s->index_k, 128, 1, rope_pos, true, false);
-    ds41_cpu_quantize(s->index_k, 128, 1, DS41_CPU_FP4_E8M0);
-    memcpy(s->index_cache[owner] + (size_t)row * 128u, s->index_k, sizeof(s->index_k));
-    ds41_cpu_rope(s->latent, 512, 1, rope_pos, true, false);
-    ds41_cpu_quantize(s->latent, 512, 1, DS41_CPU_FP4_E4M3);
-    memcpy(s->compressed[owner] + (size_t)row * 512u, s->latent, sizeof(s->latent));
-    return true;
+    return ds41_cpu_attention_publish_row(s, m, l, owner, ratio, pos, s->latent, s->index_k);
 }
 
 typedef struct {
