@@ -2609,6 +2609,14 @@ static void ds4_parallel_for_tasks(uint64_t n_tasks, ds4_parallel_fn fn, void *c
     ds4_pool_dispatch(n_tasks, fn, ctx, n_tasks, 1, 1);
 }
 
+/* One item per claim for the prefill tile grids: an item is tens of
+ * millions of products (a row block against a tile block), so a claim of
+ * several would leave the phase's tail to whichever thread shares its core
+ * with foreign load. */
+static void ds4_parallel_for_items(uint64_t n_items, ds4_parallel_fn fn, void *ctx) {
+    ds4_pool_dispatch(n_items, fn, ctx, n_items, 2, 1);
+}
+
 /* Threads the pool runs a kernel on, the caller included. */
 static uint32_t ds4_pool_threads(void) {
     ds4_threads_init();
@@ -11137,7 +11145,7 @@ static void matmul_q8_0_batch_prequant(
     ctx.tiles = q8_0_tiles_pack(xq, xscale, n_tok, 1, ctx.in_dim, ctx.blocks);
 #endif
     ctx.grid = q8_0_tile_grid_make(ctx.out_dim, ctx.tiles.n_tiles, ctx.blocks);
-    ds4_parallel_for_min_rows(ctx.grid.n_items, matmul_q8_0_batch_worker, &ctx, 2);
+    ds4_parallel_for_items(ctx.grid.n_items, matmul_q8_0_batch_worker, &ctx);
 }
 
 static void matmul_q8_0_pair_batch_prequant(
@@ -11172,7 +11180,7 @@ static void matmul_q8_0_pair_batch_prequant(
     ctx.tiles = q8_0_tiles_pack(xq, xscale, n_tok, 1, ctx.in_dim, ctx.blocks);
 #endif
     ctx.grid = q8_0_tile_grid_make(ctx.out_dim, ctx.tiles.n_tiles, ctx.blocks);
-    ds4_parallel_for_min_rows(ctx.grid.n_items, matmul_q8_0_pair_batch_worker, &ctx, 2);
+    ds4_parallel_for_items(ctx.grid.n_items, matmul_q8_0_pair_batch_worker, &ctx);
 }
 
 /* Batched Q8_0 matmul for prefill: quantize all token activations, then scan
@@ -11462,7 +11470,7 @@ static void matmul_q8_0_grouped_batch(
     ctx.tiles = q8_0_tiles_pack(xq, xscale, n_tok, n_groups, group_dim, blocks);
 #endif
     ctx.grid = q8_0_tile_grid_make(rank, ctx.tiles.n_tiles, blocks);
-    ds4_parallel_for_min_rows((uint64_t)n_groups * ctx.grid.n_items, matmul_q8_0_grouped_batch_worker, &ctx, 2);
+    ds4_parallel_for_items((uint64_t)n_groups * ctx.grid.n_items, matmul_q8_0_grouped_batch_worker, &ctx);
 
 }
 
@@ -16476,7 +16484,7 @@ static uint32_t compressor_project_tiles(float *out, const uint16_t *w, const fl
     ctx.out = out;
     const uint64_t items = (uint64_t)(width + COMP_TILE_ROWS - 1) / COMP_TILE_ROWS *
                            ((ctx.n_tiles + COMP_TILE_BLOCK - 1) / COMP_TILE_BLOCK);
-    ds4_parallel_for_min_rows(items, compressor_tile_worker, &ctx, 1);
+    ds4_parallel_for_items(items, compressor_tile_worker, &ctx);
     return ctx.n_tiles * 16;
 }
 #endif
