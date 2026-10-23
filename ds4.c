@@ -17688,7 +17688,8 @@ static void layer_attention_raw_swa_batch(
                 }
                 allowed_mask[t] = 1;
                 uint8_t *bits = allowed_bits + (uint64_t)t * allowed_stride;
-                for (uint32_t c = 0; c < cache->n_comp; c++) {
+                /* The attention rows emitted so far, the deferred ones included. */
+                for (uint32_t c = 0; c < cache->n_comp + n_emit; c++) {
                     if (comp_allowed[c]) bits[c >> 3] |= (uint8_t)(1u << (c & 7u));
                 }
                 free(comp_allowed);
