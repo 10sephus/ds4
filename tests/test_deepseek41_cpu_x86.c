@@ -137,10 +137,83 @@ static void check_moe(uint32_t embd, uint32_t hidden, uint32_t type, uint32_t do
     down.bytes = down_bytes;
     down.dim[0] = hidden; down.dim[1] = embd;
     ds4_layer_weights l = {.ffn_gate_exps = &gate, .ffn_up_exps = &up, .ffn_down_exps = &down};
+    CHECK(ds41_cpu_routed_moe_q8k((float *)ob.data, (float *)mb.data, &m, &l, x, selected, weights) ==
+          (type == DS4_TENSOR_IQ2_XXS && down_type == DS4_TENSOR_Q2_K));
     layer_glm_routed_moe_one_f32_ref((float *)oa.data, (float *)ma.data, &m, &l, x, selected, weights);
     ds41_cpu_routed_moe((float *)ob.data, (float *)mb.data, &m, &l, x, selected, weights);
     test_equal("MoE mid", (float *)ma.data, (float *)mb.data, 3 * hidden);
     test_equal("MoE out", (float *)oa.data, (float *)ob.data, embd);
+    test_free(ob); test_free(oa); test_free(mb); test_free(ma); test_free(xb); test_free(w);
+}
+
+/* The CUDA-style Q2 path: IQ2_XXS gate/up and Q2_K down on Q8_K activations.
+ * Oracle: the same steps written out with the single-row integer dots, which
+ * test_cpu_quant_x86 checks against scalar block oracles.  check_moe checks
+ * the F32-activation path, ds41_cpu_routed_moe, on the same expert types. */
+static void check_moe_q8k(uint32_t embd, uint32_t hidden, float clamp) {
+    g_ds4_shape = DS4_SHAPE_FLASH41;
+    g_ds4_shape.n_embd = embd;
+    g_ds4_shape.n_ff_exp = hidden;
+    g_ds4_shape.n_expert = 7;
+    g_ds4_shape.n_expert_used = 3;
+    g_ds4_shape.swiglu_clamp_exp = clamp;
+    const int selected[] = {6, 2, 0};
+    const float weights[] = {0.2173f, -0.6129f, 1.397f};
+    const size_t gate_bytes = (size_t)embd * hidden * 7 / QK_K * sizeof(block_iq2_xxs);
+    const size_t down_bytes = (size_t)embd * hidden * 7 / QK_K * sizeof(block_q2_K);
+    test_buffer w = test_alloc(2 * gate_bytes + down_bytes), xb = test_alloc(embd * sizeof(float));
+    test_buffer ma = test_alloc(3 * hidden * sizeof(float)), mb = test_alloc(3 * hidden * sizeof(float));
+    test_buffer oa = test_alloc(embd * sizeof(float)), ob = test_alloc(embd * sizeof(float));
+    test_fill_quants(w.data, 2 * gate_bytes, DS4_TENSOR_IQ2_XXS);
+    test_fill_quants(w.data + 2 * gate_bytes, down_bytes, DS4_TENSOR_Q2_K);
+    float *x = (float *)xb.data, *mid = (float *)ma.data, *out = (float *)oa.data;
+    for (uint32_t i = 0; i < embd; i++) x[i] = test_float();
+    ds4_model m = {.map = w.data, .size = 2 * gate_bytes + down_bytes};
+    ds4_tensor gate = {.type = DS4_TENSOR_IQ2_XXS, .ndim = 3, .dim = {embd, hidden, 7},
+                      .elements = (uint64_t)embd * hidden * 7, .bytes = gate_bytes};
+    ds4_tensor up = gate, down = gate;
+    up.abs_offset = gate_bytes;
+    down.type = DS4_TENSOR_Q2_K;
+    down.abs_offset = 2 * gate_bytes;
+    down.bytes = down_bytes;
+    down.dim[0] = hidden; down.dim[1] = embd;
+    ds4_layer_weights l = {.ffn_gate_exps = &gate, .ffn_up_exps = &up, .ffn_down_exps = &down};
+
+    block_q8_K xq[DS4_MAX_EMBD / QK_K], midq[3 * (DS4_MAX_FF_EXP / QK_K)];
+    iq2xxs_q8 yq[DS4_MAX_EMBD / QK_K];
+    ds4_quantize_row_q8_K(x, xq, embd);
+    iq2xxs_q8_prepare(yq, xq, embd / QK_K);
+    for (uint32_t slot = 0; slot < 3; slot++) {
+        uint64_t in, n_out, grb, urb;
+        const uint8_t *g = tensor_expert_bytes(&m, &gate, (uint32_t)selected[slot], &in, &n_out, &grb);
+        const uint8_t *u = tensor_expert_bytes(&m, &up, (uint32_t)selected[slot], &in, &n_out, &urb);
+        for (uint32_t row = 0; row < hidden; row++) {
+            float gv = 0.0f, uv = 0.0f;
+            ds4_vec_dot_iq2_xxs_q8_K((int)embd, &gv, (const block_iq2_xxs *)(g + row * grb), yq);
+            ds4_vec_dot_iq2_xxs_q8_K((int)embd, &uv, (const block_iq2_xxs *)(u + row * urb), yq);
+            if (clamp > 1.0e-6f) {
+                if (gv > clamp) gv = clamp;
+                if (uv > clamp) uv = clamp;
+                if (uv < -clamp) uv = -clamp;
+            }
+            mid[slot * hidden + row] = silu(gv) * uv * weights[slot];
+        }
+        ds4_quantize_row_q8_K(mid + slot * hidden, midq + slot * (hidden / QK_K), hidden);
+    }
+    for (uint32_t row = 0; row < embd; row++) out[row] = 0.0f;
+    for (uint32_t slot = 0; slot < 3; slot++) {
+        uint64_t in, n_out, rb;
+        const uint8_t *d = tensor_expert_bytes(&m, &down, (uint32_t)selected[slot], &in, &n_out, &rb);
+        for (uint32_t row = 0; row < embd; row++) {
+            float v = 0.0f;
+            ds4_vec_dot_q2_K_q8_K((int)hidden, &v, (const block_q2_K *)(d + row * rb),
+                                  midq + slot * (hidden / QK_K));
+            out[row] += v;
+        }
+    }
+    CHECK(ds41_cpu_routed_moe_q8k((float *)ob.data, (float *)mb.data, &m, &l, x, selected, weights));
+    test_equal("Q8_K MoE mid", mid, (float *)mb.data, 3 * hidden);
+    test_equal("Q8_K MoE out", out, (float *)ob.data, embd);
     test_free(ob); test_free(oa); test_free(mb); test_free(ma); test_free(xb); test_free(w);
 }
 
@@ -326,7 +399,7 @@ static void check_q4_tails(void) {
 typedef struct {
     test_buffer map;
     ds4_model m;
-    ds4_tensor t[32];
+    ds4_tensor t[40];
     uint32_t n;
     uint64_t used;
 } test_layer;
@@ -335,7 +408,7 @@ static ds4_tensor *test_tensor(test_layer *tl, uint32_t type, uint64_t d0,
                                uint64_t d1, uint64_t d2) {
     ds4_tensor *t = &tl->t[tl->n++];
     uint64_t row_bytes;
-    CHECK(tl->n <= 32 && tensor_nbytes(type, d0, &row_bytes));
+    CHECK(tl->n <= 40 && tensor_nbytes(type, d0, &row_bytes));
     *t = (ds4_tensor){.type = type, .ndim = d2 ? 3 : d1 ? 2 : 1, .dim = {d0, d1 ? d1 : 1, d2 ? d2 : 1},
                       .elements = d0 * (d1 ? d1 : 1) * (d2 ? d2 : 1),
                       .bytes = row_bytes * (d1 ? d1 : 1) * (d2 ? d2 : 1), .abs_offset = tl->used};
@@ -355,8 +428,8 @@ static ds4_tensor *test_tensor(test_layer *tl, uint32_t type, uint64_t d0,
 static void test_layer_init(test_layer *tl, ds4_layer_weights *l) {
     memset(tl, 0, sizeof(*tl));
     memset(l, 0, sizeof(*l));
-    tl->map = test_alloc((size_t)400 << 20);
-    tl->m = (ds4_model){.map = tl->map.data, .size = (uint64_t)400 << 20};
+    tl->map = test_alloc((size_t)600 << 20);
+    tl->m = (ds4_model){.map = tl->map.data, .size = (uint64_t)600 << 20};
     l->hc_attn_fn = test_tensor(tl, DS4_TENSOR_F16, 20480, 24, 0);
     l->hc_attn_scale = test_tensor(tl, DS4_TENSOR_F32, 3, 0, 0);
     l->hc_attn_base = test_tensor(tl, DS4_TENSOR_F32, 24, 0, 0);
@@ -932,6 +1005,12 @@ static void check_routed_batch(uint32_t embd, uint32_t hidden, float clamp) {
             test_equal("routed batch mid", ma, mr, (size_t)nt * 3 * hidden);
             test_equal("routed batch out", oa, ob, (size_t)nt * embd);
         }
+        /* The Q8_K prefill experts against the one-token Q8_K path. */
+        for (uint32_t t = 0; t < nt; t++)
+            CHECK(ds41_cpu_routed_moe_q8k(oa + (size_t)t * embd, ma, &m, &l, x + (size_t)t * embd,
+                                          selected + t * 3, weights + t * 3));
+        CHECK(ds41_cpu_routed_moe_q8k_batch(ob, &m, &l, x, nt, selected, weights));
+        test_equal("Q8_K routed batch out", oa, ob, (size_t)nt * embd);
         free(entry); free(selected); free(weights); free(partial);
         free(ob); free(oa); free(mr); free(mb); free(ma); free(x);
     }
@@ -1139,8 +1218,10 @@ int main(void) {
             check_f32_batch();
             check_routed_batch(256, 512, 10.0f);
             check_routed_batch(512, 256, 0.0f);
+            check_moe_q8k(512, 256, 10.0f);
+            check_moe_q8k(256, 512, 0.0f);
             ds4_threads_shutdown();
-            printf("V4.1 CPU Q8/Q4/Q2 bitwise reference checks: %u threads%s PASS\n",
+            printf("V4.1 CPU Q8/Q4/Q2 bitwise reference and Q8_K MoE oracle checks: %u threads%s PASS\n",
                    threads[i], mode ? ", NUMA halves" : "");
         }
     }
@@ -1155,9 +1236,15 @@ int main(void) {
         test_layer tl;
         ds4_layer_weights l;
         test_layer_init(&tl, &l);
+        /* Q4_K experts keep the F32 stages, the Q2 ones take the Q8_K stages. */
+        ds4_layer_weights l4 = l;
+        l4.ffn_gate_exps = test_tensor(&tl, DS4_TENSOR_Q4_K, 5120, 2304, 8);
+        l4.ffn_up_exps = test_tensor(&tl, DS4_TENSOR_Q4_K, 5120, 2304, 8);
+        l4.ffn_down_exps = test_tensor(&tl, DS4_TENSOR_Q4_K, 2304, 5120, 8);
         for (size_t i = 0; i < sizeof(threads) / sizeof(*threads); i++) {
             g_requested_threads = threads[i];
             check_ffn_graph(&tl, &l);
+            check_ffn_graph(&tl, &l4);
             check_proj_graph(&tl, &l);
             check_out_graph(&tl, &l);
             check_out_ffn_graph(&tl, &l);

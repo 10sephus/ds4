@@ -225,6 +225,13 @@ static void ds41_cpu_hc_post_norm(void *vctx) {
     2u * 64u * 512u + 512u + 8192u + 2u * 24u * 256u + 5u * 5120u + 3u * 2304u + \
     6u * (2304u + 5120u + 1u) + 6u + 48u + 6u + 512u + 24u + 384u + 2u * 4u * 5120u + \
     2u * 512u + 32u * 128u + 32u + 2u * 24u * 256u + 48u))
+/* The Q2 experts' chunk workspace, moe_grouped_ffn's pf_buf slots, which
+ * ds41_cpu_prefill frees on return as V4's prefill does: per token the Q8_K
+ * and IQ2_XXS-order input, the six mids, their Q8_K rows and the six down
+ * rows; per pool thread the tile scratch. */
+#define DS41_CPU_Q8K_TOKEN_BYTES (20u * (sizeof(block_q8_K) + sizeof(iq2xxs_q8)) + \
+    6u * (2304u * 4u + 9u * sizeof(block_q8_K) + 5120u * 4u))
+#define DS41_CPU_Q8K_THREAD_BYTES (2u * DS4_MOE_ROW_BLOCK * 20u * (QK_K + QK_K / 32u * 4u))
 /* The query side's scratch of one pool thread (see
  * ds41_cpu_batch_attention_worker): the attended row list, the transposed
  * query, the head scores, the index scores and the top-k heap. */
@@ -318,6 +325,9 @@ typedef struct ds41_cpu_state {
     float x[5120], norm[5120], block[5120], shared[5120];
     float shared_gate[2304], shared_up[2304], shared_mid[2304];
     float expert_mid[6 * 2304];
+    /* The staged FFN's Q8_K experts: input, mids and the six down rows. */
+    block_q8_K expert_xq[5120 / QK_K], expert_midq[6 * 2304 / QK_K];
+    float expert_part[6 * 5120];
 } ds41_cpu_state;
 
 static ds4_context_memory ds41_cpu_memory(uint32_t ctx) {
@@ -335,7 +345,8 @@ static ds4_context_memory ds41_cpu_memory(uint32_t ctx) {
     const uint64_t rounded = (uint64_t)DS41_CPU_BATCH + 128u +
         (ctx < DS41_CPU_BATCH_COMP ? ctx : DS41_CPU_BATCH_COMP);
     memory.scratch_bytes = sizeof(ds41_cpu_state) + sizeof(ds41_cpu_attention_state) +
-        (uint64_t)DS41_CPU_BATCH * DS41_CPU_BATCH_TOKEN_BYTES +
+        (uint64_t)DS41_CPU_BATCH * (DS41_CPU_BATCH_TOKEN_BYTES + DS41_CPU_Q8K_TOKEN_BYTES) +
+        (uint64_t)DS4_MAX_THREADS * DS41_CPU_Q8K_THREAD_BYTES +
         rounded * 512u * sizeof(float) +
         (uint64_t)DS4_N_VOCAB * (sizeof(uint32_t) + 2u * sizeof(float)) +
         ((uint64_t)ctx + 1u) * sizeof(float) + blocks * (sizeof(float) + sizeof(uint8_t)) +
@@ -466,6 +477,77 @@ static ds41_cpu_hc_job ds41_cpu_hc_mixer(ds41_cpu_state *s, const ds4_layer_weig
     };
 }
 
+/* Q2 routed experts in the arithmetic of the CUDA V4.1 path and of the V4
+ * CPU decode: the expert input and every SwiGLU mid are quantized to Q8_K
+ * (ds4_quantize_row_q8_K is the formula of q8_K_quantize_kernel), gate/up
+ * and down are integer IQ2_XXS and Q2_K dots, the router weight scales the
+ * mid before down and the six down rows are summed in F32, as in
+ * moe_gate_up_mid_aligned_q8k and moe_down_sum_qwarp32.  The result is not
+ * the F32-activation reference of ds41_cpu_routed_moe, which remains the
+ * path of the other expert types and the oracle of the unit tests.
+ * True when the experts are IQ2_XXS/IQ2_XXS/Q2_K, which take this path. */
+static bool ds41_cpu_q8k_experts(const ds4_layer_weights *l) {
+    const ds4_tensor *gate = l->ffn_gate_exps, *up = l->ffn_up_exps;
+    const ds4_tensor *down = l->ffn_down_exps;
+    if (!gate || !up || !down || gate->type != DS4_TENSOR_IQ2_XXS ||
+        up->type != DS4_TENSOR_IQ2_XXS || down->type != DS4_TENSOR_Q2_K) return false;
+    if (DS4_N_EMBD % QK_K != 0 || DS4_N_EMBD > DS4_MAX_EMBD ||
+        DS4_N_FF_EXP % QK_K != 0 || DS4_N_FF_EXP > DS4_MAX_FF_EXP ||
+        DS4_N_EXPERT_USED == 0 || DS4_N_EXPERT_USED > DS4_MAX_EXPERT_USED)
+        ds4_die("V4.1 CPU routed-MoE shape does not fit the Q8_K buffers");
+    /* The kernels index by the tensor dims, the buffers by the shape. */
+    if (gate->dim[0] != DS4_N_EMBD || gate->dim[1] != DS4_N_FF_EXP ||
+        up->dim[0] != DS4_N_EMBD || up->dim[1] != DS4_N_FF_EXP ||
+        down->dim[0] != DS4_N_FF_EXP || down->dim[1] != DS4_N_EMBD)
+        ds4_die("V4.1 CPU routed-MoE found unexpected expert dimensions");
+    return true;
+}
+
+/* One token.  Returns false, having done nothing, for other expert types. */
+static bool ds41_cpu_routed_moe_q8k(float *out, float *mid, const ds4_model *m,
+                                   const ds4_layer_weights *l, const float *x,
+                                   const int *selected, const float *weights) {
+    if (!ds41_cpu_q8k_experts(l)) return false;
+    for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++)
+        if (selected[i] < 0 || (uint32_t)selected[i] >= DS4_N_EXPERT)
+            ds4_die("V4.1 CPU routed-MoE selected expert is outside range");
+    block_q8_K xq[DS4_MAX_EMBD / QK_K];
+    block_q8_K midq[DS4_MAX_EXPERT_USED * (DS4_MAX_FF_EXP / QK_K)];
+    const uint64_t mid_blocks = DS4_N_FF_EXP / QK_K;
+    ds4_quantize_row_q8_K(x, xq, DS4_N_EMBD);
+    matvec_experts_mid_prequant(mid, m, l->ffn_gate_exps, l->ffn_up_exps, xq, selected,
+                                weights, (int)DS4_N_EXPERT_USED, DS4_SWIGLU_CLAMP_EXP);
+    for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++)
+        ds4_quantize_row_q8_K(mid + (uint64_t)i * DS4_N_FF_EXP,
+                              midq + i * mid_blocks, DS4_N_FF_EXP);
+    matvec_experts_down_accum_prequant(out, m, l->ffn_down_exps, midq, selected,
+                                       (int)DS4_N_EXPERT_USED);
+    return true;
+}
+
+/* n tokens, x and out n rows of DS4_N_EMBD: moe_grouped_ffn, the V4 prefill
+ * kernels grouped by expert, whose every output is the one-token kernels'
+ * (the same integer dots, mids and slot-order sums).  Returns false, having
+ * done nothing, for other expert types. */
+static bool ds41_cpu_routed_moe_q8k_batch(float *out, const ds4_model *m,
+                                         const ds4_layer_weights *l, const float *x,
+                                         uint32_t n, const int *selected,
+                                         const float *weights) {
+    if (!ds41_cpu_q8k_experts(l)) return false;
+    uint64_t in, mid, out_dim, gate_rb, up_rb, down_rb;
+    const uint8_t *gate = tensor_expert_bytes(m, l->ffn_gate_exps, 0, &in, &mid, &gate_rb);
+    const uint8_t *up = tensor_expert_bytes(m, l->ffn_up_exps, 0, &in, &mid, &up_rb);
+    const uint8_t *down = tensor_expert_bytes(m, l->ffn_down_exps, 0, &mid, &out_dim, &down_rb);
+    for (uint32_t t0 = 0; t0 < n; t0 += DS4_MOE_CHUNK_TOKENS) {
+        const uint32_t c = n - t0 < DS4_MOE_CHUNK_TOKENS ? n - t0 : DS4_MOE_CHUNK_TOKENS;
+        moe_grouped_ffn(out + (uint64_t)t0 * DS4_N_EMBD, gate, up, down, gate_rb, up_rb,
+                        down_rb, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EMBD,
+                        x + (uint64_t)t0 * DS4_N_EMBD, selected + (uint64_t)t0 * DS4_N_EXPERT_USED,
+                        weights + (uint64_t)t0 * DS4_N_EXPERT_USED, c, DS4_SWIGLU_CLAMP_EXP);
+    }
+    return true;
+}
+
 static bool ds41_cpu_moe(ds41_cpu_state *s, const ds4_layer_weights *l) {
     int selected[DS4_MAX_EXPERT_USED];
     float expert_weight[DS4_MAX_EXPERT_USED], probs[DS4_MAX_EXPERT];
@@ -492,13 +574,16 @@ static bool ds41_cpu_moe(ds41_cpu_state *s, const ds4_layer_weights *l) {
     swiglu(s->shared_mid, s->shared_gate, s->shared_up, 2304, DS4_SWIGLU_CLAMP_EXP);
     ds41_cpu_bf16_rows(s->shared_mid, 2304);
     if (!ds41_cpu_matvec(s->shared, s->model, l->ffn_down_shexp, s->shared_mid, true)) return false;
-    /* The quantized routed-expert kernels retain F32 intermediates and apply
-     * routing weights before down projection. Shared experts round to BF16. */
+    /* Routing weights scale the expert mids before the down projection.
+     * Q2 experts quantize their input and mids to Q8_K as CUDA does, the
+     * other expert types keep F32 intermediates. Shared experts round to BF16. */
     ds41_prof(DS41_PROF_ROUTED);
     if (ds41_prof_on)
         ds41_prof_bytes[DS41_PROF_ROUTED] += DS4_N_EXPERT_USED * ds41_cpu_routed_expert_bytes(l);
-    ds41_cpu_routed_moe(s->block, s->expert_mid, s->model, l,
-                       s->norm, selected, expert_weight);
+    if (!ds41_cpu_routed_moe_q8k(s->block, s->expert_mid, s->model, l,
+                                 s->norm, selected, expert_weight))
+        ds41_cpu_routed_moe(s->block, s->expert_mid, s->model, l,
+                           s->norm, selected, expert_weight);
     for (uint32_t i = 0; i < 5120; i++) s->block[i] = ds41_cpu_bf16(s->block[i] + s->shared[i]);
     ds41_prof(DS41_PROF_HC);
     return true;
@@ -523,6 +608,11 @@ typedef struct {
     ds41_cpu_q8_ctx shared_down;
     glm_routed_moe_f32_mid_ctx mid;
     glm_routed_moe_f32_down_ctx down;
+    /* Q2 experts: ds41_cpu_routed_moe_q8k's kernels and Q8_K activations. */
+    bool q8k;
+    matvec_iq2_xxs_mid_ctx q8k_mid;
+    matvec_q2_k_accum_ctx q8k_down;
+    iq2xxs_q8 yq[5120 / QK_K];
 } ds41_cpu_ffn_graph;
 
 static void ds41_cpu_ffn_route(void *vctx) {
@@ -532,7 +622,36 @@ static void ds41_cpu_ffn_route(void *vctx) {
     for (uint32_t i = 0; i < DS4_N_EXPERT; i++)
         probs[i] = sqrtf(softplus_stable(g->logits[i]));
     layer_topk_selected_experts_from_probs(selected, expert_weight, g->s->model, g->l, probs);
-    ds41_cpu_routed_bind(&g->mid, &g->down, g->s->model, g->l, selected, expert_weight);
+    if (!g->q8k) {
+        ds41_cpu_routed_bind(&g->mid, &g->down, g->s->model, g->l, selected, expert_weight);
+        return;
+    }
+    /* matvec_experts_mid_prequant and matvec_experts_down_accum_prequant's
+     * contexts, as V4's ffn_graph_route() fills them. */
+    ds41_cpu_state *s = g->s;
+    for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
+        uint64_t in, out;
+        if (selected[slot] < 0 || (uint32_t)selected[slot] >= DS4_N_EXPERT)
+            ds4_die("V4.1 CPU routed-MoE selected expert is outside range");
+        const uint32_t e = (uint32_t)selected[slot];
+        g->q8k_mid.gate_base[slot] = tensor_expert_bytes(s->model, g->l->ffn_gate_exps, e,
+                                                         &in, &out, &g->q8k_mid.gate_row_bytes[slot]);
+        g->q8k_mid.up_base[slot] = tensor_expert_bytes(s->model, g->l->ffn_up_exps, e,
+                                                       &in, &out, &g->q8k_mid.up_row_bytes[slot]);
+        g->q8k_mid.expert_weight[slot] = expert_weight[slot];
+        g->q8k_down.base[slot] = tensor_expert_bytes(s->model, g->l->ffn_down_exps, e,
+                                                     &in, &out, &g->q8k_down.row_bytes[slot]);
+        g->q8k_down.xq[slot] = s->expert_midq + slot * (2304 / QK_K);
+    }
+    ds4_quantize_row_q8_K(s->norm, s->expert_xq, 5120);
+    iq2xxs_q8_prepare(g->yq, s->expert_xq, 5120 / QK_K);
+}
+
+static void ds41_cpu_ffn_routed_midq(void *vctx) {
+    ds41_cpu_state *s = vctx;
+    for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++)
+        ds4_quantize_row_q8_K(s->expert_mid + slot * 2304, s->expert_midq + slot * (2304 / QK_K),
+                              2304);
 }
 
 static void ds41_cpu_ffn_shared_mid(void *vctx) {
@@ -544,7 +663,17 @@ static void ds41_cpu_ffn_shared_mid(void *vctx) {
 }
 
 static void ds41_cpu_ffn_post_worker(void *vctx, uint64_t d0, uint64_t d1) {
-    ds41_cpu_state *s = vctx;
+    ds41_cpu_ffn_graph *g = vctx;
+    ds41_cpu_state *s = g->s;
+    /* The Q8_K down rows in slot order from 0.0f, as the plain path sums them. */
+    if (g->q8k) {
+        for (uint64_t d = d0; d < d1; d++) {
+            float sum = 0.0f;
+            for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++)
+                sum += s->expert_part[slot * 5120u + d];
+            s->block[d] = sum;
+        }
+    }
     for (uint64_t d = d0; d < d1; d++)
         s->block[d] = ds41_cpu_bf16(s->block[d] + ds41_cpu_bf16(s->shared[d]));
     ds41_cpu_hc_expand_cols(s->residual, s->block, s->after_attn, s->ffn_split, d0, d1);
@@ -587,6 +716,12 @@ static void ds41_cpu_ffn_graph_stages(ds41_cpu_ffn_graph *g, ds41_cpu_state *s,
         .rows = 5120, .group_rows = 5120,
     };
     ds41_cpu_routed_init(&g->mid, &g->down, l, s->norm, s->expert_mid, s->block);
+    g->q8k = ds41_cpu_q8k_experts(l);
+    g->q8k_mid = (matvec_iq2_xxs_mid_ctx){
+        .mid = s->expert_mid, .xq = g->yq, .clamp = DS4_SWIGLU_CLAMP_EXP,
+        .in_dim = 5120, .out_dim = 2304, .n_expert = (int)DS4_N_EXPERT_USED,
+    };
+    g->q8k_down = (matvec_q2_k_accum_ctx){.part = s->expert_part, .in_dim = 2304, .out_dim = 5120};
     /* Independent stages first: a thread waits at the first stage whose
      * inputs are not ready.  The gate/up rows of each expert are their own
      * NUMA group, so each node reads the half of every expert placed on it.
@@ -607,10 +742,20 @@ static void ds41_cpu_ffn_graph_stages(ds41_cpu_ffn_graph *g, ds41_cpu_state *s,
         { .fn = ds41_cpu_down_worker, .ctx = &g->down, .n_rows = tiles,
           .group_rows = tiles, .deps = 1u << 3 },
         /* Light elementwise work: claims of 256 columns. */
-        { .fn = ds41_cpu_ffn_post_worker, .ctx = s, .n_rows = 5120, .group_rows = 5120,
+        { .fn = ds41_cpu_ffn_post_worker, .ctx = g, .n_rows = 5120, .group_rows = 5120,
           .min_chunk = 256, .deps = (1u << 4) | (1u << 5) | (1u << 6) },
     };
     memcpy(stages, st, sizeof(st));
+    /* Q8_K experts: the mids in rows (each expert's a NUMA group), quantized
+     * by the stage's finish step, then the down rows expert-major, as in
+     * V4's layer_ffn_graph(). */
+    if (g->q8k) {
+        stages[3] = (ds4_pool_stage){ .fn = matvec_iq2_xxs_mid_worker, .ctx = &g->q8k_mid,
+            .n_rows = DS4_N_EXPERT_USED * 2304u, .group_rows = 2304, .deps = 1u << 1,
+            .finish = ds41_cpu_ffn_routed_midq, .finish_ctx = s };
+        stages[6] = (ds4_pool_stage){ .fn = matvec_q2_k_accum_worker, .ctx = &g->q8k_down,
+            .n_rows = DS4_N_EXPERT_USED * 5120u, .group_rows = 5120, .deps = 1u << 3 };
+    }
 }
 
 static void ds41_cpu_ffn_graph_bytes(const ds4_layer_weights *l, int phase) {
@@ -1425,9 +1570,12 @@ static bool ds41_cpu_prefill_layer(ds41_cpu_state *s, uint32_t il, uint32_t n,
     if (!ds41_cpu_matmul(b->shared, 5120, m, l->ffn_down_shexp, b->shared_mid, 2304, n, true))
         return false;
     DS41_PHASE(5);
-    c.routed = ds41_cpu_routed_moe_batch(b->partial, b->mid, b->entry, m, l, b->norm, 5120, n,
-                                         b->selected, b->weight);
-    if (!c.routed) {
+    /* Q2 experts write block; the F32 batch writes the partials. */
+    const bool q8k = ds41_cpu_routed_moe_q8k_batch(b->block, m, l, b->norm, n,
+                                                   b->selected, b->weight);
+    c.routed = !q8k && ds41_cpu_routed_moe_batch(b->partial, b->mid, b->entry, m, l, b->norm,
+                                                 5120, n, b->selected, b->weight);
+    if (!q8k && !c.routed) {
         for (uint32_t i = 0; i < n; i++)
             ds41_cpu_routed_moe(b->block + (size_t)i * 5120u, s->expert_mid, m, l,
                                 b->norm + (size_t)i * 5120u,
@@ -1490,6 +1638,8 @@ static bool ds41_cpu_prefill(ds41_cpu_state *s, const int *tokens, uint32_t n,
         pre[0] = 1.0f;
         pre[1] = pre[2] = pre[3] = 0.0f;
     }
+    /* moe_grouped_ffn's workspace is freed on every return, as V4's
+     * prefill frees it. */
     for (uint32_t il = 0; il < 40; il++) {
         if (il == 1 || il == 14) {
             const double wait = profile ? now_sec() : 0;
@@ -1498,6 +1648,7 @@ static bool ds41_cpu_prefill(ds41_cpu_state *s, const int *tokens, uint32_t n,
             if (profile) read_seconds += now_sec() - wait;
             if (!ok) {
                 if (il == 1) ds41_cpu_engram_batch_finish(rows, true);
+                pf_bufs_free();
                 s->valid = false;
                 return ds41_cpu_error(error, cap, "V4.1 Engram row read failed");
             }
@@ -1508,11 +1659,13 @@ static bool ds41_cpu_prefill(ds41_cpu_state *s, const int *tokens, uint32_t n,
             ds41_cpu_engram_batch_ahead(b, &s->engram, history, s->table, next, next_n);
         if (!ds41_cpu_prefill_layer(s, il, n, profile ? phase : NULL)) {
             if (il < 14) ds41_cpu_engram_batch_finish(rows, true);
+            pf_bufs_free();
             s->valid = false;
             if (error && cap) snprintf(error, cap, "V4.1 CPU prefill layer %u failed at token position %u", il, s->pos);
             return false;
         }
     }
+    pf_bufs_free();
     memcpy(s->residual, b->residual + (size_t)(n - 1u) * 4u * 5120u, sizeof(s->residual));
     memcpy(s->pre, b->pre + (size_t)(n - 1u) * 4u, sizeof(s->pre));
     const double head_started = profile ? now_sec() : 0;

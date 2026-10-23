@@ -835,6 +835,99 @@ static void check_q8_quantizers(void) {
     }
 }
 
+/* Scalar port of q8_K_quantize_kernel in ds4_cuda.cu, which quantizes the
+ * routed-expert input and the SwiGLU mids on CUDA.  Its 256 threads reduce
+ * max |x| as a tree, halving the stride and keeping the lower slot on ties;
+ * each level reads only slots the level does not write, so a serial loop
+ * per level is the same reduction. */
+static float q8_K_cuda_oracle(const float *x, block_q8_K *y) {
+    float abs_part[QK_K], val_part[QK_K];
+    for (int t = 0; t < QK_K; t++) {
+        abs_part[t] = fabsf(x[t]);
+        val_part[t] = x[t];
+    }
+    for (int stride = QK_K / 2; stride > 0; stride >>= 1) {
+        for (int t = 0; t < stride; t++) {
+            if (abs_part[t + stride] > abs_part[t]) {
+                abs_part[t] = abs_part[t + stride];
+                val_part[t] = val_part[t + stride];
+            }
+        }
+    }
+    if (abs_part[0] == 0.0f) {
+        y->d = 0.0f;
+        memset(y->qs, 0, sizeof(y->qs));
+        memset(y->bsums, 0, sizeof(y->bsums));
+        return 0.0f;
+    }
+    const float iscale = -127.0f / val_part[0];
+    for (int t = 0; t < QK_K; t++) {
+        int qv = (int)lrintf(iscale * x[t]);
+        if (qv > 127) qv = 127;
+        if (qv < -128) qv = -128;
+        y->qs[t] = (int8_t)qv;
+    }
+    for (int t = 0; t < QK_K / 16; t++) {
+        int sum = 0;
+        for (int i = 0; i < 16; i++) sum += y->qs[t * 16 + i];
+        y->bsums[t] = (int16_t)sum;
+    }
+    y->d = 1.0f / iscale;
+    return val_part[0];
+}
+
+/* The V4.1 CPU routed experts use ds4_quantize_row_q8_K as CUDA's Q8_K
+ * quantizer.  The bytes are the same unless the block's largest |x| occurs
+ * with both signs: CUDA can then pick the other sign, which negates d, every
+ * q and every bsum, so each d * integer-sum product of a dot is unchanged.
+ * NaN, infinite and subnormal-scale inputs are left out: they do not occur
+ * in activations and the two codes need not agree on them. */
+static void check_q8_K_cuda_formula(void) {
+    enum { N = 64 * QK_K };
+    static float x[N];
+    static block_q8_K k0[N / QK_K], k1[N / QK_K];
+    const unsigned patterns[] = {0, 1, 2, 3, 10, 11, 12, 13};
+    unsigned same = 0, negated = 0;
+    for (unsigned rep = 0; rep < 16; rep++) {
+        for (unsigned p = 0; p < sizeof(patterns) / sizeof(*patterns) + 2; p++) {
+            if (p < sizeof(patterns) / sizeof(*patterns)) {
+                quant_activation(x, N, patterns[p]);
+            } else {
+                /* BF16-rounded activations, as the V4.1 CPU norms produce:
+                 * few mantissa bits make equal |x| of either sign common. */
+                for (unsigned i = 0; i < N; i++) {
+                    float v = quant_uniform(p & 1 ? 0.125f : 3.0f) * (float)(1 + quant_random() % 4);
+                    uint32_t bits;
+                    memcpy(&bits, &v, sizeof(bits));
+                    bits &= 0xffff0000u;
+                    memcpy(&v, &bits, sizeof(v));
+                    x[i] = (quant_random() % 97u) ? v : 0.0f;
+                }
+                for (unsigned b = 0; b < N / QK_K; b += 3) {
+                    x[b * QK_K + quant_random() % QK_K] = 7.5f;
+                    x[b * QK_K + quant_random() % QK_K] = -7.5f;
+                }
+            }
+            memset(k0, 0x5a, sizeof(k0)); memset(k1, 0x5a, sizeof(k1));
+            ds4_quantize_row_q8_K(x, k1, N);
+            for (unsigned b = 0; b < N / QK_K; b++) {
+                q8_K_cuda_oracle(x + b * QK_K, &k0[b]);
+                if (!memcmp(&k0[b], &k1[b], sizeof(k0[b]))) {
+                    same++;
+                    continue;
+                }
+                CHECK(k0[b].d == -k1[b].d);
+                for (int t = 0; t < QK_K; t++) CHECK(k0[b].qs[t] == -k1[b].qs[t]);
+                for (int t = 0; t < QK_K / 16; t++) CHECK(k0[b].bsums[t] == -k1[b].bsums[t]);
+                negated++;
+            }
+        }
+    }
+    CHECK(same > 0 && negated > 0);
+    printf("CPU Q8_K quantizer is CUDA's q8_K_quantize formula: %u blocks identical, "
+           "%u sign-flipped ties with equal d*q\n", same, negated);
+}
+
 static void check_q8_0_dots(void) {
     const uint64_t dims[] = {32, 64, 224, 256, 260, 288, 512, 1000, 1024, 2048 + 96, 4096, 4096 + 17};
     const uint16_t half[] = {0, 0x8000, 1, 0x8001, 0x03ff, 0x83ff, 0x0400, 0x1801, 0x9a17,
@@ -3009,6 +3102,7 @@ int main(void) {
 #endif
     check_q8_quantizers();
     puts("CPU Q8_0/Q8_K activation quantizers match the scalar code bitwise");
+    check_q8_K_cuda_formula();
     check_indexer();
     check_indexer_selection();
     puts("CPU indexer row-parallel scoring and top-k selection oracle PASS");
