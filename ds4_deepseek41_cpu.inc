@@ -787,14 +787,71 @@ static bool ds41_cpu_matmul(float *out, uint64_t out_stride, const ds4_model *m,
     return true;
 }
 
-static void ds41_cpu_batch_read_worker(void *vctx, uint64_t t0, uint64_t t1) {
-    ds41_cpu_batch_ctx *c = vctx;
+/* The chunk's Engram rows, read by helper threads while the layers before
+ * 1 and 14 run: every token's row of layer 1's table, then of layer 14's.
+ * The rows are the bytes ds4_engram_read() returns and land where the
+ * synchronous read put them; only the time they are read changes. */
+#define DS41_CPU_ENGRAM_READERS 16u
+typedef struct {
+    const ds4_engram_table *table;
+    const uint32_t *ids;
+    float *rows;
+    uint32_t n, next[2], done[2];
+    int failed, stop;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    pthread_t threads[DS41_CPU_ENGRAM_READERS];
+    uint32_t started;
+} ds41_cpu_engram_batch;
+
+static void *ds41_cpu_engram_batch_thread(void *vctx) {
+    ds41_cpu_engram_batch *e = vctx;
     const size_t cols = DS4_ENGRAM_COLS;
-    for (uint64_t t = t0; t < t1; t++)
-        for (uint32_t i = 0; i < 2; i++)
-            if (!ds4_engram_read(&c->s->table[i], c->b->ids + (t * 2u + i) * cols, cols,
-                                 c->b->rows + (t * 2u + i) * cols * DS4_ENGRAM_DIM))
-                ds41_cpu_batch_fail(c);
+    for (uint32_t i = 0; i < 2; i++) {
+        for (;;) {
+            const uint32_t t = __atomic_fetch_add(&e->next[i], 1, __ATOMIC_RELAXED);
+            if (t >= e->n) break;
+            if (!__atomic_load_n(&e->stop, __ATOMIC_RELAXED) &&
+                !ds4_engram_read(&e->table[i], e->ids + ((size_t)t * 2u + i) * cols, cols,
+                                 e->rows + ((size_t)t * 2u + i) * cols * DS4_ENGRAM_DIM))
+                __atomic_store_n(&e->failed, 1, __ATOMIC_RELAXED);
+            if (__atomic_add_fetch(&e->done[i], 1, __ATOMIC_ACQ_REL) == e->n) {
+                pthread_mutex_lock(&e->mutex);
+                pthread_cond_broadcast(&e->cond);
+                pthread_mutex_unlock(&e->mutex);
+            }
+        }
+    }
+    return NULL;
+}
+
+/* Start the reads; without helper threads they run here before returning. */
+static void ds41_cpu_engram_batch_start(ds41_cpu_engram_batch *e, const ds4_engram_table table[2],
+                                        const uint32_t *ids, float *rows, uint32_t n) {
+    *e = (ds41_cpu_engram_batch){.table = table, .ids = ids, .rows = rows, .n = n};
+    pthread_mutex_init(&e->mutex, NULL);
+    pthread_cond_init(&e->cond, NULL);
+    while (e->started < DS41_CPU_ENGRAM_READERS &&
+           !pthread_create(&e->threads[e->started], NULL, ds41_cpu_engram_batch_thread, e))
+        e->started++;
+    if (!e->started) ds41_cpu_engram_batch_thread(e);
+}
+
+/* Wait for the rows of table i; false when a read failed. */
+static bool ds41_cpu_engram_batch_wait(ds41_cpu_engram_batch *e, uint32_t i) {
+    pthread_mutex_lock(&e->mutex);
+    while (__atomic_load_n(&e->done[i], __ATOMIC_ACQUIRE) < e->n)
+        pthread_cond_wait(&e->cond, &e->mutex);
+    pthread_mutex_unlock(&e->mutex);
+    return !__atomic_load_n(&e->failed, __ATOMIC_RELAXED);
+}
+
+/* Join the readers, early (skipping the reads left) when stop is set. */
+static void ds41_cpu_engram_batch_finish(ds41_cpu_engram_batch *e, bool stop) {
+    if (stop) __atomic_store_n(&e->stop, 1, __ATOMIC_RELAXED);
+    for (uint32_t i = 0; i < e->started; i++) pthread_join(e->threads[i], NULL);
+    pthread_cond_destroy(&e->cond);
+    pthread_mutex_destroy(&e->mutex);
 }
 
 /* Engram and the flat HC input of each token before attention. */
@@ -1203,10 +1260,9 @@ static bool ds41_cpu_prefill(ds41_cpu_state *s, const int *tokens, uint32_t n,
         if (!ds4_engram_hash(&s->engram, &history, &tokens[i], NULL, 1,
                              b->ids + (size_t)i * 2u * DS4_ENGRAM_COLS))
             return ds41_cpu_error(error, cap, "V4.1 Engram hash failed");
-    ds41_cpu_batch_ctx c = {.s = s, .b = b};
-    ds4_parallel_for_min_rows(n, ds41_cpu_batch_read_worker, &c, 1);
-    if (c.failed) return ds41_cpu_error(error, cap, "V4.1 Engram row read failed");
-    const double read_seconds = profile ? now_sec() - started : 0;
+    ds41_cpu_engram_batch rows;
+    ds41_cpu_engram_batch_start(&rows, s->table, b->ids, b->rows, n);
+    double read_seconds = profile ? now_sec() - started : 0;
     for (uint32_t i = 0; i < n; i++) {
         float *x = b->x + (size_t)i * 5120u, *pre = b->pre + (size_t)i * 4u;
         embed_token_any(s->model, s->weights, tokens[i], x);
@@ -1215,7 +1271,19 @@ static bool ds41_cpu_prefill(ds41_cpu_state *s, const int *tokens, uint32_t n,
         pre[1] = pre[2] = pre[3] = 0.0f;
     }
     for (uint32_t il = 0; il < 40; il++) {
+        if (il == 1 || il == 14) {
+            const double wait = profile ? now_sec() : 0;
+            const bool ok = ds41_cpu_engram_batch_wait(&rows, il == 1 ? 0u : 1u);
+            if (il == 14) ds41_cpu_engram_batch_finish(&rows, false);
+            if (profile) read_seconds += now_sec() - wait;
+            if (!ok) {
+                if (il == 1) ds41_cpu_engram_batch_finish(&rows, true);
+                s->valid = false;
+                return ds41_cpu_error(error, cap, "V4.1 Engram row read failed");
+            }
+        }
         if (!ds41_cpu_prefill_layer(s, il, n, profile ? phase : NULL)) {
+            if (il < 14) ds41_cpu_engram_batch_finish(&rows, true);
             s->valid = false;
             if (error && cap) snprintf(error, cap, "V4.1 CPU prefill layer %u failed at token position %u", il, s->pos);
             return false;
