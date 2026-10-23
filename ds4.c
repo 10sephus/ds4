@@ -10745,9 +10745,11 @@ static void q8_0_gemm_8x16(
 /* Rows [r0, r1) of a Q8_0 matrix (row r at data + r * blocks * 34) against
  * every full tile of one group, writing out[t * out_stride + r].  Row blocks
  * are sized to stay in L2 while the tiles stream past, so each weight row is
- * read from DRAM once per matmul.  The last group of eight rows may run past
- * r1 on duplicates of the last row; those results are not stored.  Returns
- * the first token not covered by a tile. */
+ * read from DRAM once per matmul: up to 384 KB of tables, which holds the 32
+ * rows of a grid item at in_dim 8192 (the output projection) in one block,
+ * where 256 KB split them 24 + 8 and streamed the tiles twice.  The last
+ * group of eight rows may run past r1 on duplicates of the last row; those
+ * results are not stored.  Returns the first token not covered by a tile. */
 static uint64_t matmul_q8_0_tiles_range(
         float            *out,
         uint64_t          out_stride,
@@ -10762,7 +10764,7 @@ static uint64_t matmul_q8_0_tiles_range(
     if (tiles->n_tiles == 0) return 0;
 
     const uint64_t row_bytes = blocks * 34;
-    uint64_t block_rows = (256 * 1024 / row_bytes) & ~(uint64_t)7;
+    uint64_t block_rows = (384 * 1024 / row_bytes) & ~(uint64_t)7;
     if (block_rows < 8) block_rows = 8;
     q8_0_tab8 *tab = xmalloc(block_rows / 8 * blocks * sizeof(*tab));
 
