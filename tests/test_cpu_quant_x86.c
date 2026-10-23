@@ -2286,10 +2286,14 @@ static void check_x16_kernels(void) {
     for (unsigned c = 0; c < sizeof(counts) / sizeof(*counts); c++) {
         const unsigned nb = counts[c];
         quant_buffer ib0 = quant_alloc(nb * sizeof(block_iq2_xxs)), ib1 = quant_alloc(nb * sizeof(block_iq2_xxs));
+        quant_buffer ib2 = quant_alloc(nb * sizeof(block_iq2_xxs)), ib3 = quant_alloc(nb * sizeof(block_iq2_xxs));
         quant_buffer qb0 = quant_alloc(nb * sizeof(block_q2_K)), qb1 = quant_alloc(nb * sizeof(block_q2_K));
+        quant_buffer qb2 = quant_alloc(nb * sizeof(block_q2_K)), qb3 = quant_alloc(nb * sizeof(block_q2_K));
         quant_buffer yb = quant_alloc(DS4_MOE_TILE * nb * sizeof(block_q8_K));
         block_iq2_xxs *iq0 = (block_iq2_xxs *)ib0.data, *iq1 = (block_iq2_xxs *)ib1.data;
+        block_iq2_xxs *iq2 = (block_iq2_xxs *)ib2.data, *iq3 = (block_iq2_xxs *)ib3.data;
         block_q2_K *q20 = (block_q2_K *)qb0.data, *q21 = (block_q2_K *)qb1.data;
+        block_q2_K *q22 = (block_q2_K *)qb2.data, *q23 = (block_q2_K *)qb3.data;
         block_q8_K *acts = (block_q8_K *)yb.data;
         iq2xxs_q8 *acts_iq2 = malloc((size_t)DS4_MOE_TILE * nb * sizeof(*acts_iq2));
         CHECK(acts_iq2);
@@ -2298,8 +2302,10 @@ static void check_x16_kernels(void) {
         tile.d = malloc((size_t)nb * DS4_MOE_TILE * sizeof(float));
         tile.bsums = malloc((size_t)nb * DS4_MOE_TILE_BS_STRIDE * sizeof(int16_t));
         uint8_t *w0 = malloc((size_t)nb * QK_K), *w1 = malloc((size_t)nb * QK_K);
+        uint8_t *w2 = malloc((size_t)nb * QK_K), *w3 = malloc((size_t)nb * QK_K);
         int32_t *ls0 = malloc((size_t)nb * (QK_K / 32) * sizeof(int32_t)), *ls1 = malloc((size_t)nb * (QK_K / 32) * sizeof(int32_t));
-        CHECK(tile.q && tile.d && tile.bsums && w0 && w1 && ls0 && ls1);
+        int32_t *ls2 = malloc((size_t)nb * (QK_K / 32) * sizeof(int32_t)), *ls3 = malloc((size_t)nb * (QK_K / 32) * sizeof(int32_t));
+        CHECK(tile.q && tile.d && tile.bsums && w0 && w1 && w2 && w3 && ls0 && ls1 && ls2 && ls3);
         for (unsigned p = 0; p < 24; p++) {
             for (unsigned lane = 0; lane < DS4_MOE_TILE; lane++) {
                 fill_q8_k_row(acts + lane * nb, nb, (p + lane) % 8);
@@ -2307,8 +2313,12 @@ static void check_x16_kernels(void) {
             iq2xxs_q8_prepare(acts_iq2, acts, (uint64_t)DS4_MOE_TILE * nb);
             fill_iq2_row(iq0, nb, p & 1, &counter);
             fill_iq2_row(iq1, nb, (p & 2) != 0, &counter);
+            fill_iq2_row(iq2, nb, (p & 4) != 0, &counter);
+            fill_iq2_row(iq3, nb, (p & 1) == 0, &counter);
             fill_q2_row(q20, nb, &counter);
             fill_q2_row(q21, nb, &counter);
+            fill_q2_row(q22, nb, &counter);
+            fill_q2_row(q23, nb, &counter);
             for (unsigned l = 0; l < sizeof(lanes) / sizeof(*lanes); l++) {
                 tile.n = lanes[l];
                 tile.expert = 0;
@@ -2331,6 +2341,24 @@ static void check_x16_kernels(void) {
                     quant_equal("IQ2_XXS x16 row0", ref0, out0[lane], nb, p * 100 + lane);
                     quant_equal("IQ2_XXS x16 row1", ref1, out1[lane], nb, p * 100 + lane);
                 }
+                /* The four-row pass (two gate/up pairs), row by row. */
+                moe_iq2_xxs_decode_row(iq2, nb, w2, ls2);
+                moe_iq2_xxs_decode_row(iq3, nb, w3, ls3);
+                {
+                    const block_iq2_xxs *x4[4] = { iq0, iq1, iq2, iq3 };
+                    const uint8_t *w4[4] = { w0, w1, w2, w3 };
+                    const int32_t *ls4[4] = { ls0, ls1, ls2, ls3 };
+                    float out4[4][DS4_MOE_TILE];
+                    float *o4[4] = { out4[0], out4[1], out4[2], out4[3] };
+                    moe_iq2_xxs_x16_4(x4, w4, ls4, &tile, nb, o4);
+                    for (unsigned r = 0; r < 4; r++) {
+                        for (unsigned lane = 0; lane < DS4_MOE_TILE; lane++) {
+                            float ref = 0.0f;
+                            if (lane < tile.n) ds4_vec_dot_iq2_xxs_q8_K((int)(nb * QK_K), &ref, x4[r], acts_iq2 + lane * nb);
+                            quant_equal("IQ2_XXS x16 four rows", ref, out4[r][lane], nb, (p * 100 + lane) * 4 + r);
+                        }
+                    }
+                }
                 load.iq2_order = false;
                 moe_tiles_load_worker(&load, 0, 1);
                 moe_q2_k_decode_row(q20, nb, w0);
@@ -2345,11 +2373,29 @@ static void check_x16_kernels(void) {
                     quant_equal("Q2_K x16 row0", ref0, out0[lane], nb, p * 100 + lane);
                     quant_equal("Q2_K x16 row1", ref1, out1[lane], nb, p * 100 + lane);
                 }
+                /* The four-row pass, row by row. */
+                moe_q2_k_decode_row(q22, nb, w2);
+                moe_q2_k_decode_row(q23, nb, w3);
+                {
+                    const block_q2_K *x4[4] = { q20, q21, q22, q23 };
+                    const uint8_t *w4[4] = { w0, w1, w2, w3 };
+                    float out4[4][DS4_MOE_TILE];
+                    float *o4[4] = { out4[0], out4[1], out4[2], out4[3] };
+                    moe_q2_k_x16_4(x4, w4, &tile, nb, o4);
+                    for (unsigned r = 0; r < 4; r++) {
+                        for (unsigned lane = 0; lane < DS4_MOE_TILE; lane++) {
+                            float ref = 0.0f;
+                            if (lane < tile.n) ds4_vec_dot_q2_K_q8_K((int)(nb * QK_K), &ref, x4[r], acts + lane * nb);
+                            quant_equal("Q2_K x16 four rows", ref, out4[r][lane], nb, (p * 100 + lane) * 4 + r);
+                        }
+                    }
+                }
             }
         }
-        free(ls1); free(ls0); free(w1); free(w0);
+        free(ls3); free(ls2); free(ls1); free(ls0); free(w3); free(w2); free(w1); free(w0);
         free(acts_iq2); free(tile.bsums); free(tile.d); free(tile.q);
-        quant_free(yb); quant_free(qb1); quant_free(qb0); quant_free(ib1); quant_free(ib0);
+        quant_free(yb); quant_free(qb3); quant_free(qb2); quant_free(qb1); quant_free(qb0);
+        quant_free(ib3); quant_free(ib2); quant_free(ib1); quant_free(ib0);
     }
 #endif
 }
