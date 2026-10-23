@@ -808,7 +808,7 @@ static bool ds41_cpu_matvec_q8_pair(float *out0, float *out1, const ds4_model *m
             .rows = rows, .group_rows = rows, .group_in = 0,
         };
     }
-    ds4_pool_dispatch(2 * ctx.units, ds41_cpu_q8_pair_worker, &ctx, ctx.units, 32);
+    ds4_pool_dispatch(2 * ctx.units, ds41_cpu_q8_pair_worker, &ctx, ctx.units, 32, 64);
     return true;
 #else
     (void)out0; (void)out1; (void)m; (void)t0; (void)t1; (void)x;
@@ -917,9 +917,9 @@ static bool ds41_cpu_routed_moe_batch(float *partial, float *mid, uint32_t *entr
     c.clamp = DS4_SWIGLU_CLAMP_EXP;
     /* Each expert is a NUMA group: a node takes the row half placed on it. */
     ds4_pool_dispatch((uint64_t)n_used * (DS4_N_FF_EXP / 16), ds41_cpu_routed_mid_batch_worker,
-                      &c, DS4_N_FF_EXP / 16, 1);
+                      &c, DS4_N_FF_EXP / 16, 1, 64);
     ds4_pool_dispatch((uint64_t)n_used * (DS4_N_EMBD / 16), ds41_cpu_routed_down_batch_worker,
-                      &c, DS4_N_EMBD / 16, 1);
+                      &c, DS4_N_EMBD / 16, 1, 64);
     return true;
 #else
     (void)partial; (void)mid; (void)entry; (void)m; (void)l; (void)x; (void)x_stride;
@@ -1005,7 +1005,7 @@ static void ds41_cpu_routed_moe(float *out, float *mid, const ds4_model *m,
          * halves --numa-place all put on it, instead of three whole experts
          * read half from the other socket. */
         const uint64_t tiles = (mc.out_dim + 15) / 16;
-        ds4_pool_dispatch((uint64_t)mc.n_expert * tiles, ds41_cpu_mid_worker, &mc, tiles, 32);
+        ds4_pool_dispatch((uint64_t)mc.n_expert * tiles, ds41_cpu_mid_worker, &mc, tiles, 32, 64);
         ds4_parallel_for_min_rows((dc.out_dim + 15) / 16, ds41_cpu_down_worker, &dc, 32);
         return;
     }

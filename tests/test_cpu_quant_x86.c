@@ -1068,6 +1068,7 @@ typedef struct {
     uint32_t threads_seen;
     uint32_t round;
     bool slow;
+    bool tasks;   /* dispatched by ds4_parallel_for_tasks(): one task per claim */
 } pool_test_ctx;
 
 static __thread uint32_t pool_thread_round;
@@ -1080,8 +1081,9 @@ static void pool_nested_worker(void *vctx, uint64_t row0, uint64_t row1) {
 static void pool_claim_worker(void *vctx, uint64_t row0, uint64_t row1) {
     pool_test_ctx *ctx = vctx;
     CHECK(row0 < row1 && row1 <= ctx->n_rows);
+    CHECK(g_pool_thread < g_pool.n_threads);
     if (g_pool.n_threads > 1) {   /* one thread runs the whole range inline */
-        CHECK(row1 - row0 <= 64);
+        CHECK(row1 - row0 <= (ctx->tasks ? 1 : 64));
         /* A claim never crosses the half of a group that belongs to one node. */
         const uint64_t g = row0 / ctx->group_rows;
         const uint64_t i = row0 - g * ctx->group_rows;
@@ -1108,10 +1110,27 @@ static void pool_dispatch(pool_test_ctx *ctx, uint64_t n_rows, uint64_t group_ro
     ctx->nested_rows = 0;
     ctx->threads_seen = 0;
     ctx->slow = slow;
+    ctx->tasks = false;
     ctx->round++;
     memset(ctx->claims, 0, (size_t)n_rows * sizeof(ctx->claims[0]));
-    ds4_pool_dispatch(n_rows, pool_claim_worker, ctx, group_rows, 1);
+    ds4_pool_dispatch(n_rows, pool_claim_worker, ctx, group_rows, 1, 64);
     for (uint64_t r = 0; r < n_rows; r++) CHECK(ctx->claims[r] == 1);
+    CHECK(ctx->nested_rows == 1000);
+}
+
+/* Every task its own claim, the tasks split between the nodes at the midpoint. */
+static void pool_dispatch_tasks(pool_test_ctx *ctx, uint64_t n_tasks) {
+    ctx->n_rows = n_tasks;
+    ctx->group_rows = n_tasks;
+    ctx->half_rows = g_numa.on ? n_tasks / 2 : n_tasks;
+    ctx->nested_rows = 0;
+    ctx->threads_seen = 0;
+    ctx->slow = false;
+    ctx->tasks = true;
+    ctx->round++;
+    memset(ctx->claims, 0, (size_t)n_tasks * sizeof(ctx->claims[0]));
+    ds4_parallel_for_tasks(n_tasks, pool_claim_worker, ctx);
+    for (uint64_t r = 0; r < n_tasks; r++) CHECK(ctx->claims[r] == 1);
     CHECK(ctx->nested_rows == 1000);
 }
 
@@ -1136,6 +1155,8 @@ static void check_thread_pool(void) {
             pool_dispatch(ctx, 6 * 600, 600, false);        /* six experts' rows */
             pool_dispatch(ctx, 7 * 333 + 100, 333, false);  /* odd halves, partial group */
             pool_dispatch(ctx, 3000, 1, false);             /* nothing for node 0 */
+            pool_dispatch_tasks(ctx, 64 * threads[i]);      /* one task per claim */
+            pool_dispatch_tasks(ctx, 1 + 7 * threads[i]);   /* odd halves */
             const uint32_t rounds = threads[i] == DS4_MAX_THREADS ? 2000 : 100000;
             for (uint32_t k = 0; k < rounds; k++) {
                 pool_dispatch(ctx, 1 + k % 37, 1 + k % 37, false);

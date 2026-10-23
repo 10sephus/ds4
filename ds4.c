@@ -1534,7 +1534,7 @@ enum {
     PF_KV_RAW, PF_KV, PF_HEADS, PF_ATTN_OUT,
     PF_FFN_CUR, PF_FFN_NORM, PF_MOE, PF_SHARED,
     PF_SH_GATE, PF_SH_UP, PF_SH_MID,
-    PF_MOE_XQ, PF_MOE_XQ_IQ2, PF_MOE_MID, PF_MOE_MIDQ, PF_MOE_DOWN,
+    PF_MOE_XQ, PF_MOE_XQ_IQ2, PF_MOE_MID, PF_MOE_MIDQ, PF_MOE_DOWN, PF_MOE_SCRATCH,
     PF_BUF_COUNT
 };
 
@@ -2217,6 +2217,7 @@ typedef struct {
 
 static ds4_thread_pool g_pool;
 static __thread int g_parallel_depth;
+static __thread uint32_t g_pool_thread;   /* index in the pool; 0 on the main thread */
 static uint32_t g_requested_threads;
 /* Pool dispatches and staged dispatches so far (calling thread only), for
  * the CPU profiles: each one costs a wake-up and a join. */
@@ -2350,6 +2351,7 @@ static void *ds4_worker_main(void *arg) {
     const int node = g_pool.thread_node[(uintptr_t)arg];
     uint32_t generation = 0;
     g_parallel_depth = 1;   /* a kernel that dispatches again runs it inline */
+    g_pool_thread = (uint32_t)(uintptr_t)arg;
     ds4_numa_pin(node);
     for (;;) {
         ds4_pool_wait(&g_pool.generation, ++generation, &g_pool.work_cond);
@@ -2546,7 +2548,8 @@ static void ds4_threads_shutdown(void) {
  * (n_rows for one dense tensor, out_dim when the rows run over the selected
  * experts), matching the halves model_place_weights() put on each node. */
 static void ds4_pool_dispatch(uint64_t n_rows, ds4_parallel_fn fn, void *ctx,
-                              uint64_t group_rows, uint64_t min_parallel_rows) {
+                              uint64_t group_rows, uint64_t min_parallel_rows,
+                              uint64_t max_chunk) {
     ds4_threads_init();
 
     if (g_parallel_depth > 0 || g_pool.n_threads <= 1 || n_rows < min_parallel_rows) {
@@ -2555,11 +2558,11 @@ static void ds4_pool_dispatch(uint64_t n_rows, ds4_parallel_fn fn, void *ctx,
     }
 
     /* About eight claims per thread keep the load balanced when some cores
-     * are busy elsewhere; the 64-row cap keeps the last claim of a big matvec
-     * short. */
+     * are busy elsewhere; the caller's cap keeps the last claim of a big
+     * matvec short (64 rows), or makes every task its own claim. */
     uint64_t chunk = n_rows / (8u * g_pool.n_threads);
     if (chunk < 1) chunk = 1;
-    if (chunk > 64) chunk = 64;
+    if (chunk > max_chunk) chunk = max_chunk;
     const uint64_t half = g_numa.on ? group_rows / 2 : group_rows;
     const uint64_t groups = n_rows / group_rows;
     const uint64_t tail = n_rows - groups * group_rows;
@@ -2585,15 +2588,29 @@ static void ds4_pool_dispatch(uint64_t n_rows, ds4_parallel_fn fn, void *ctx,
 }
 
 static void ds4_parallel_for_min_rows(uint64_t n_rows, ds4_parallel_fn fn, void *ctx, uint64_t min_parallel_rows) {
-    ds4_pool_dispatch(n_rows, fn, ctx, n_rows, min_parallel_rows);
+    ds4_pool_dispatch(n_rows, fn, ctx, n_rows, min_parallel_rows, 64);
 }
 
 static void ds4_parallel_for(uint64_t n_rows, ds4_parallel_fn fn, void *ctx) {
-    ds4_pool_dispatch(n_rows, fn, ctx, n_rows, 512);
+    ds4_pool_dispatch(n_rows, fn, ctx, n_rows, 512, 64);
 }
 
 static void ds4_parallel_for_grouped(uint64_t n_rows, ds4_parallel_fn fn, void *ctx, uint64_t group_rows) {
-    ds4_pool_dispatch(n_rows, fn, ctx, group_rows, 512);
+    ds4_pool_dispatch(n_rows, fn, ctx, group_rows, 512, 64);
+}
+
+/* One task per claim, for tasks whose cost differs by orders of magnitude:
+ * a routed prefill task is one expert's tiles times a row block, so a claim
+ * of several tasks of a popular expert could exceed a thread's share of the
+ * whole phase. */
+static void ds4_parallel_for_tasks(uint64_t n_tasks, ds4_parallel_fn fn, void *ctx) {
+    ds4_pool_dispatch(n_tasks, fn, ctx, n_tasks, 1, 1);
+}
+
+/* Threads the pool runs a kernel on, the caller included. */
+static uint32_t ds4_pool_threads(void) {
+    ds4_threads_init();
+    return g_pool.n_threads;
 }
 
 /* Run dependent row-parallel kernels in one dispatch with one join.  Each
@@ -12606,19 +12623,21 @@ typedef struct {
     uint32_t n_groups;
     uint32_t n_row_blocks;
     float clamp;
+    uint8_t *scratch;           /* decoded rows, scratch_stride bytes per thread */
+    size_t scratch_stride;
 } moe_mid_tile_ctx;
 
-/* The task's gate/up row pairs are decoded once into a buffer that stays in
- * L2 while every tile of the expert streams past once; then the same clamp,
- * SwiGLU and router weight as the decode path.  Only a lone tile can be too
- * sparse for the x16 kernel. */
+/* The task's gate/up row pairs are decoded once into the thread's buffer,
+ * which stays in L2 while every tile of the expert streams past once; then
+ * the same clamp, SwiGLU and router weight as the decode path.  Only a lone
+ * tile can be too sparse for the x16 kernel. */
 static void moe_mid_tile_worker(void *vctx, uint64_t task0, uint64_t task1) {
     moe_mid_tile_ctx *ctx = vctx;
     const uint32_t nb = ctx->nb;
 #if DS4_MOE_X16
     const size_t wq = (size_t)nb * QK_K, lq = (size_t)nb * (QK_K / 32);
-    uint8_t *w = xmalloc(2 * DS4_MOE_ROW_BLOCK * wq);
-    int32_t *ls = xmalloc(2 * DS4_MOE_ROW_BLOCK * lq * sizeof(ls[0]));
+    uint8_t *w = ctx->scratch + (size_t)g_pool_thread * ctx->scratch_stride;
+    int32_t *ls = (int32_t *)(w + 2 * DS4_MOE_ROW_BLOCK * wq);
 #endif
 
     for (uint64_t task = task0; task < task1; task++) {
@@ -12673,10 +12692,6 @@ static void moe_mid_tile_worker(void *vctx, uint64_t task0, uint64_t task1) {
             }
         }
     }
-#if DS4_MOE_X16
-    free(ls);
-    free(w);
-#endif
 }
 
 typedef struct {
@@ -12689,17 +12704,19 @@ typedef struct {
     uint32_t nb;
     uint32_t n_groups;
     uint32_t n_row_blocks;
+    uint8_t *scratch;           /* decoded rows, scratch_stride bytes per thread */
+    size_t scratch_stride;
 } moe_down_tile_ctx;
 
 /* Two down rows per pass share the tile loads; the task's rows are decoded
- * once into an L2-resident buffer and every tile of the expert streams past
- * once. */
+ * once into the thread's L2-resident buffer and every tile of the expert
+ * streams past once. */
 static void moe_down_tile_worker(void *vctx, uint64_t task0, uint64_t task1) {
     moe_down_tile_ctx *ctx = vctx;
     const uint32_t nb = ctx->nb;
 #if DS4_MOE_X16
     const size_t wq = (size_t)nb * QK_K;
-    uint8_t *w = xmalloc(DS4_MOE_ROW_BLOCK * wq);
+    uint8_t *w = ctx->scratch + (size_t)g_pool_thread * ctx->scratch_stride;
 #endif
 
     for (uint64_t task = task0; task < task1; task++) {
@@ -12744,9 +12761,6 @@ static void moe_down_tile_worker(void *vctx, uint64_t task0, uint64_t task1) {
             }
         }
     }
-#if DS4_MOE_X16
-    free(w);
-#endif
 }
 
 typedef struct {
@@ -12870,6 +12884,13 @@ static void moe_grouped_ffn(
     qsort(groups, n_groups, sizeof(groups[0]), moe_expert_tiles_cmp);
     free(pair_ids);
 
+    /* Per-thread decode buffers of the tile workers: a row block of gate/up
+     * pairs with their scales, or of down rows. */
+    size_t scratch_stride = (size_t)2 * DS4_MOE_ROW_BLOCK * nb_in * (QK_K + QK_K / 32 * sizeof(int32_t));
+    if (scratch_stride < (size_t)DS4_MOE_ROW_BLOCK * nb_mid * QK_K) scratch_stride = (size_t)DS4_MOE_ROW_BLOCK * nb_mid * QK_K;
+    scratch_stride = (scratch_stride + 63) & ~(size_t)63;
+    uint8_t *scratch = DS4_MOE_X16 ? pf_buf(PF_MOE_SCRATCH, (size_t)ds4_pool_threads() * scratch_stride) : NULL;
+
     /* Gate/up over the token activations. */
     moe_tiles_load_ctx load_ctx = { .tiles = tiles, .rows = xq, .iq2_rows = xq_iq2, .nb = nb_in,
                                     .pairs_per_row = n_used, .iq2_order = true };
@@ -12890,8 +12911,10 @@ static void moe_grouped_ffn(
         .n_groups = n_groups,
         .n_row_blocks = (uint32_t)((mid_dim + DS4_MOE_ROW_BLOCK - 1) / DS4_MOE_ROW_BLOCK),
         .clamp = clamp,
+        .scratch = scratch,
+        .scratch_stride = scratch_stride,
     };
-    ds4_parallel_for_min_rows((uint64_t)n_groups * mid_ctx.n_row_blocks, moe_mid_tile_worker, &mid_ctx, 1);
+    ds4_parallel_for_tasks((uint64_t)n_groups * mid_ctx.n_row_blocks, moe_mid_tile_worker, &mid_ctx);
 
     /* Down over the requantized mids, one Q8_K row per pair. */
     block_q8_K *midq = pf_buf(PF_MOE_MIDQ, (size_t)total_pairs * nb_mid * sizeof(midq[0]));
@@ -12912,8 +12935,10 @@ static void moe_grouped_ffn(
         .nb = nb_mid,
         .n_groups = n_groups,
         .n_row_blocks = (uint32_t)((out_dim + DS4_MOE_ROW_BLOCK - 1) / DS4_MOE_ROW_BLOCK),
+        .scratch = scratch,
+        .scratch_stride = scratch_stride,
     };
-    ds4_parallel_for_min_rows((uint64_t)n_groups * down_ctx.n_row_blocks, moe_down_tile_worker, &down_ctx, 1);
+    ds4_parallel_for_tasks((uint64_t)n_groups * down_ctx.n_row_blocks, moe_down_tile_worker, &down_ctx);
     free(groups);
     free(tile_bs);
     free(tile_d);
