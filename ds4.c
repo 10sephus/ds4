@@ -12608,15 +12608,17 @@ typedef struct {
     float clamp;
 } moe_mid_tile_ctx;
 
-/* Each gate/up row pair of the task is decoded once and run against every
- * tile of the expert, then the same clamp, SwiGLU and router weight as the
- * decode path.  Only a lone tile can be too sparse for the x16 kernel. */
+/* The task's gate/up row pairs are decoded once into a buffer that stays in
+ * L2 while every tile of the expert streams past once; then the same clamp,
+ * SwiGLU and router weight as the decode path.  Only a lone tile can be too
+ * sparse for the x16 kernel. */
 static void moe_mid_tile_worker(void *vctx, uint64_t task0, uint64_t task1) {
     moe_mid_tile_ctx *ctx = vctx;
     const uint32_t nb = ctx->nb;
 #if DS4_MOE_X16
-    uint8_t w0[nb * QK_K], w1[nb * QK_K];
-    int32_t ls0[nb * (QK_K / 32)], ls1[nb * (QK_K / 32)];
+    const size_t wq = (size_t)nb * QK_K, lq = (size_t)nb * (QK_K / 32);
+    uint8_t *w = xmalloc(2 * DS4_MOE_ROW_BLOCK * wq);
+    int32_t *ls = xmalloc(2 * DS4_MOE_ROW_BLOCK * lq * sizeof(ls[0]));
 #endif
 
     for (uint64_t task = task0; task < task1; task++) {
@@ -12628,22 +12630,28 @@ static void moe_mid_tile_worker(void *vctx, uint64_t task0, uint64_t task1) {
         const uint64_t row1 = row0 + DS4_MOE_ROW_BLOCK < ctx->out_dim ? row0 + DS4_MOE_ROW_BLOCK : ctx->out_dim;
         const uint8_t *gate = ctx->gate + (uint64_t)tiles->expert * ctx->out_dim * ctx->gate_row_bytes;
         const uint8_t *up = ctx->up + (uint64_t)tiles->expert * ctx->out_dim * ctx->up_row_bytes;
-
-        for (uint64_t row = row0; row < row1; row++) {
-            const block_iq2_xxs *x0 = (const block_iq2_xxs *)(gate + row * ctx->gate_row_bytes);
-            const block_iq2_xxs *x1 = (const block_iq2_xxs *)(up + row * ctx->up_row_bytes);
 #if DS4_MOE_X16
-            if (tiles->n >= DS4_MOE_X16_MIN_LANES) {
-                moe_iq2_xxs_decode_row(x0, nb, w0, ls0);
-                moe_iq2_xxs_decode_row(x1, nb, w1, ls1);
+        if (tiles->n >= DS4_MOE_X16_MIN_LANES) {
+            for (uint64_t r = 0; r < row1 - row0; r++) {
+                moe_iq2_xxs_decode_row((const block_iq2_xxs *)(gate + (row0 + r) * ctx->gate_row_bytes), nb,
+                                       w + 2 * r * wq, ls + 2 * r * lq);
+                moe_iq2_xxs_decode_row((const block_iq2_xxs *)(up + (row0 + r) * ctx->up_row_bytes), nb,
+                                       w + (2 * r + 1) * wq, ls + (2 * r + 1) * lq);
             }
+        }
 #endif
-            for (uint32_t ti = 0; ti < g->n_tiles; ti++) {
-                const ds4_moe_tile *t = tiles + ti;
+
+        for (uint32_t ti = 0; ti < g->n_tiles; ti++) {
+            const ds4_moe_tile *t = tiles + ti;
+            for (uint64_t row = row0; row < row1; row++) {
+                const block_iq2_xxs *x0 = (const block_iq2_xxs *)(gate + row * ctx->gate_row_bytes);
+                const block_iq2_xxs *x1 = (const block_iq2_xxs *)(up + row * ctx->up_row_bytes);
                 float gv[DS4_MOE_TILE], uv[DS4_MOE_TILE];
 #if DS4_MOE_X16
                 if (t->n >= DS4_MOE_X16_MIN_LANES) {
-                    moe_iq2_xxs_x16(x0, w0, ls0, x1, w1, ls1, t, nb, gv, uv);
+                    const uint64_t r = row - row0;
+                    moe_iq2_xxs_x16(x0, w + 2 * r * wq, ls + 2 * r * lq,
+                                    x1, w + (2 * r + 1) * wq, ls + (2 * r + 1) * lq, t, nb, gv, uv);
                 } else
 #endif
                 {
@@ -12665,6 +12673,10 @@ static void moe_mid_tile_worker(void *vctx, uint64_t task0, uint64_t task1) {
             }
         }
     }
+#if DS4_MOE_X16
+    free(ls);
+    free(w);
+#endif
 }
 
 typedef struct {
@@ -12679,13 +12691,15 @@ typedef struct {
     uint32_t n_row_blocks;
 } moe_down_tile_ctx;
 
-/* Two down rows per pass, decoded once, share the tile loads of every tile
- * of the expert. */
+/* Two down rows per pass share the tile loads; the task's rows are decoded
+ * once into an L2-resident buffer and every tile of the expert streams past
+ * once. */
 static void moe_down_tile_worker(void *vctx, uint64_t task0, uint64_t task1) {
     moe_down_tile_ctx *ctx = vctx;
     const uint32_t nb = ctx->nb;
 #if DS4_MOE_X16
-    uint8_t w0[nb * QK_K], w1[nb * QK_K];
+    const size_t wq = (size_t)nb * QK_K;
+    uint8_t *w = xmalloc(DS4_MOE_ROW_BLOCK * wq);
 #endif
 
     for (uint64_t task = task0; task < task1; task++) {
@@ -12696,22 +12710,24 @@ static void moe_down_tile_worker(void *vctx, uint64_t task0, uint64_t task1) {
         const uint64_t row0 = (uint64_t)rb * DS4_MOE_ROW_BLOCK;
         const uint64_t row1 = row0 + DS4_MOE_ROW_BLOCK < ctx->out_dim ? row0 + DS4_MOE_ROW_BLOCK : ctx->out_dim;
         const uint8_t *down = ctx->down + (uint64_t)tiles->expert * ctx->out_dim * ctx->row_bytes;
-
-        for (uint64_t row = row0; row < row1; row += 2) {
-            const block_q2_K *x0 = (const block_q2_K *)(down + row * ctx->row_bytes);
-            const block_q2_K *x1 = (const block_q2_K *)(down + (row + 1) * ctx->row_bytes);
 #if DS4_MOE_X16
-            if (tiles->n >= DS4_MOE_X16_MIN_LANES) {
-                moe_q2_k_decode_row(x0, nb, w0);
-                moe_q2_k_decode_row(x1, nb, w1);
+        if (tiles->n >= DS4_MOE_X16_MIN_LANES) {
+            for (uint64_t r = 0; r < row1 - row0; r++) {
+                moe_q2_k_decode_row((const block_q2_K *)(down + (row0 + r) * ctx->row_bytes), nb, w + r * wq);
             }
+        }
 #endif
-            for (uint32_t ti = 0; ti < g->n_tiles; ti++) {
-                const ds4_moe_tile *t = tiles + ti;
+
+        for (uint32_t ti = 0; ti < g->n_tiles; ti++) {
+            const ds4_moe_tile *t = tiles + ti;
+            for (uint64_t row = row0; row < row1; row += 2) {
+                const block_q2_K *x0 = (const block_q2_K *)(down + row * ctx->row_bytes);
+                const block_q2_K *x1 = (const block_q2_K *)(down + (row + 1) * ctx->row_bytes);
                 float v0[DS4_MOE_TILE], v1[DS4_MOE_TILE];
 #if DS4_MOE_X16
                 if (t->n >= DS4_MOE_X16_MIN_LANES) {
-                    moe_q2_k_x16(x0, w0, x1, w1, t, nb, v0, v1);
+                    const uint64_t r = row - row0;
+                    moe_q2_k_x16(x0, w + r * wq, x1, w + (r + 1) * wq, t, nb, v0, v1);
                 } else
 #endif
                 {
@@ -12728,6 +12744,9 @@ static void moe_down_tile_worker(void *vctx, uint64_t task0, uint64_t task1) {
             }
         }
     }
+#if DS4_MOE_X16
+    free(w);
+#endif
 }
 
 typedef struct {
