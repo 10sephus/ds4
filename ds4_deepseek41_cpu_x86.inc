@@ -742,12 +742,15 @@ static void ds41_cpu_f16_batch2_worker(void *vctx, uint64_t first, uint64_t last
 /* F32 rows times many tokens with matvec_f32_worker's double chain for each
  * (row, token): (double)w * x added in input order, rounded to float at the
  * end.  SIMD lanes are eight tokens of xt, the inputs as [group][i][8]
- * doubles; four rows run at once for independent chains. */
+ * doubles; eight rows run at once for independent chains.  Consecutive
+ * units share a token group, so a claim streams its group's xt (in_dim * 64
+ * bytes, the larger input) once and only the smaller weight rows per unit. */
+#define DS41_CPU_F32_ROWS 8u
 typedef struct {
     const float *w, *x;
     double *xt;
     float *out;
-    uint64_t in_dim, rows, x_stride, out_stride;
+    uint64_t in_dim, rows, x_stride, out_stride, units;
     uint32_t n, groups;
 } ds41_cpu_f32_batch_ctx;
 
@@ -767,26 +770,22 @@ static void ds41_cpu_f32_transpose_worker(void *vctx, uint64_t first, uint64_t l
 static void ds41_cpu_f32_batch_worker(void *vctx, uint64_t first, uint64_t last) {
     const ds41_cpu_f32_batch_ctx *c = vctx;
     for (uint64_t unit = first; unit < last; unit++) {
-        const uint64_t g = unit % c->groups, r0 = unit / c->groups * 4;
-        const uint64_t nr = c->rows - r0 < 4 ? c->rows - r0 : 4;
+        const uint64_t g = unit / c->units, r0 = unit % c->units * DS41_CPU_F32_ROWS;
+        const uint64_t nr = c->rows - r0 < DS41_CPU_F32_ROWS ? c->rows - r0 : DS41_CPU_F32_ROWS;
         const double *x = c->xt + g * c->in_dim * 8;
-        const float *w0 = c->w + r0 * c->in_dim;
-        const float *w1 = nr > 1 ? w0 + c->in_dim : w0;
-        const float *w2 = nr > 2 ? w0 + 2 * c->in_dim : w0;
-        const float *w3 = nr > 3 ? w0 + 3 * c->in_dim : w0;
-        __m512d a0 = _mm512_setzero_pd(), a1 = a0, a2 = a0, a3 = a0;
+        const float *w[DS41_CPU_F32_ROWS];
+        __m512d a[DS41_CPU_F32_ROWS];
+        for (unsigned r = 0; r < DS41_CPU_F32_ROWS; r++) {
+            w[r] = c->w + (r0 + (r < nr ? r : 0)) * c->in_dim;
+            a[r] = _mm512_setzero_pd();
+        }
         for (uint64_t i = 0; i < c->in_dim; i++) {
             const __m512d xv = _mm512_loadu_pd(x + i * 8);
-            a0 = _mm512_add_pd(a0, _mm512_mul_pd(_mm512_set1_pd((double)w0[i]), xv));
-            a1 = _mm512_add_pd(a1, _mm512_mul_pd(_mm512_set1_pd((double)w1[i]), xv));
-            a2 = _mm512_add_pd(a2, _mm512_mul_pd(_mm512_set1_pd((double)w2[i]), xv));
-            a3 = _mm512_add_pd(a3, _mm512_mul_pd(_mm512_set1_pd((double)w3[i]), xv));
+            for (unsigned r = 0; r < DS41_CPU_F32_ROWS; r++)
+                a[r] = _mm512_add_pd(a[r], _mm512_mul_pd(_mm512_set1_pd((double)w[r][i]), xv));
         }
-        double acc[4][8];
-        _mm512_storeu_pd(acc[0], a0);
-        _mm512_storeu_pd(acc[1], a1);
-        _mm512_storeu_pd(acc[2], a2);
-        _mm512_storeu_pd(acc[3], a3);
+        double acc[DS41_CPU_F32_ROWS][8];
+        for (unsigned r = 0; r < DS41_CPU_F32_ROWS; r++) _mm512_storeu_pd(acc[r], a[r]);
         for (uint64_t r = 0; r < nr; r++)
             for (uint64_t lane = 0; lane < 8 && g * 8 + lane < c->n; lane++)
                 c->out[(g * 8 + lane) * c->out_stride + r0 + r] = (float)acc[r][lane];
@@ -1042,10 +1041,11 @@ static bool ds41_cpu_matmul_f32(float *out, uint64_t out_stride, const ds4_model
     ds41_cpu_f32_batch_ctx ctx = {
         .w = tensor_data(m, t), .x = x, .xt = xt, .out = out, .in_dim = t->dim[0],
         .rows = t->dim[1], .x_stride = x_stride, .out_stride = out_stride,
+        .units = (t->dim[1] + DS41_CPU_F32_ROWS - 1) / DS41_CPU_F32_ROWS,
         .n = n, .groups = (n + 7) / 8,
     };
     ds4_parallel_for_min_rows(ctx.groups, ds41_cpu_f32_transpose_worker, &ctx, 1);
-    ds4_parallel_for_min_rows((ctx.rows + 3) / 4 * ctx.groups, ds41_cpu_f32_batch_worker, &ctx, 1);
+    ds4_parallel_for_min_rows(ctx.units * ctx.groups, ds41_cpu_f32_batch_worker, &ctx, 1);
     return true;
 #else
     (void)out; (void)out_stride; (void)m; (void)t; (void)x; (void)x_stride; (void)n; (void)xt;
