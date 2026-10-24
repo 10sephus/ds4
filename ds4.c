@@ -14116,7 +14116,30 @@ static void hc_post_sum_batch_worker(void *vctx, uint64_t t0, uint64_t t1) {
         float *out = ctx->out_hc + t * ctx->hc_dim;
 
         for (uint32_t dst = 0; dst < ctx->n_hc; dst++) {
-            for (uint32_t d = 0; d < ctx->n_embd; d++) {
+            uint32_t d0 = 0;
+#if defined(__AVX512F__)
+            /* Four streams: sixteen elements at a time, each through the
+             * scalar loop's operations in its order (the sum of the two
+             * expert outputs times post, then the sources in order). */
+            if (ctx->n_hc == 4) {
+                const __m512 vp = _mm512_set1_ps(post[dst]);
+                const __m512 w0 = _mm512_set1_ps(comb[dst + 0 * 4]);
+                const __m512 w1 = _mm512_set1_ps(comb[dst + 1 * 4]);
+                const __m512 w2 = _mm512_set1_ps(comb[dst + 2 * 4]);
+                const __m512 w3 = _mm512_set1_ps(comb[dst + 3 * 4]);
+                const float *r0 = residual, *r1 = r0 + ctx->n_embd, *r2 = r1 + ctx->n_embd, *r3 = r2 + ctx->n_embd;
+                float *o = out + (uint64_t)dst * ctx->n_embd;
+                for (; d0 + 16 <= ctx->n_embd; d0 += 16) {
+                    __m512 v = _mm512_mul_ps(_mm512_add_ps(_mm512_loadu_ps(moe + d0), _mm512_loadu_ps(shared + d0)), vp);
+                    v = _mm512_add_ps(v, _mm512_mul_ps(w0, _mm512_loadu_ps(r0 + d0)));
+                    v = _mm512_add_ps(v, _mm512_mul_ps(w1, _mm512_loadu_ps(r1 + d0)));
+                    v = _mm512_add_ps(v, _mm512_mul_ps(w2, _mm512_loadu_ps(r2 + d0)));
+                    v = _mm512_add_ps(v, _mm512_mul_ps(w3, _mm512_loadu_ps(r3 + d0)));
+                    _mm512_storeu_ps(o + d0, v);
+                }
+            }
+#endif
+            for (uint32_t d = d0; d < ctx->n_embd; d++) {
                 float acc = (moe[d] + shared[d]) * post[dst];
                 for (uint32_t src = 0; src < ctx->n_hc; src++) {
                     acc += comb[dst + src * ctx->n_hc] *

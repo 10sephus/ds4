@@ -1468,8 +1468,9 @@ static void check_decode_glue(void) {
         glue_equal("head RMS", a, b, (size_t)heads * dim * sizeof(float), c);
     }
 
-    /* HC pre-sum and post mix with signed zeros, infinities and tiny values. */
-    float post[HC], comb[HC * HC], block[EMBD];
+    /* HC pre-sum and post mix with signed zeros, infinities and tiny values;
+     * the batched FFN post takes its block term as the sum of two outputs. */
+    float post[HC], comb[HC * HC], block[EMBD], moe[EMBD], shared[EMBD];
     for (unsigned c = 0; c < 16; c++) {
         const uint32_t embd = c & 1 ? 1000 : EMBD;
         for (uint32_t i = 0; i < HC * embd; i++) x[i] = glue_random(c & 2 ? 1e-38f : 3.0f);
@@ -1483,6 +1484,18 @@ static void check_decode_glue(void) {
         hc_sum_oracle(a, x, post, embd, HC);
         hc_weighted_sum_one(b, x, post, embd, HC);
         glue_equal("HC sum", a, b, (size_t)embd * sizeof(float), c);
+        for (uint32_t i = 0; i < embd; i++) {
+            moe[i] = glue_random(c & 4 ? 1e30f : 1.0f);
+            shared[i] = glue_random(1.0f);
+            block[i] = moe[i] + shared[i];
+        }
+        if (c == 8) { moe[5] = -0.0f; shared[5] = -0.0f; block[5] = -0.0f; }
+        hc_post_oracle(a, block, x, post, comb, embd, HC);
+        hc_post_sum_batch_ctx sum_ctx = { .out_hc = b, .moe = moe, .shared = shared, .residual_hc = x,
+                                          .post = post, .comb = comb, .hc_dim = (uint64_t)HC * embd,
+                                          .n_embd = embd, .n_hc = HC };
+        hc_post_sum_batch_worker(&sum_ctx, 0, 1);
+        glue_equal("HC post sum", a, b, (size_t)HC * embd * sizeof(float), c);
     }
 
     /* E4M3: every midpoint between grid values, then a sweep of bit patterns.
