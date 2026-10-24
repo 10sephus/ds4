@@ -793,8 +793,11 @@ static bool ds41_cpu_matmul(float *out, uint64_t out_stride, const ds4_model *m,
 /* The chunk's Engram rows, read by helper threads while the layers before
  * 1 and 14 run: every token's row of layer 1's table, then of layer 14's.
  * The rows are the bytes ds4_engram_read() returns and land where the
- * synchronous read put them; only the time they are read changes. */
-#define DS41_CPU_ENGRAM_READERS 16u
+ * synchronous read put them; only the time they are read changes.  A row
+ * not in the page cache is a small random read, and the device serves
+ * them faster the more are in flight: 64 readers keep a cold chunk's
+ * 24576 rows from stalling layer 1. */
+#define DS41_CPU_ENGRAM_READERS 64u
 typedef struct {
     const ds4_engram_table *table;
     const uint32_t *ids;
