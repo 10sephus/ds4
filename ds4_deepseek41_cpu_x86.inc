@@ -832,6 +832,61 @@ static void ds41_cpu_q8_batch4_worker(void *vctx, uint64_t first, uint64_t last)
     }
 }
 
+/* Eight tiles (128 rows) at once for one token pass, a token at a time:
+ * one input broadcast feeds the eight tiles, and each decoded weight
+ * vector is the memory operand of its multiply at a pointer stepping
+ * through the block.  That issues 20 instructions per 128 multiply-adds,
+ * where four tiles of two tokens with the weights loaded into registers
+ * issue 25; a core whose two hardware threads are both busy allocates
+ * about two instructions per cycle to each, which then sets the pace
+ * rather than its two FP ports.  For every (row, token) the products and
+ * additions are those of ds41_cpu_q8_batch4_worker, in the same order.
+ * group_rows must be a multiple of 128. */
+static void ds41_cpu_q8_batch8_worker(void *vctx, uint64_t first, uint64_t last) {
+    const ds41_cpu_q8_batch_ctx *c = vctx;
+    const __m512i offsets = ds41_cpu_row_offsets(c->row_bytes);
+    const uint32_t passes = (c->n + DS41_CPU_PASS - 1) / DS41_CPU_PASS;
+    __m512 w[256], acc[8 * DS41_CPU_PASS];
+    for (uint64_t unit = first; unit < last; unit++) {
+        const uint64_t row = unit / passes * 128;
+        const uint32_t t0 = (uint32_t)(unit % passes) * DS41_CPU_PASS;
+        const uint32_t nt = c->n - t0 < DS41_CPU_PASS ? c->n - t0 : DS41_CPU_PASS;
+        const uint8_t *rows = c->data + row * c->row_bytes;
+        const float *x = c->x + row / c->group_rows * c->group_in + (uint64_t)t0 * c->x_stride;
+        for (uint32_t i = 0; i < 8 * nt; i++) acc[i] = _mm512_setzero_ps();
+        for (uint64_t b = 0; b < c->in_dim / 32; b++) {
+            for (unsigned k = 0; k < 8; k++)
+                ds41_cpu_q8_decode16(w + 32 * k, rows + 16 * k * c->row_bytes + b * 34, offsets);
+            for (uint32_t t = 0; t < nt; t++) {
+                const float *xt = x + (uint64_t)t * c->x_stride + b * 32;
+                __m512 *a = acc + 8 * t;
+                __m512 a0 = a[0], a1 = a[1], a2 = a[2], a3 = a[3];
+                __m512 a4 = a[4], a5 = a[5], a6 = a[6], a7 = a[7];
+                const __m512 *wi = w;
+                for (unsigned i = 0; i < 32; i++, wi++) {
+                    const __m512 v = _mm512_set1_ps(xt[i]);
+                    a0 = _mm512_add_ps(a0, _mm512_mul_ps(wi[0], v));
+                    a1 = _mm512_add_ps(a1, _mm512_mul_ps(wi[32], v));
+                    a2 = _mm512_add_ps(a2, _mm512_mul_ps(wi[64], v));
+                    a3 = _mm512_add_ps(a3, _mm512_mul_ps(wi[96], v));
+                    a4 = _mm512_add_ps(a4, _mm512_mul_ps(wi[128], v));
+                    a5 = _mm512_add_ps(a5, _mm512_mul_ps(wi[160], v));
+                    a6 = _mm512_add_ps(a6, _mm512_mul_ps(wi[192], v));
+                    a7 = _mm512_add_ps(a7, _mm512_mul_ps(wi[224], v));
+                }
+                a[0] = a0; a[1] = a1; a[2] = a2; a[3] = a3;
+                a[4] = a4; a[5] = a5; a[6] = a6; a[7] = a7;
+            }
+        }
+        for (uint32_t t = 0; t < nt; t++) {
+            float *out = c->out + (uint64_t)(t0 + t) * c->out_stride + row;
+            for (unsigned k = 0; k < 8; k++)
+                _mm512_storeu_ps(out + 16 * k, c->round ? ds41_cpu_bf16_16(acc[8 * t + k]) :
+                                                          acc[8 * t + k]);
+        }
+    }
+}
+
 /* out[t * out_stride + r] = row r of an F16 matrix times x[t * x_stride] for
  * n tokens, optionally rounded to BF16, as matvec_f16 computes each token:
  * dot_f16_rows converts a weight with VCVTPH2PS, multiplies it by x and adds
@@ -1205,11 +1260,14 @@ static bool ds41_cpu_matmul_q8(float *out, uint64_t out_stride, const ds4_model 
         .out_stride = out_stride, .in_dim = t->dim[0], .row_bytes = t->dim[0] / 32 * 34,
         .group_rows = group_rows, .group_in = group_in, .n = n, .round = round,
     };
-    /* Row blocks of four tiles by token pass when they give every thread
-     * two units, else tile pairs when they still give every thread one. */
+    /* Row blocks of eight tiles by token pass when they give every thread
+     * three units, else of four tiles when they give it two, else tile
+     * pairs when they still give every thread one. */
     ds4_threads_init();
     const uint64_t passes = (n + DS41_CPU_PASS - 1) / DS41_CPU_PASS;
-    if (group_rows % 64 == 0 && rows / 64 * passes >= 2u * g_pool.n_threads)
+    if (group_rows % 128 == 0 && rows / 128 * passes >= 3u * g_pool.n_threads)
+        ds4_parallel_for_min_rows(rows / 128 * passes, ds41_cpu_q8_batch8_worker, &ctx, 1);
+    else if (group_rows % 64 == 0 && rows / 64 * passes >= 2u * g_pool.n_threads)
         ds4_parallel_for_min_rows(rows / 64 * passes, ds41_cpu_q8_batch4_worker, &ctx, 1);
     else if (group_rows % 32 == 0 && rows / 32 >= g_pool.n_threads)
         ds4_parallel_for_min_rows(rows / 32, ds41_cpu_q8_batch2_worker, &ctx, 1);
