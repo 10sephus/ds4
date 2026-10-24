@@ -2322,9 +2322,10 @@ static void fill_q2_row(block_q2_K *x, unsigned blocks, unsigned *counter) {
     }
 }
 
-/* The x16 tile kernels against the single-row reference dots, lane by lane,
- * on dense tiles (vector path) and sparse tiles (per-row path), including
- * padding lanes, odd block counts and adversarial activations. */
+/* The per-superblock x16 tile kernels, run over whole rows the way the
+ * workers do, against the single-row reference dots, lane by lane, on dense
+ * tiles (vector path) and sparse tiles (per-row path), including padding
+ * lanes, odd block counts and adversarial activations. */
 static void check_x16_kernels(void) {
 #if DS4_MOE_X16
     const unsigned counts[] = {1, 2, 3, 5, 8, 16};
@@ -2348,11 +2349,11 @@ static void check_x16_kernels(void) {
         tile.q = malloc((size_t)nb * DS4_MOE_TILE_Q_STRIDE);
         tile.d = malloc((size_t)nb * DS4_MOE_TILE * sizeof(float));
         tile.bsums = malloc((size_t)nb * DS4_MOE_TILE_BS_STRIDE * sizeof(int16_t));
-        uint8_t *w0 = malloc((size_t)nb * QK_K), *w1 = malloc((size_t)nb * QK_K);
-        uint8_t *w2 = malloc((size_t)nb * QK_K), *w3 = malloc((size_t)nb * QK_K);
-        int32_t *ls0 = malloc((size_t)nb * (QK_K / 32) * sizeof(int32_t)), *ls1 = malloc((size_t)nb * (QK_K / 32) * sizeof(int32_t));
-        int32_t *ls2 = malloc((size_t)nb * (QK_K / 32) * sizeof(int32_t)), *ls3 = malloc((size_t)nb * (QK_K / 32) * sizeof(int32_t));
-        CHECK(tile.q && tile.d && tile.bsums && w0 && w1 && w2 && w3 && ls0 && ls1 && ls2 && ls3);
+        uint8_t *w4 = malloc((size_t)4 * nb * QK_K);
+        int32_t *ls4 = malloc((size_t)4 * nb * (QK_K / 32) * sizeof(int32_t));
+        float *ds4 = malloc((size_t)4 * nb * sizeof(float));
+        float *dd4 = malloc((size_t)4 * nb * sizeof(float)), *dm4 = malloc((size_t)4 * nb * sizeof(float));
+        CHECK(tile.q && tile.d && tile.bsums && w4 && ls4 && ds4 && dd4 && dm4);
         for (unsigned p = 0; p < 24; p++) {
             for (unsigned lane = 0; lane < DS4_MOE_TILE; lane++) {
                 fill_q8_k_row(acts + lane * nb, nb, (p + lane) % 8);
@@ -2375,71 +2376,59 @@ static void check_x16_kernels(void) {
                                             .pairs_per_row = 1, .iq2_order = true };
                 moe_tiles_load_worker(&load, 0, 1);
 
-                float out0[DS4_MOE_TILE], out1[DS4_MOE_TILE];
-                moe_iq2_xxs_decode_row(iq0, nb, w0, ls0);
-                moe_iq2_xxs_decode_row(iq1, nb, w1, ls1);
-                moe_iq2_xxs_x16(iq0, w0, ls0, iq1, w1, ls1, &tile, nb, out0, out1);
-                for (unsigned lane = 0; lane < DS4_MOE_TILE; lane++) {
-                    float ref0 = 0.0f, ref1 = 0.0f;
-                    if (lane < tile.n) {
-                        ds4_vec_dot_iq2_xxs_q8_K((int)(nb * QK_K), &ref0, iq0, acts_iq2 + lane * nb);
-                        ds4_vec_dot_iq2_xxs_q8_K((int)(nb * QK_K), &ref1, iq1, acts_iq2 + lane * nb);
-                    }
-                    quant_equal("IQ2_XXS x16 row0", ref0, out0[lane], nb, p * 100 + lane);
-                    quant_equal("IQ2_XXS x16 row1", ref1, out1[lane], nb, p * 100 + lane);
-                }
-                /* The four-row pass (two gate/up pairs), row by row. */
-                moe_iq2_xxs_decode_row(iq2, nb, w2, ls2);
-                moe_iq2_xxs_decode_row(iq3, nb, w3, ls3);
+                /* Four IQ2_XXS rows decoded superblock-major (n_rows 4), the
+                 * per-superblock four-row kernel over every superblock as the
+                 * gate/up worker runs it, then the final 1/8: row by row
+                 * against the reference dot. */
                 {
                     const block_iq2_xxs *x4[4] = { iq0, iq1, iq2, iq3 };
-                    const uint8_t *w4[4] = { w0, w1, w2, w3 };
-                    const int32_t *ls4[4] = { ls0, ls1, ls2, ls3 };
                     float out4[4][DS4_MOE_TILE];
-                    float *o4[4] = { out4[0], out4[1], out4[2], out4[3] };
-                    moe_iq2_xxs_x16_4(x4, w4, ls4, &tile, nb, o4);
+                    __m512 sumf[4];
+                    for (unsigned r = 0; r < 4; r++) moe_iq2_xxs_decode_row_sb(x4[r], nb, 4, r, w4, ls4, ds4);
+                    for (unsigned r = 0; r < 4; r++) sumf[r] = _mm512_setzero_ps();
+                    for (unsigned i = 0; i < nb; i++) {
+                        moe_iq2_xxs_x16_sb4(w4 + (size_t)i * 4 * QK_K, ls4 + (size_t)i * 4 * (QK_K / 32), ds4 + (size_t)i * 4,
+                                            tile.q + (size_t)i * DS4_MOE_TILE_Q_STRIDE,
+                                            tile.bsums + (size_t)i * DS4_MOE_TILE_BS_STRIDE,
+                                            _mm512_loadu_ps(tile.d + (size_t)i * DS4_MOE_TILE), sumf);
+                    }
                     for (unsigned r = 0; r < 4; r++) {
+                        _mm512_storeu_ps(out4[r], _mm512_mul_ps(_mm512_set1_ps(0.125f), sumf[r]));
                         for (unsigned lane = 0; lane < DS4_MOE_TILE; lane++) {
                             float ref = 0.0f;
                             if (lane < tile.n) ds4_vec_dot_iq2_xxs_q8_K((int)(nb * QK_K), &ref, x4[r], acts_iq2 + lane * nb);
-                            quant_equal("IQ2_XXS x16 four rows", ref, out4[r][lane], nb, (p * 100 + lane) * 4 + r);
+                            quant_equal("IQ2_XXS x16 superblock rows", ref, out4[r][lane], nb, (p * 100 + lane) * 4 + r);
                         }
                     }
                 }
+                /* The same for four Q2_K rows against the tile in natural order. */
                 load.iq2_order = false;
                 moe_tiles_load_worker(&load, 0, 1);
-                moe_q2_k_decode_row(q20, nb, w0);
-                moe_q2_k_decode_row(q21, nb, w1);
-                moe_q2_k_x16(q20, w0, q21, w1, &tile, nb, out0, out1);
-                for (unsigned lane = 0; lane < DS4_MOE_TILE; lane++) {
-                    float ref0 = 0.0f, ref1 = 0.0f;
-                    if (lane < tile.n) {
-                        ds4_vec_dot_q2_K_q8_K((int)(nb * QK_K), &ref0, q20, acts + lane * nb);
-                        ds4_vec_dot_q2_K_q8_K((int)(nb * QK_K), &ref1, q21, acts + lane * nb);
-                    }
-                    quant_equal("Q2_K x16 row0", ref0, out0[lane], nb, p * 100 + lane);
-                    quant_equal("Q2_K x16 row1", ref1, out1[lane], nb, p * 100 + lane);
-                }
-                /* The four-row pass, row by row. */
-                moe_q2_k_decode_row(q22, nb, w2);
-                moe_q2_k_decode_row(q23, nb, w3);
                 {
                     const block_q2_K *x4[4] = { q20, q21, q22, q23 };
-                    const uint8_t *w4[4] = { w0, w1, w2, w3 };
                     float out4[4][DS4_MOE_TILE];
-                    float *o4[4] = { out4[0], out4[1], out4[2], out4[3] };
-                    moe_q2_k_x16_4(x4, w4, &tile, nb, o4);
+                    __m512 sumf[4];
+                    for (unsigned r = 0; r < 4; r++) moe_q2_k_decode_row_sb(x4[r], nb, 4, r, w4, ls4, dd4, dm4);
+                    for (unsigned r = 0; r < 4; r++) sumf[r] = _mm512_setzero_ps();
+                    for (unsigned i = 0; i < nb; i++) {
+                        moe_q2_k_x16_sb4(w4 + (size_t)i * 4 * QK_K, ls4 + (size_t)i * 4 * (QK_K / 32),
+                                         dd4 + (size_t)i * 4, dm4 + (size_t)i * 4,
+                                         tile.q + (size_t)i * DS4_MOE_TILE_Q_STRIDE,
+                                         tile.bsums + (size_t)i * DS4_MOE_TILE_BS_STRIDE,
+                                         _mm512_loadu_ps(tile.d + (size_t)i * DS4_MOE_TILE), sumf);
+                    }
                     for (unsigned r = 0; r < 4; r++) {
+                        _mm512_storeu_ps(out4[r], sumf[r]);
                         for (unsigned lane = 0; lane < DS4_MOE_TILE; lane++) {
                             float ref = 0.0f;
                             if (lane < tile.n) ds4_vec_dot_q2_K_q8_K((int)(nb * QK_K), &ref, x4[r], acts + lane * nb);
-                            quant_equal("Q2_K x16 four rows", ref, out4[r][lane], nb, (p * 100 + lane) * 4 + r);
+                            quant_equal("Q2_K x16 superblock rows", ref, out4[r][lane], nb, (p * 100 + lane) * 4 + r);
                         }
                     }
                 }
             }
         }
-        free(ls3); free(ls2); free(ls1); free(ls0); free(w3); free(w2); free(w1); free(w0);
+        free(dm4); free(dd4); free(ds4); free(ls4); free(w4);
         free(acts_iq2); free(tile.bsums); free(tile.d); free(tile.q);
         quant_free(yb); quant_free(qb3); quant_free(qb2); quant_free(qb1); quant_free(qb0);
         quant_free(ib3); quant_free(ib2); quant_free(ib1); quant_free(ib0);
