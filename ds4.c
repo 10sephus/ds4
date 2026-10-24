@@ -17377,7 +17377,13 @@ static void attn_lanes_score_worker(void *vctx, uint64_t item0, uint64_t item1) 
 
 /* The maximum of each head of group g: its sink, then the chunk maxima (of
  * the scored superset when there is one, a chunk with unlisted rows by the
- * maximum of its listed rows). */
+ * maximum of its listed rows).  That maximum is the chunk's own when every
+ * unlisted row of the chunk is below it in every lane (an ordered '<', which
+ * a NaN fails): the chunk's first row to reach it is then listed, and so it
+ * is the first listed row to reach it, the row whose bits the scan over the
+ * listed rows would keep.  With one or two unlisted rows, the usual case
+ * just past the top-k window, checking them reads their score lines instead
+ * of the chunk's sixteen. */
 static void attn_lanes_head_max(const layer_attention_lanes_ctx *ctx, uint32_t g, float *max) {
     const uint32_t n = g * 16 + 16 < ctx->n_head ? 16 : ctx->n_head - g * 16;
     const layer_attention_lanes_ctx *src = ctx->all ? ctx->all : ctx;
@@ -17389,7 +17395,13 @@ static void attn_lanes_head_max(const layer_attention_lanes_ctx *ctx, uint32_t g
             const uint32_t r0 = c * ATTN_LANES_ROWS_PER_ITEM;
             const uint32_t r1 = r0 >= src->n_rows ? r0 :
                                 r0 + ATTN_LANES_ROWS_PER_ITEM < src->n_rows ? r0 + ATTN_LANES_ROWS_PER_ITEM : src->n_rows;
-            if (ctx->listed[c] != r1 - r0) {
+            bool held = ctx->listed[c] != r1 - r0 && ctx->listed[c] != 0 && r1 - r0 - ctx->listed[c] <= 2;
+            for (uint32_t r = r0 > ctx->n_raw ? r0 : ctx->n_raw; held && r < r1; r++) {
+                if (ctx->allowed[r - ctx->n_raw]) continue;
+                const float *v = attn_lanes_score(src, g * 16, r);
+                for (uint32_t l = 0; l < n; l++) held = held && v[l] < cmax[l];
+            }
+            if (ctx->listed[c] != r1 - r0 && !held) {
                 for (uint32_t l = 0; l < n; l++) part[l] = -INFINITY;
                 for (uint32_t r = r0; r < r1; r++) {
                     if (r >= ctx->n_raw && !ctx->allowed[r - ctx->n_raw]) continue;

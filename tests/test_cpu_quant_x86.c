@@ -2220,6 +2220,9 @@ static void check_attn_graph(void) {
         {1, 251, 16, 60, false, 0},   /* ratio 4: 6 of 61 compressed rows */
         {1, 250, 16, 60, false, 57},  /* ratio 4: 57 of 60, whole chunks listed */
         {1, 251, 16, 60, false, 33},  /* ratio 4: 33 of 61 */
+        {1, 251, 16, 60, false, 60},  /* ratio 4: 60 of 61, one unlisted row */
+        {1, 251, 16, 60, false, 59},  /* ratio 4: 59 of 61, two unlisted rows */
+        {1, 251, 16, 60, false, 58},  /* ratio 4: 58 of 61, three: the listed rows' scan */
     };
     const size_t n_cases = sizeof(cases) / sizeof(*cases);
 
