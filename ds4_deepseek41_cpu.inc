@@ -227,6 +227,11 @@ typedef struct ds41_cpu_batch {
     float *rows, *engram_kv, *shared_gate, *shared_up, *shared_mid;
     float *mid, *partial, *weight, *mix, *probs, *ckv, *cscore, *iq, *iw;
     float *prev_window;
+    /* The rows the chunk's queries attend, rounded to F16 once per layer:
+     * the raw window before the chunk, then the chunk's own KV rows, and
+     * room for rounded_rows compressed rows. */
+    float *rounded_raw, *rounded_comp;
+    uint64_t rounded_rows;
     double *xt;
     int *selected;
     uint32_t *ids, *entry, *sel;
@@ -264,6 +269,7 @@ static ds4_context_memory ds41_cpu_memory(uint32_t ctx) {
     const uint64_t blocks = ((uint64_t)ctx + 7u) / 8u;
     memory.scratch_bytes = sizeof(ds41_cpu_state) + sizeof(ds41_cpu_attention_state) +
         (uint64_t)DS41_CPU_BATCH * DS41_CPU_BATCH_TOKEN_BYTES +
+        ((uint64_t)DS41_CPU_BATCH + 128u + ctx + 1u) * 512u * sizeof(float) +
         (uint64_t)DS4_N_VOCAB * (sizeof(uint32_t) + 2u * sizeof(float)) +
         ((uint64_t)ctx + 1u) * sizeof(float) + blocks * (sizeof(float) + sizeof(uint8_t));
     memory.total_bytes = memory.raw_bytes + memory.compressed_bytes + memory.scratch_bytes;
@@ -716,7 +722,7 @@ static void ds41_cpu_batch_free(ds41_cpu_batch *b) {
     free(b->selected); free(b->ids); free(b->entry); free(b->sel);
     free(b->mix); free(b->probs); free(b->xt);
     free(b->ckv); free(b->cscore); free(b->iq); free(b->iw);
-    free(b->prev_window);
+    free(b->prev_window); free(b->rounded_raw); free(b->rounded_comp);
     free(b);
 }
 
@@ -760,13 +766,14 @@ static ds41_cpu_batch *ds41_cpu_batch_create(void) {
     b->iq = malloc(n * 32u * 128u * f);
     b->iw = malloc(n * 32u * f);
     b->prev_window = malloc(128u * 512u * f);
+    b->rounded_raw = malloc((128u + n) * 512u * f);
     if (!b->residual || !b->after_attn || !b->flat || !b->x || !b->norm ||
         !b->block || !b->shared || !b->pre || !b->attn_split || !b->ffn_split ||
         !b->qr || !b->q || !b->kv || !b->heads || !b->low || !b->rows ||
         !b->engram_kv || !b->shared_gate || !b->shared_up || !b->shared_mid ||
         !b->mid || !b->partial || !b->weight || !b->selected || !b->ids || !b->entry ||
         !b->sel || !b->mix || !b->probs || !b->xt || !b->ckv || !b->cscore ||
-        !b->iq || !b->iw || !b->prev_window) {
+        !b->iq || !b->iw || !b->prev_window || !b->rounded_raw) {
         ds41_cpu_batch_free(b);
         return NULL;
     }
@@ -1078,9 +1085,31 @@ static bool ds41_cpu_batch_attention_kv(ds41_cpu_batch_ctx *c, uint32_t n) {
     return !c->failed;
 }
 
+/* Rows r of the chunk's attended rows rounded to F16: the 128 raw window
+ * rows before the chunk, the chunk's n KV rows, then the compressed rows
+ * of the layer's owner.  The rounding is a function of each row, which no
+ * query of the chunk changes, so a token reads the values the copy it
+ * would round for itself holds. */
+static void ds41_cpu_batch_round_worker(void *vctx, uint64_t r0, uint64_t r1) {
+    ds41_cpu_batch_ctx *c = vctx;
+    ds41_cpu_batch *b = c->b;
+    const uint32_t il = c->il, n = c->n;
+    const uint32_t owner = il < 8 ? 0u : il < 14 ? 1u : il < 20 ? 2u : 3u;
+    for (uint64_t r = r0; r < r1; r++) {
+        if (r < 128u + n) {
+            const float *src = r < 128u ? b->prev_window + r * 512u : b->kv + (r - 128u) * 512u;
+            ds41_cpu_f16_round(b->rounded_raw + r * 512u, src, 512);
+        } else {
+            const uint64_t row = r - 128u - n;
+            ds41_cpu_f16_round(b->rounded_comp + row * 512u,
+                               c->s->attention->compressed[owner] + row * 512u, 512);
+        }
+    }
+}
+
 typedef struct {
     const float *rows[128 + 512];
-    float *attended, *qt, *score, *index_scores;
+    float *qt, *score, *index_scores;
     float inv[64];
     ds41_cpu_candidate heap[512];
 } ds41_cpu_batch_attention_scratch;
@@ -1122,15 +1151,12 @@ static void ds41_cpu_batch_attention_token(ds41_cpu_batch_ctx *c,
     const uint32_t n_raw = pos < 127u ? pos + 1u : 128u, n_rows = n_raw + attended;
     for (uint32_t r = 0; r < n_raw; r++) {
         const uint32_t p = pos + 1u - n_raw + r;
-        const float *src = p >= s->pos ? b->kv + (size_t)(p - s->pos) * 512u :
-                                         b->prev_window + (size_t)(p % 128u) * 512u;
-        ds41_cpu_f16_round(sc->attended + (size_t)r * 512u, src, 512);
+        const uint32_t row = p >= s->pos ? 128u + (p - s->pos) : p % 128u;
+        sc->rows[r] = b->rounded_raw + (size_t)row * 512u;
     }
     for (uint32_t r = 0; r < attended; r++)
-        ds41_cpu_f16_round(sc->attended + (size_t)(n_raw + r) * 512u,
-                           as->compressed[owner] + (size_t)sel[r] * 512u, 512);
+        sc->rows[n_raw + r] = b->rounded_comp + (size_t)sel[r] * 512u;
     ds41_cpu_f16_round(q, q, 64u * 512u);
-    for (uint32_t r = 0; r < n_rows; r++) sc->rows[r] = sc->attended + (size_t)r * 512u;
     attn_lanes_transpose_q(sc->qt, q, 64, 512);
     layer_attention_lanes_ctx ctx = {
         .out_heads = heads,
@@ -1160,13 +1186,11 @@ static void ds41_cpu_batch_attention_worker(void *vctx, uint64_t p0, uint64_t p1
     const uint32_t n = c->n;
     const size_t f = sizeof(float);
     ds41_cpu_batch_attention_scratch *sc = malloc(sizeof(*sc));
-    float *attended = malloc((128u + 512u) * 512u * f), *qt = malloc(64u * 512u * f);
-    float *score = malloc(64u * (128u + 512u) * f);
+    float *qt = malloc(64u * 512u * f), *score = malloc(64u * (128u + 512u) * f);
     float *index_scores = malloc(((size_t)c->s->pos + n + 1u) * f);
-    if (!sc || !attended || !qt || !score || !index_scores) {
+    if (!sc || !qt || !score || !index_scores) {
         ds41_cpu_batch_fail(c);
     } else {
-        sc->attended = attended;
         sc->qt = qt;
         sc->score = score;
         sc->index_scores = index_scores;
@@ -1176,7 +1200,7 @@ static void ds41_cpu_batch_attention_worker(void *vctx, uint64_t p0, uint64_t p1
                 ds41_cpu_batch_attention_token(c, sc, n - 1u - (uint32_t)p);
         }
     }
-    free(index_scores); free(score); free(qt); free(attended); free(sc);
+    free(index_scores); free(score); free(qt); free(sc);
 }
 
 static bool ds41_cpu_prefill_layer(ds41_cpu_state *s, uint32_t il, uint32_t n,
@@ -1232,6 +1256,16 @@ static bool ds41_cpu_prefill_layer(ds41_cpu_state *s, uint32_t il, uint32_t n,
      * the state keeps the last token's selection, as after the token loop. */
     if (!ds41_cpu_batch_attention_kv(&c, n)) return false;
     c.n = n;
+    /* The rows the queries read, rounded once for the chunk rather than
+     * copied and rounded by every token. */
+    const uint64_t comp_rows = ratio ? ((uint64_t)s->pos + n) / ratio : 0;
+    if (comp_rows > b->rounded_rows) {
+        float *grown = realloc(b->rounded_comp, comp_rows * 512u * sizeof(float));
+        if (!grown) return false;
+        b->rounded_comp = grown;
+        b->rounded_rows = comp_rows;
+    }
+    ds4_parallel_for_min_rows(128u + n + comp_rows, ds41_cpu_batch_round_worker, &c, 16);
     ds4_parallel_for_min_rows((n + 1u) / 2u, ds41_cpu_batch_attention_worker, &c, 1);
     if (c.failed) return false;
     if (ratio && (s->pos + n) / ratio)
