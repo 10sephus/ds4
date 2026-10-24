@@ -1546,7 +1546,7 @@ static void *xmalloc_zeroed(size_t n, size_t size) {
  * Only the main thread uses the slots (prefill runs one batch at a time), and
  * no two live buffers share a slot.  Contents are not preserved on growth. */
 enum {
-    PF_ATTN_CUR, PF_ATTN_NORM, PF_ATTN_RESIDUAL, PF_QR, PF_QR_NORM, PF_Q,
+    PF_ATTN_CUR, PF_ATTN_NORM, PF_QR, PF_QR_NORM, PF_Q,
     PF_KV_RAW, PF_KV, PF_HEADS, PF_ATTN_OUT,
     PF_FFN_CUR, PF_FFN_NORM, PF_MOE, PF_SHARED,
     PF_SH_GATE, PF_SH_UP, PF_SH_MID,
@@ -18412,12 +18412,10 @@ static void layer_attention_raw_swa_batch(
     double t_tl_inv_rope = 0.0;
     double t_out = 0.0;
     const uint32_t n_hc = DS4_N_HC;
-    const uint64_t hc_dim = (uint64_t)n_hc * DS4_N_EMBD;
     const uint64_t q_dim = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM;
 
     float *attn_cur = pf_buf(PF_ATTN_CUR, (size_t)n_tok * DS4_N_EMBD * sizeof(attn_cur[0]));
     float *attn_norm = pf_buf(PF_ATTN_NORM, (size_t)n_tok * DS4_N_EMBD * sizeof(attn_norm[0]));
-    float *attn_residual = pf_buf(PF_ATTN_RESIDUAL, (size_t)n_tok * hc_dim * sizeof(attn_residual[0]));
     const uint32_t q_rank = DS4_N_LORA_Q;
     float *qr = pf_buf(PF_QR, (size_t)n_tok * q_rank * sizeof(qr[0]));
     float *qr_norm = pf_buf(PF_QR_NORM, (size_t)n_tok * q_rank * sizeof(qr_norm[0]));
@@ -18445,7 +18443,7 @@ static void layer_attention_raw_swa_batch(
                       layer->hc_attn_base,
                       layer->attn_norm,
                       inp_hc,
-                      attn_residual,
+                      NULL,
                       attn_cur,
                       attn_norm,
                       post,
@@ -18617,9 +18615,11 @@ static void layer_attention_raw_swa_batch(
     layer_grouped_out_batch(attn_out, model, layer, heads, n_tok);
     cpu_directional_steering_project_rows(attn_out, steering_dirs, il, n_tok, steering_scale);
 
+    /* The HC state the layer read is the residual: inp_hc is not written
+     * before this point. */
     hc_post_batch(after_attn_hc,
                   attn_out,
-                  attn_residual,
+                  inp_hc,
                   post,
                   comb,
                   n_tok,
