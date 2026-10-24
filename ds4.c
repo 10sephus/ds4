@@ -15010,6 +15010,12 @@ static void layer_hash_selected_experts(
 
 /* Router scores use sqrt(softplus(logit)); normalization happens only after
  * the six selected experts are known. */
+static void router_probs_from_logits(float probs[DS4_MAX_EXPERT], const float *logits) {
+    for (uint32_t i = 0; i < DS4_N_EXPERT; i++) {
+        probs[i] = sqrtf(softplus_stable(logits[i]));
+    }
+}
+
 static void layer_router_probs_one(
         float             probs[DS4_MAX_EXPERT],
         const ds4_model   * model,
@@ -15018,9 +15024,7 @@ static void layer_router_probs_one(
     float logits[DS4_MAX_EXPERT];
 
     matvec_any(logits, model, layer->ffn_gate_inp, x);
-    for (uint32_t i = 0; i < DS4_N_EXPERT; i++) {
-        probs[i] = sqrtf(softplus_stable(logits[i]));
-    }
+    router_probs_from_logits(probs, logits);
 }
 
 static void layer_hash_router_weights_from_probs(
@@ -15394,9 +15398,12 @@ typedef struct {
     const ds4_layer_weights *layer;
     const float *norm;
     const int *token_ids;
+    const float *logits;    /* router logits of the first n_logits tokens */
+    uint32_t n_logits;
 } moe_route_ctx;
 
-/* Per-token routing; the router matvec runs serially inside the worker. */
+/* Per-token routing from the batched logits; tokens past the last tile run
+ * the router matvec serially inside the worker. */
 static void moe_route_worker(void *vctx, uint64_t t0, uint64_t t1) {
     moe_route_ctx *ctx = vctx;
 
@@ -15404,17 +15411,68 @@ static void moe_route_worker(void *vctx, uint64_t t0, uint64_t t1) {
         int sel[DS4_MAX_EXPERT_USED];
         float weights[DS4_MAX_EXPERT_USED];
         const float *x = ctx->norm + t * DS4_N_EMBD;
+        float probs[DS4_MAX_EXPERT] = {0};
+        if (t < ctx->n_logits) {
+            router_probs_from_logits(probs, ctx->logits + t * DS4_N_EXPERT);
+        } else {
+            layer_router_probs_one(probs, ctx->model, ctx->layer, x);
+        }
         if (ctx->layer->ffn_gate_tid2eid) {
             layer_hash_selected_experts(sel, ctx->model, ctx->layer, ctx->token_ids[t]);
-            layer_hash_router_weights_one(weights, ctx->model, ctx->layer, x, sel);
+            layer_hash_router_weights_from_probs(weights, probs, sel);
         } else {
-            layer_topk_selected_experts(sel, weights, ctx->model, ctx->layer, x);
+            layer_topk_selected_experts_from_probs(sel, weights, ctx->model, ctx->layer, probs);
         }
         for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++) {
             ctx->selected[t * DS4_N_EXPERT_USED + slot] = sel[slot];
             ctx->pair_weight[t * DS4_N_EXPERT_USED + slot] = weights[slot];
         }
     }
+}
+
+#if defined(DS4_NO_GPU) && defined(__AVX512F__) && defined(__F16C__)
+static uint32_t compressor_project_tiles(float *out, const uint16_t *w, const float *x,
+                                         float *xt, uint64_t in_dim, uint32_t width,
+                                         uint32_t n_tok, bool pack);
+#endif
+
+/* Route n_tok tokens: the six experts and router weights of every token,
+ * as layer_routed_moe_one() picks them.  The F16 router logits of whole
+ * sixteen-token tiles come from one token-lane projection (the compressor's
+ * kernel, bitwise dot_f16_row per logit) instead of a latency-bound
+ * row-group matvec per token; the compressor's scratch slots are free while
+ * the FFN runs. */
+static void moe_route_batch(
+        int               * selected,
+        float             * pair_weight,
+        const ds4_model   * model,
+        const ds4_layer_weights * layer,
+        const float       * norm,
+        const int         * token_ids,
+        uint32_t            n_tok) {
+    moe_route_ctx route_ctx = {
+        .selected = selected,
+        .pair_weight = pair_weight,
+        .model = model,
+        .layer = layer,
+        .norm = norm,
+        .token_ids = token_ids,
+    };
+    float *logits = NULL;
+#if defined(DS4_NO_GPU) && defined(__AVX512F__) && defined(__F16C__)
+    const ds4_tensor *gate_inp = layer->ffn_gate_inp;
+    const uint64_t in_dim = DS4_N_EMBD;
+    if (gate_inp->type == 1 && gate_inp->ndim == 2 && gate_inp->dim[0] == in_dim &&
+        gate_inp->dim[1] == DS4_N_EXPERT && n_tok >= 16) {
+        logits = xmalloc((size_t)(n_tok / 16) * 16 * DS4_N_EXPERT * sizeof(logits[0]));
+        float *xt = pf_buf(PF_COMP_XT, (size_t)(n_tok / 16) * 16 * in_dim * sizeof(float));
+        route_ctx.logits = logits;
+        route_ctx.n_logits = compressor_project_tiles(logits, tensor_data(model, gate_inp), norm, xt,
+                                                      in_dim, DS4_N_EXPERT, n_tok, true);
+    }
+#endif
+    ds4_parallel_for_min_rows(n_tok, moe_route_worker, &route_ctx, 1);
+    free(logits);
 }
 
 /* Prefill routed MoE for IQ2_XXS gate/up and Q2_K down experts (the caller
@@ -15441,15 +15499,7 @@ static void layer_routed_moe_batch(
     const uint32_t total_pairs = n_tok * DS4_N_EXPERT_USED;
     int *selected = xmalloc((size_t)total_pairs * sizeof(selected[0]));
     float *pair_weight = xmalloc((size_t)total_pairs * sizeof(pair_weight[0]));
-    moe_route_ctx route_ctx = {
-        .selected = selected,
-        .pair_weight = pair_weight,
-        .model = model,
-        .layer = layer,
-        .norm = norm,
-        .token_ids = token_ids,
-    };
-    ds4_parallel_for_min_rows(n_tok, moe_route_worker, &route_ctx, 1);
+    moe_route_batch(selected, pair_weight, model, layer, norm, token_ids, n_tok);
 
     for (uint32_t tok0 = 0; tok0 < n_tok; tok0 += DS4_MOE_CHUNK_TOKENS) {
         const uint32_t n = n_tok - tok0 < DS4_MOE_CHUNK_TOKENS ? n_tok - tok0 : DS4_MOE_CHUNK_TOKENS;

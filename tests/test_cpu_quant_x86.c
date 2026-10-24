@@ -1431,6 +1431,65 @@ static void check_hc_pre_batch(void) {
     g_ds4_shape = saved;
 }
 
+/* Batched prefill routing (token-lane router logits for whole tiles, the
+ * per-token matvec for the rest) against per-token routing: experts and
+ * router weights bitwise, for top-k and hash layers, with and without tiles,
+ * at 1/3/16 threads. */
+static void check_route_batch(void) {
+    const ds4_shape saved = g_ds4_shape;
+    g_ds4_shape = DS4_SHAPE_FLASH;
+    const uint64_t in_dim = DS4_N_EMBD, n_exp = DS4_N_EXPERT, n_used = DS4_N_EXPERT_USED, vocab = 997;
+    const size_t off_bias = in_dim * n_exp * 2, off_hash = off_bias + n_exp * 4, total = off_hash + vocab * n_used * 4;
+    uint8_t *map = malloc(total);
+    CHECK(map);
+    uint16_t *w = (uint16_t *)map;
+    float *bias = (float *)(map + off_bias);
+    int32_t *hash = (int32_t *)(map + off_hash);
+    for (uint64_t i = 0; i < in_dim * n_exp; i++) w[i] = f32_to_f16(glue_random(0.03f));
+    for (uint64_t i = 0; i < n_exp; i++) bias[i] = glue_random(0.1f);
+    for (uint64_t i = 0; i < vocab * n_used; i++) hash[i] = (int32_t)(quant_random() % n_exp);
+    ds4_model m = {0};
+    m.map = map;
+    m.size = total;
+    ds4_tensor tw = {.type = DS4_TENSOR_F16, .ndim = 2, .dim = {in_dim, n_exp}, .abs_offset = 0,
+                     .elements = in_dim * n_exp, .bytes = in_dim * n_exp * 2};
+    ds4_tensor tb = {.type = DS4_TENSOR_F32, .ndim = 1, .dim = {n_exp}, .abs_offset = off_bias,
+                     .elements = n_exp, .bytes = n_exp * 4};
+    ds4_tensor th = {.type = 26, .ndim = 2, .dim = {n_used, vocab}, .abs_offset = off_hash,
+                     .elements = vocab * n_used, .bytes = vocab * n_used * 4};
+    const uint32_t n_max = 64;
+    float *norm = malloc((size_t)n_max * in_dim * sizeof(float));
+    int *tokens = malloc(n_max * sizeof(int));
+    int *sel[2] = {malloc(n_max * n_used * sizeof(int)), malloc(n_max * n_used * sizeof(int))};
+    float *pw[2] = {malloc(n_max * n_used * sizeof(float)), malloc(n_max * n_used * sizeof(float))};
+    CHECK(norm && tokens && sel[0] && sel[1] && pw[0] && pw[1]);
+    const uint32_t counts[] = {5, 16, 37, 64};
+    const uint32_t threads[] = {1, 3, 16};
+    for (unsigned c = 0; c < 8; c++) {
+        const uint32_t n_tok = counts[c % 4];
+        ds4_layer_weights layer;
+        memset(&layer, 0, sizeof(layer));
+        layer.ffn_gate_inp = &tw;
+        layer.ffn_exp_probs_b = &tb;
+        if (c >= 4) layer.ffn_gate_tid2eid = &th;
+        for (uint64_t i = 0; i < (uint64_t)n_tok * in_dim; i++) norm[i] = glue_random(c & 1 ? 3.0f : 0.5f);
+        for (uint32_t t = 0; t < n_tok; t++) tokens[t] = (int)(quant_random() % vocab);
+        moe_route_ctx ref = { .selected = sel[0], .pair_weight = pw[0], .model = &m, .layer = &layer,
+                              .norm = norm, .token_ids = tokens };
+        moe_route_worker(&ref, 0, n_tok);
+        g_requested_threads = threads[c % 3];
+        memset(sel[1], 0xff, n_max * n_used * sizeof(int));
+        memset(pw[1], 0xff, n_max * n_used * sizeof(float));
+        moe_route_batch(sel[1], pw[1], &m, &layer, norm, tokens, n_tok);
+        glue_equal("routed experts", sel[0], sel[1], n_tok * n_used * sizeof(int), c);
+        glue_equal("router weights", pw[0], pw[1], n_tok * n_used * sizeof(float), c);
+        ds4_threads_shutdown();
+    }
+    g_requested_threads = 0;
+    free(pw[1]); free(pw[0]); free(sel[1]); free(sel[0]); free(tokens); free(norm); free(map);
+    g_ds4_shape = saved;
+}
+
 static void check_decode_glue(void) {
     enum { HEADS = 64, DIM = 512, ROT = 64, EMBD = 4096, HC = 4 };
     float *x = malloc((size_t)HEADS * DIM * sizeof(float));
@@ -2914,6 +2973,8 @@ int main(void) {
     puts("CPU decode glue (RoPE, HC, head RMS, E4M3) bitwise oracles PASS");
     check_hc_pre_batch();
     puts("CPU batched HC pre (sixteen-token lanes) bitwise with the per-token path PASS");
+    check_route_batch();
+    puts("CPU batched prefill routing (token-lane router logits) bitwise with per-token routing PASS");
     /* nb_in > nb_mid with a partial last row block, then nb_in < nb_mid,
      * then a full down row block followed by a partial one. */
     check_grouped_ffn(2 * QK_K, QK_K, 2 * DS4_MOE_ROW_BLOCK + 6);
