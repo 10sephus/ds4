@@ -813,6 +813,26 @@ static void check_expf_fmaxf(void) {
     }
 }
 
+/* The index scores of a query, four keys and a head per lane at a time,
+ * against ds41_cpu_index_score_worker. */
+static void check_index_scores(void) {
+    const uint32_t counts[] = {1, 3, 4, 5, 37, 600};
+    float *q = malloc(32u * 128u * sizeof(float)), *keys = malloc(600u * 128u * sizeof(float));
+    float *a = malloc(600u * sizeof(float)), *b = malloc(600u * sizeof(float));
+    float *qt = malloc(32u * 128u * sizeof(float)), w[32];
+    CHECK(q && keys && a && b && qt);
+    for (uint32_t i = 0; i < 32u * 128u; i++) q[i] = test_random() % 7 ? test_float() : 0.0f;
+    for (uint32_t i = 0; i < 600u * 128u; i++) keys[i] = test_random() % 5 ? test_float() * 2.0f : -0.0f;
+    for (uint32_t h = 0; h < 32; h++) w[h] = test_float();
+    for (size_t ci = 0; ci < sizeof(counts) / sizeof(*counts); ci++) {
+        ds41_cpu_index_score_context ca = {q, keys, w, a}, cb = {q, keys, w, b};
+        ds41_cpu_index_scores(&ca, counts[ci], qt);
+        ds41_cpu_index_score_worker(&cb, 0, counts[ci]);
+        test_equal("index scores", a, b, counts[ci]);
+    }
+    free(qt); free(b); free(a); free(keys); free(q);
+}
+
 /* The sink softmax weights of 64 heads in head groups against the scalar
  * loop one head at a time, with -inf, huge and tiny scores. */
 static void check_attention_weights(void) {
@@ -853,6 +873,7 @@ int main(void) {
     check_q2k_pair();
     check_q4_tails();
     check_expf_fmaxf();
+    check_index_scores();
     check_attention_weights();
 #endif
     /* Both pool layouts: NUMA halves per group (on a two-node host) and one cursor. */

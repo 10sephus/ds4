@@ -188,6 +188,50 @@ static void ds41_cpu_index_score_worker(void *vctx, uint64_t first, uint64_t end
     }
 }
 
+/* The scores of keys [0, n) of one index query, as
+ * ds41_cpu_index_score_worker computes them: per head and key dot_f32's
+ * chain in input order, then fmaxf(dot / 64, 0) * weight added over the
+ * heads in head order.  With AVX-512 a lane is a head (qt is 16 KiB of
+ * scratch for the transposed query) and four keys run at once, eight
+ * independent chains instead of one; a zero's sign from fmaxf cannot reach
+ * a score that starts at +0. */
+static void ds41_cpu_index_scores(ds41_cpu_index_score_context *c, uint32_t n, float *qt) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    for (uint32_t h = 0; h < 32; h++)
+        for (uint32_t i = 0; i < 128; i++) qt[i * 32u + h] = c->q[h * 128u + i];
+    const __m512 scale = _mm512_set1_ps(1.0f / 64.0f), zero = _mm512_setzero_ps();
+    const __m512 w0 = _mm512_loadu_ps(c->weights), w1 = _mm512_loadu_ps(c->weights + 16);
+    for (uint32_t r0 = 0; r0 < n; r0 += 4) {
+        const uint32_t m = n - r0 < 4 ? n - r0 : 4;
+        const float *key[4];
+        __m512 a[4], b[4];
+        for (uint32_t j = 0; j < 4; j++) {
+            key[j] = c->keys + (uint64_t)(r0 + (j < m ? j : m - 1)) * 128u;
+            a[j] = b[j] = zero;
+        }
+        for (uint32_t i = 0; i < 128; i++) {
+            const __m512 qa = _mm512_loadu_ps(qt + i * 32u), qb = _mm512_loadu_ps(qt + i * 32u + 16);
+            for (uint32_t j = 0; j < 4; j++) {
+                const __m512 kv = _mm512_set1_ps(key[j][i]);
+                a[j] = _mm512_add_ps(a[j], _mm512_mul_ps(qa, kv));
+                b[j] = _mm512_add_ps(b[j], _mm512_mul_ps(qb, kv));
+            }
+        }
+        for (uint32_t j = 0; j < m; j++) {
+            float t[32] __attribute__((aligned(64)));
+            _mm512_store_ps(t, _mm512_mul_ps(_mm512_max_ps(_mm512_mul_ps(a[j], scale), zero), w0));
+            _mm512_store_ps(t + 16, _mm512_mul_ps(_mm512_max_ps(_mm512_mul_ps(b[j], scale), zero), w1));
+            float score = 0;
+            for (uint32_t h = 0; h < 32; h++) score += t[h];
+            c->scores[r0 + j] = score;
+        }
+    }
+#else
+    (void)qt;
+    ds41_cpu_index_score_worker(c, 0, n);
+#endif
+}
+
 /* Layer 20 fixes a block mask for all later decoder index sources at this
  * token. Pinning the newest block prevents eviction of the current latent. */
 static void ds41_cpu_attention_candidates(ds41_cpu_attention_state *s,

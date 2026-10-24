@@ -1101,7 +1101,7 @@ static void ds41_cpu_batch_attention_token(ds41_cpu_batch_ctx *c,
         ds41_cpu_index_score_context score = {
             iq, as->index_cache[owner], b->iw + (size_t)i * 32u, sc->index_scores
         };
-        ds41_cpu_index_score_worker(&score, 0, n_comp);
+        ds41_cpu_index_scores(&score, n_comp, sc->qt);
         /* Within 2048 blocks ds41_cpu_attention_candidates only clears the
          * block mask on layer 20, so the later sources mask nothing. */
         ds41_cpu_attention_topk(sel, sc->index_scores, n_comp,
