@@ -217,10 +217,24 @@ static void ds41_cpu_hc_post_norm(void *vctx) {
 /* Per-token activations of a layer-major prefill chunk (see ds41_cpu_prefill),
  * allocated with the first chunk: about 1 MB per token. */
 #define DS41_CPU_BATCH 512u
+/* The positions a layer-major chunk can end at: past 2048 blocks of 8 on
+ * layer 20 the prompt keeps the token loop, so no chunk attends or scores
+ * more compressed rows than this. */
+#define DS41_CPU_BATCH_COMP 16384u
 #define DS41_CPU_BATCH_TOKEN_BYTES (4u * (3u * 4u * 5120u + 4u * 5120u + 52u + 1280u + \
     2u * 64u * 512u + 512u + 8192u + 2u * 24u * 256u + 5u * 5120u + 3u * 2304u + \
     6u * (2304u + 5120u + 1u) + 6u + 48u + 6u + 512u + 24u + 384u + 2u * 4u * 5120u + \
     2u * 512u + 32u * 128u + 32u))
+/* The query side's scratch of one pool thread (see
+ * ds41_cpu_batch_attention_worker): the attended row list, the transposed
+ * query, the head scores, the index scores and the top-k heap. */
+typedef struct {
+    const float *rows[128 + 512];
+    float *qt, *score, *index_scores;
+    float inv[64];
+    ds41_cpu_candidate heap[512];
+} ds41_cpu_batch_attention_scratch;
+
 typedef struct ds41_cpu_batch {
     float *residual, *after_attn, *flat, *x, *norm, *block, *shared;
     float *pre, *attn_split, *ffn_split, *qr, *q, *kv, *heads, *low;
@@ -232,10 +246,31 @@ typedef struct ds41_cpu_batch {
      * room for rounded_rows compressed rows. */
     float *rounded_raw, *rounded_comp;
     uint64_t rounded_rows;
+    /* One ds41_cpu_batch_attention_scratch and its buffers per pool
+     * thread (DS4_MAX_THREADS slots, whatever the pool's size, so that
+     * g_pool_thread always has one), attn_stride bytes apart, allocated
+     * with the batch; a slot's pages are touched only by its thread. */
+    uint8_t *attn;
+    size_t attn_stride;
     double *xt;
     int *selected;
     uint32_t *ids, *entry, *sel;
 } ds41_cpu_batch;
+
+/* The query side's scratch of one pool thread: the scratch struct, the
+ * transposed query (64 heads x 512), the scores (64 heads x 640 rows) and
+ * the index scores of up to min(ctx, DS41_CPU_BATCH_COMP) + 1 keys, each
+ * on whole cache lines. */
+static size_t ds41_cpu_batch_attention_stride(uint32_t ctx) {
+    const uint64_t keys = (ctx < DS41_CPU_BATCH_COMP ? ctx : DS41_CPU_BATCH_COMP) + 1u;
+    const size_t lines[4] = {
+        sizeof(ds41_cpu_batch_attention_scratch), 64u * 512u * sizeof(float),
+        64u * (128u + 512u) * sizeof(float), (size_t)keys * sizeof(float)
+    };
+    size_t stride = 0;
+    for (uint32_t i = 0; i < 4; i++) stride += (lines[i] + 63u) & ~(size_t)63u;
+    return stride;
+}
 
 typedef struct ds41_cpu_state {
     const ds4_model *model;
@@ -271,7 +306,8 @@ static ds4_context_memory ds41_cpu_memory(uint32_t ctx) {
         (uint64_t)DS41_CPU_BATCH * DS41_CPU_BATCH_TOKEN_BYTES +
         ((uint64_t)DS41_CPU_BATCH + 128u + ctx + 1u) * 512u * sizeof(float) +
         (uint64_t)DS4_N_VOCAB * (sizeof(uint32_t) + 2u * sizeof(float)) +
-        ((uint64_t)ctx + 1u) * sizeof(float) + blocks * (sizeof(float) + sizeof(uint8_t));
+        ((uint64_t)ctx + 1u) * sizeof(float) + blocks * (sizeof(float) + sizeof(uint8_t)) +
+        (uint64_t)DS4_MAX_THREADS * ds41_cpu_batch_attention_stride(ctx);
     memory.total_bytes = memory.raw_bytes + memory.compressed_bytes + memory.scratch_bytes;
     return memory;
 }
@@ -756,10 +792,23 @@ static void ds41_cpu_batch_free(ds41_cpu_batch *b) {
     free(b->mix); free(b->probs); free(b->xt);
     free(b->ckv); free(b->cscore); free(b->iq); free(b->iw);
     free(b->prev_window); free(b->rounded_raw); free(b->rounded_comp);
+    free(b->attn);
     free(b);
 }
 
-static ds41_cpu_batch *ds41_cpu_batch_create(void) {
+static ds41_cpu_batch_attention_scratch *ds41_cpu_batch_attention_thread(ds41_cpu_batch *b) {
+    uint8_t *p = b->attn + (size_t)g_pool_thread * b->attn_stride;
+    ds41_cpu_batch_attention_scratch *sc = (ds41_cpu_batch_attention_scratch *)p;
+    p += (sizeof(*sc) + 63u) & ~(size_t)63u;
+    sc->qt = (float *)p;
+    p += 64u * 512u * sizeof(float);
+    sc->score = (float *)p;
+    p += 64u * (128u + 512u) * sizeof(float);
+    sc->index_scores = (float *)p;
+    return sc;
+}
+
+static ds41_cpu_batch *ds41_cpu_batch_create(uint32_t ctx) {
     ds41_cpu_batch *b = calloc(1, sizeof(*b));
     if (!b) return NULL;
     const size_t n = DS41_CPU_BATCH, f = sizeof(float);
@@ -800,13 +849,17 @@ static ds41_cpu_batch *ds41_cpu_batch_create(void) {
     b->iw = malloc(n * 32u * f);
     b->prev_window = malloc(128u * 512u * f);
     b->rounded_raw = malloc((128u + n) * 512u * f);
+    b->attn_stride = ds41_cpu_batch_attention_stride(ctx);
+    void *attn = NULL;
+    if (posix_memalign(&attn, 64, (size_t)DS4_MAX_THREADS * b->attn_stride) == 0)
+        b->attn = attn;
     if (!b->residual || !b->after_attn || !b->flat || !b->x || !b->norm ||
         !b->block || !b->shared || !b->pre || !b->attn_split || !b->ffn_split ||
         !b->qr || !b->q || !b->kv || !b->heads || !b->low || !b->rows ||
         !b->engram_kv || !b->shared_gate || !b->shared_up || !b->shared_mid ||
         !b->mid || !b->partial || !b->weight || !b->selected || !b->ids || !b->entry ||
         !b->sel || !b->mix || !b->probs || !b->xt || !b->ckv || !b->cscore ||
-        !b->iq || !b->iw || !b->prev_window || !b->rounded_raw) {
+        !b->iq || !b->iw || !b->prev_window || !b->rounded_raw || !b->attn) {
         ds41_cpu_batch_free(b);
         return NULL;
     }
@@ -1140,13 +1193,6 @@ static void ds41_cpu_batch_round_worker(void *vctx, uint64_t r0, uint64_t r1) {
     }
 }
 
-typedef struct {
-    const float *rows[128 + 512];
-    float *qt, *score, *index_scores;
-    float inv[64];
-    ds41_cpu_candidate heap[512];
-} ds41_cpu_batch_attention_scratch;
-
 /* The query side of one token's attention after the KV pass: index scores
  * and selection on an index source, staging and the sink softmax heads.
  * The token reads only cache rows up to its own position, which the KV
@@ -1213,27 +1259,17 @@ static void ds41_cpu_batch_attention_token(ds41_cpu_batch_ctx *c,
 }
 
 /* Item p of (n + 1) / 2 pairs the short early token p with the long late
- * token n - 1 - p, as V4's prefill does, to balance the claims. */
+ * token n - 1 - p, as V4's prefill does, to balance the claims.  Every
+ * value a token reads from its thread's scratch it has written first. */
 static void ds41_cpu_batch_attention_worker(void *vctx, uint64_t p0, uint64_t p1) {
     ds41_cpu_batch_ctx *c = vctx;
     const uint32_t n = c->n;
-    const size_t f = sizeof(float);
-    ds41_cpu_batch_attention_scratch *sc = malloc(sizeof(*sc));
-    float *qt = malloc(64u * 512u * f), *score = malloc(64u * (128u + 512u) * f);
-    float *index_scores = malloc(((size_t)c->s->pos + n + 1u) * f);
-    if (!sc || !qt || !score || !index_scores) {
-        ds41_cpu_batch_fail(c);
-    } else {
-        sc->qt = qt;
-        sc->score = score;
-        sc->index_scores = index_scores;
-        for (uint64_t p = p0; p < p1; p++) {
-            ds41_cpu_batch_attention_token(c, sc, (uint32_t)p);
-            if (n - 1u - (uint32_t)p != (uint32_t)p)
-                ds41_cpu_batch_attention_token(c, sc, n - 1u - (uint32_t)p);
-        }
+    ds41_cpu_batch_attention_scratch *sc = ds41_cpu_batch_attention_thread(c->b);
+    for (uint64_t p = p0; p < p1; p++) {
+        ds41_cpu_batch_attention_token(c, sc, (uint32_t)p);
+        if (n - 1u - (uint32_t)p != (uint32_t)p)
+            ds41_cpu_batch_attention_token(c, sc, n - 1u - (uint32_t)p);
     }
-    free(index_scores); free(score); free(qt); free(sc);
 }
 
 static bool ds41_cpu_prefill_layer(ds41_cpu_state *s, uint32_t il, uint32_t n,
@@ -1360,7 +1396,8 @@ static bool ds41_cpu_prefill(ds41_cpu_state *s, const int *tokens, uint32_t n,
      * its own token only; such chunks keep the token loop. */
     const uint32_t ratio20 = ds4_layer_compress_ratio(20);
     const uint64_t last_comp = ratio20 ? ((uint64_t)s->pos + n) / ratio20 : 0;
-    if (n <= 1 || (last_comp + 7u) / 8u > 2048u) {
+    if (n <= 1 || (last_comp + 7u) / 8u > 2048u ||
+        (uint64_t)s->pos + n > DS41_CPU_BATCH_COMP) {
         for (uint32_t i = 0; i < n; i++)
             if (!ds41_cpu_forward(s, tokens[i], i + 1u == n ? logits : NULL, error, cap))
                 return false;
@@ -1369,7 +1406,7 @@ static bool ds41_cpu_prefill(ds41_cpu_state *s, const int *tokens, uint32_t n,
     for (uint32_t i = 0; i < n; i++)
         if (tokens[i] < 0 || (uint32_t)tokens[i] >= DS4_N_VOCAB)
             return ds41_cpu_error(error, cap, "V4.1 CPU token is outside vocabulary");
-    if (!s->batch && !(s->batch = ds41_cpu_batch_create()))
+    if (!s->batch && !(s->batch = ds41_cpu_batch_create(s->ctx)))
         return ds41_cpu_error(error, cap, "cannot allocate V4.1 CPU prefill batch");
     ds41_cpu_batch *b = s->batch;
     const bool profile = getenv("DS4_CPU_PROFILE") != NULL;
