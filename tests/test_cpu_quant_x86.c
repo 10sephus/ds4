@@ -1364,6 +1364,73 @@ static void glue_equal(const char *name, const void *expected, const void *actua
     }
 }
 
+/* The batched HC pre (sixteen-token lane groups plus per-token tails) against
+ * the per-token worker, which composes the decode functions, for full and
+ * partial groups, 1/3/16 threads, and rows of zeros, tiny, huge and signed
+ * zero values. */
+static void check_hc_pre_batch(void) {
+    const ds4_shape saved = g_ds4_shape;
+    g_ds4_shape = DS4_SHAPE_FLASH;
+    const uint64_t embd = DS4_N_EMBD, hc_dim = 4 * embd, n_max = 49;
+    const size_t off_sc = hc_dim * 24 * 2, off_base = off_sc + 64, off_nw = off_base + 24 * 4, total = off_nw + embd * 4;
+    uint8_t *map = malloc(total);
+    float *inp = malloc(n_max * hc_dim * sizeof(float));
+    float *out[2][5];
+    CHECK(map && inp);
+    for (int k = 0; k < 2; k++) {
+        out[k][0] = malloc(n_max * hc_dim * sizeof(float));
+        out[k][1] = malloc(n_max * embd * sizeof(float));
+        out[k][2] = malloc(n_max * embd * sizeof(float));
+        out[k][3] = malloc(n_max * 4 * sizeof(float));
+        out[k][4] = malloc(n_max * 16 * sizeof(float));
+        for (int j = 0; j < 5; j++) CHECK(out[k][j]);
+    }
+    uint16_t *fn = (uint16_t *)map;
+    float *sc = (float *)(map + off_sc), *base = (float *)(map + off_base), *nw = (float *)(map + off_nw);
+    for (uint64_t i = 0; i < hc_dim * 24; i++) fn[i] = f32_to_f16(glue_random(0.05f));
+    sc[0] = 0.7f; sc[1] = 1.3f; sc[2] = 0.9f;
+    for (int i = 0; i < 24; i++) base[i] = glue_random(1.0f);
+    for (uint64_t i = 0; i < embd; i++) nw[i] = 1.0f + glue_random(0.5f);
+    ds4_model m = {0};
+    m.map = map;
+    m.size = total;
+    ds4_tensor t[4];
+    memset(t, 0, sizeof(t));
+    t[0].ndim = 2; t[0].dim[0] = hc_dim; t[0].dim[1] = 24; t[0].type = 1; t[0].bytes = off_sc;
+    t[1].ndim = 1; t[1].dim[0] = 3; t[1].bytes = 12; t[1].abs_offset = off_sc;
+    t[2].ndim = 1; t[2].dim[0] = 24; t[2].bytes = 96; t[2].abs_offset = off_base;
+    t[3].ndim = 1; t[3].dim[0] = embd; t[3].bytes = embd * 4; t[3].abs_offset = off_nw;
+    const uint32_t counts[] = {1, 15, 16, 17, 33, 49};
+    const uint32_t threads[] = {1, 3, 16};
+    for (unsigned c = 0; c < 12; c++) {
+        const uint32_t n_tok = counts[c % 6];
+        const float mag = c < 6 ? 2.0f : c < 9 ? 1e-30f : 1e30f;
+        for (uint64_t i = 0; i < n_tok * hc_dim; i++) inp[i] = glue_random(mag);
+        if (n_tok > 3) {
+            memset(inp + 2 * hc_dim, 0, hc_dim * sizeof(float));
+            inp[3 * hc_dim + 7] = -0.0f;
+        }
+        hc_pre_norm_batch_ctx ref = { .model = &m, .fn = &t[0], .scale = &t[1], .base = &t[2], .norm_w = &t[3],
+                                      .inp_hc = inp, .residual_hc = out[0][0], .cur = out[0][1], .norm = out[0][2],
+                                      .post = out[0][3], .comb = out[0][4], .hc_dim = hc_dim, .n_hc = 4 };
+        for (uint32_t tok = 0; tok < n_tok; tok++) hc_pre_norm_batch_worker(&ref, tok, tok + 1);
+        g_requested_threads = threads[c % 3];
+        for (int j = 0; j < 5; j++) memset(out[1][j], 0xff, n_max * (j == 0 ? hc_dim : j < 3 ? embd : j == 3 ? 4 : 16) * sizeof(float));
+        hc_pre_norm_batch(&m, &t[0], &t[1], &t[2], &t[3], inp, out[1][0], out[1][1], out[1][2], out[1][3], out[1][4], n_tok);
+        glue_equal("HC pre batch residual", out[0][0], out[1][0], n_tok * hc_dim * sizeof(float), c);
+        glue_equal("HC pre batch cur", out[0][1], out[1][1], n_tok * embd * sizeof(float), c);
+        glue_equal("HC pre batch norm", out[0][2], out[1][2], n_tok * embd * sizeof(float), c);
+        glue_equal("HC pre batch post", out[0][3], out[1][3], n_tok * 4 * sizeof(float), c);
+        glue_equal("HC pre batch comb", out[0][4], out[1][4], n_tok * 16 * sizeof(float), c);
+        ds4_threads_shutdown();
+    }
+    g_requested_threads = 0;
+    for (int k = 0; k < 2; k++) for (int j = 0; j < 5; j++) free(out[k][j]);
+    free(inp);
+    free(map);
+    g_ds4_shape = saved;
+}
+
 static void check_decode_glue(void) {
     enum { HEADS = 64, DIM = 512, ROT = 64, EMBD = 4096, HC = 4 };
     float *x = malloc((size_t)HEADS * DIM * sizeof(float));
@@ -2832,6 +2899,8 @@ int main(void) {
 #endif
     check_decode_glue();
     puts("CPU decode glue (RoPE, HC, head RMS, E4M3) bitwise oracles PASS");
+    check_hc_pre_batch();
+    puts("CPU batched HC pre (sixteen-token lanes) bitwise with the per-token path PASS");
     /* nb_in > nb_mid with a partial last row block, then nb_in < nb_mid,
      * then a full down row block followed by a partial one. */
     check_grouped_ffn(2 * QK_K, QK_K, 2 * DS4_MOE_ROW_BLOCK + 6);

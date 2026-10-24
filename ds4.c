@@ -14030,6 +14030,34 @@ typedef struct {
     uint32_t     n_hc;
 } hc_post_batch_ctx;
 
+#if defined(DS4_NO_GPU) && defined(__AVX512F__)
+/* r[i] becomes the column i of the 16x16 block whose row l was r[l]: unpack
+ * pairs, then quads, then 128-bit lanes.  Pure data movement. */
+static inline void transpose16_ps(__m512 r[16]) {
+    __m512 t[16];
+    for (uint32_t k = 0; k < 16; k += 2) {
+        t[k] = _mm512_unpacklo_ps(r[k], r[k + 1]);
+        t[k + 1] = _mm512_unpackhi_ps(r[k], r[k + 1]);
+    }
+    for (uint32_t k = 0; k < 16; k += 4) {
+        r[k] = _mm512_castpd_ps(_mm512_unpacklo_pd(_mm512_castps_pd(t[k]), _mm512_castps_pd(t[k + 2])));
+        r[k + 1] = _mm512_castpd_ps(_mm512_unpackhi_pd(_mm512_castps_pd(t[k]), _mm512_castps_pd(t[k + 2])));
+        r[k + 2] = _mm512_castpd_ps(_mm512_unpacklo_pd(_mm512_castps_pd(t[k + 1]), _mm512_castps_pd(t[k + 3])));
+        r[k + 3] = _mm512_castpd_ps(_mm512_unpackhi_pd(_mm512_castps_pd(t[k + 1]), _mm512_castps_pd(t[k + 3])));
+    }
+    for (uint32_t k = 0; k < 4; k++) {
+        t[k] = _mm512_shuffle_f32x4(r[k], r[k + 4], 0x88);
+        t[k + 4] = _mm512_shuffle_f32x4(r[k], r[k + 4], 0xdd);
+        t[k + 8] = _mm512_shuffle_f32x4(r[k + 8], r[k + 12], 0x88);
+        t[k + 12] = _mm512_shuffle_f32x4(r[k + 8], r[k + 12], 0xdd);
+    }
+    for (uint32_t k = 0; k < 8; k++) {
+        r[k] = _mm512_shuffle_f32x4(t[k], t[k + 8], 0x88);
+        r[k + 8] = _mm512_shuffle_f32x4(t[k], t[k + 8], 0xdd);
+    }
+}
+#endif
+
 static void hc_post_batch_worker(void *vctx, uint64_t t0, uint64_t t1) {
     hc_post_batch_ctx *ctx = vctx;
     for (uint64_t t = t0; t < t1; t++) {
@@ -14138,6 +14166,7 @@ typedef struct {
     float *comb;
     uint64_t hc_dim;
     uint32_t n_hc;
+    uint64_t n_lanes;   /* sixteen-token groups for hc_pre_norm_lanes16() */
 } hc_pre_norm_batch_ctx;
 
 static void hc_pre_norm_batch_worker(void *vctx, uint64_t t0, uint64_t t1) {
@@ -14173,6 +14202,141 @@ static void hc_pre_norm_batch_worker(void *vctx, uint64_t t0, uint64_t t1) {
     free(flat);
 }
 
+#if defined(DS4_NO_GPU) && defined(__AVX512F__) && defined(__F16C__)
+/* The double sum of squares of n values of sixteen rows (row l at x + l *
+ * stride), lane l adding (double)v * v for its row in index order, as
+ * rms_norm_no_weight() and rms_norm_weight() do per row; n is a multiple of
+ * sixteen. */
+static void sumsq16_rows(double ss[16], const float *x, uint64_t stride, uint64_t n) {
+    __m512d lo = _mm512_setzero_pd(), hi = _mm512_setzero_pd();
+    for (uint64_t i = 0; i < n; i += 16) {
+        __m512 v[16];
+        for (uint32_t l = 0; l < 16; l++) v[l] = _mm512_loadu_ps(x + l * stride + i);
+        transpose16_ps(v);
+        for (uint32_t k = 0; k < 16; k++) {
+            const __m512d a = _mm512_cvtps_pd(_mm512_castps512_ps256(v[k]));
+            const __m512d b = _mm512_cvtps_pd(_mm256_castpd_ps(_mm512_extractf64x4_pd(_mm512_castps_pd(v[k]), 1)));
+            lo = _mm512_add_pd(lo, _mm512_mul_pd(a, a));
+            hi = _mm512_add_pd(hi, _mm512_mul_pd(b, b));
+        }
+    }
+    _mm512_storeu_pd(ss, lo);
+    _mm512_storeu_pd(ss + 8, hi);
+}
+
+/* The RMSNorm scale of a row from its sum of squares, the expression of
+ * rms_norm_no_weight() and rms_norm_weight(). */
+static inline float rms_scale_from_ss(double ss, uint64_t n, float eps) {
+    return 1.0f / sqrtf((float)(ss / (double)n) + eps);
+}
+
+/* Values per chunk of the HC rows transposed for the mix projection. */
+#define HC_PRE_LANES_CHUNK 256
+
+/* hc_pre_norm_batch_worker() for the sixteen tokens t0..t0+15, lane l for
+ * token t0 + l.  Per token the reference reduces with serial chains: the
+ * double sum of squares of its 16384 HC values, the 24 rows of the F16 mix
+ * projection (dot_f16_rows: one float chain per row in index order, product
+ * f32(w) * v) and the double sum of squares of the 4096 mixed values.  Run
+ * across the tokens' lanes every chain keeps its operations and their order,
+ * so each value is the per-token path's bit for bit, while sixteen chains
+ * share each instruction instead of one chain waiting on its own adds.  The
+ * HC values are transposed in 16x16 blocks (pure data movement) and scaled
+ * by their token's factor, as rms_norm_no_weight() writes them; the Sinkhorn
+ * split, the stream mix and the final scaling stay per token. */
+static void hc_pre_norm_lanes16(const hc_pre_norm_batch_ctx *ctx, uint64_t t0) {
+    const uint64_t hc_dim = ctx->hc_dim;
+    const uint32_t n_hc = ctx->n_hc;
+    const uint32_t n_embd = DS4_N_EMBD;
+    const float *x = ctx->inp_hc + t0 * hc_dim;
+    const uint16_t *fn = tensor_data(ctx->model, ctx->fn);
+    const float *scale_w = tensor_data(ctx->model, ctx->scale);
+    const float *base = tensor_data(ctx->model, ctx->base);
+    const float *norm_w = tensor_data(ctx->model, ctx->norm_w);
+    double ss[16];
+    float sc[16];
+    float ft[HC_PRE_LANES_CHUNK][16] __attribute__((aligned(64)));
+    float wb[24][16] __attribute__((aligned(64)));
+    float mix[24][16] __attribute__((aligned(64)));
+
+    if (ctx->residual_hc) {
+        memcpy(ctx->residual_hc + t0 * hc_dim, x, (size_t)16 * hc_dim * sizeof(x[0]));
+    }
+
+    sumsq16_rows(ss, x, hc_dim, hc_dim);
+    for (uint32_t l = 0; l < 16; l++) sc[l] = rms_scale_from_ss(ss[l], hc_dim, DS4_RMS_EPS);
+    const __m512 scv = _mm512_loadu_ps(sc);
+
+    __m512 acc[24];
+    for (uint32_t o = 0; o < 24; o++) acc[o] = _mm512_setzero_ps();
+    for (uint64_t c0 = 0; c0 < hc_dim; c0 += HC_PRE_LANES_CHUNK) {
+        for (uint32_t b = 0; b < HC_PRE_LANES_CHUNK; b += 16) {
+            __m512 v[16];
+            for (uint32_t l = 0; l < 16; l++) v[l] = _mm512_loadu_ps(x + l * hc_dim + c0 + b);
+            transpose16_ps(v);
+            for (uint32_t k = 0; k < 16; k++) _mm512_store_ps(ft[b + k], _mm512_mul_ps(v[k], scv));
+        }
+        for (uint32_t b = 0; b < HC_PRE_LANES_CHUNK; b += 16) {
+            for (uint32_t o = 0; o < 24; o++) {
+                const __m256i h = _mm256_loadu_si256((const __m256i *)(fn + o * hc_dim + c0 + b));
+                _mm512_store_ps(wb[o], _mm512_cvtph_ps(h));
+            }
+            for (uint32_t k = 0; k < 16; k++) {
+                const __m512 f = _mm512_load_ps(ft[b + k]);
+                for (uint32_t o = 0; o < 24; o++) {
+                    acc[o] = _mm512_add_ps(acc[o], _mm512_mul_ps(_mm512_set1_ps(wb[o][k]), f));
+                }
+            }
+        }
+    }
+    for (uint32_t o = 0; o < 24; o++) _mm512_store_ps(mix[o], acc[o]);
+
+    for (uint32_t l = 0; l < 16; l++) {
+        const uint64_t t = t0 + l;
+        float m[24], split[24];
+        for (uint32_t o = 0; o < 24; o++) m[o] = mix[o][l];
+        hc_split_sinkhorn_one(split, m, scale_w, base, (int)n_hc, DS4_N_HC_SINKHORN_ITER, 1.0e-6f);
+        hc_weighted_sum_one(ctx->cur + t * n_embd, x + l * hc_dim, split, n_embd, n_hc);
+        memcpy(ctx->post + t * n_hc, split + n_hc, n_hc * sizeof(float));
+        memcpy(ctx->comb + t * n_hc * n_hc, split + 2 * n_hc, n_hc * n_hc * sizeof(float));
+    }
+
+    const float *cur = ctx->cur + t0 * n_embd;
+    sumsq16_rows(ss, cur, n_embd, n_embd);
+    for (uint32_t l = 0; l < 16; l++) {
+        const float s = rms_scale_from_ss(ss[l], n_embd, DS4_RMS_EPS);
+        const float *xr = cur + (uint64_t)l * n_embd;
+        float *out = ctx->norm + (t0 + l) * n_embd;
+        const __m512 sv = _mm512_set1_ps(s);
+        for (uint32_t i = 0; i < n_embd; i += 16) {
+            _mm512_storeu_ps(out + i, _mm512_mul_ps(_mm512_mul_ps(_mm512_loadu_ps(xr + i), sv),
+                                                    _mm512_loadu_ps(norm_w + i)));
+        }
+    }
+}
+
+/* Whether hc_pre_norm_lanes16() serves this layer: the Flash HC layout (four
+ * streams, a 24-row F16 mix projection) with widths in whole 16-value blocks. */
+static bool hc_pre_norm_lanes_ok(const hc_pre_norm_batch_ctx *ctx) {
+    return ctx->n_hc == 4 && ctx->fn->type == 1 && ctx->fn->ndim == 2 &&
+           ctx->fn->dim[0] == ctx->hc_dim && ctx->fn->dim[1] == 24 &&
+           ctx->hc_dim % HC_PRE_LANES_CHUNK == 0 && DS4_N_EMBD % 16 == 0;
+}
+
+/* Items 0..n_lanes-1 are sixteen-token lane groups, the rest single tokens. */
+static void hc_pre_norm_items_worker(void *vctx, uint64_t i0, uint64_t i1) {
+    hc_pre_norm_batch_ctx *ctx = vctx;
+    for (uint64_t item = i0; item < i1; item++) {
+        if (item < ctx->n_lanes) {
+            hc_pre_norm_lanes16(ctx, item * 16);
+        } else {
+            const uint64_t t = 16 * ctx->n_lanes + (item - ctx->n_lanes);
+            hc_pre_norm_batch_worker(ctx, t, t + 1);
+        }
+    }
+}
+#endif
+
 /* Batched HC pre plus RMSNorm.  Prefill uses this to keep the layer-major
  * token batch in contiguous arrays. */
 static void hc_pre_norm_batch(
@@ -14203,6 +14367,13 @@ static void hc_pre_norm_batch(
         .hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD,
         .n_hc = DS4_N_HC,
     };
+#if defined(DS4_NO_GPU) && defined(__AVX512F__) && defined(__F16C__)
+    if (hc_pre_norm_lanes_ok(&ctx)) {
+        ctx.n_lanes = n_tok / 16;
+        ds4_parallel_for_min_rows(ctx.n_lanes + n_tok % 16, hc_pre_norm_items_worker, &ctx, 1);
+        return;
+    }
+#endif
     ds4_parallel_for_min_rows(n_tok, hc_pre_norm_batch_worker, &ctx, 1);
 }
 
@@ -17207,31 +17378,12 @@ static inline float *attn_lanes_score(const layer_attention_lanes_ctx *ctx, uint
 }
 
 #if defined(DS4_NO_GPU) && defined(__AVX512F__)
-/* dst[i][l] = src[l][i] for a 16x16 block: unpack pairs, then quads, then
- * 128-bit lanes.  Pure data movement. */
+/* dst[i][l] = src[l][i] for a 16x16 block.  Pure data movement. */
 static inline void attn_lanes_transpose16(float *dst, const float *src, uint64_t src_stride) {
-    __m512 r[16], t[16];
+    __m512 r[16];
     for (uint32_t l = 0; l < 16; l++) r[l] = _mm512_loadu_ps(src + l * src_stride);
-    for (uint32_t k = 0; k < 16; k += 2) {
-        t[k] = _mm512_unpacklo_ps(r[k], r[k + 1]);
-        t[k + 1] = _mm512_unpackhi_ps(r[k], r[k + 1]);
-    }
-    for (uint32_t k = 0; k < 16; k += 4) {
-        r[k] = _mm512_castpd_ps(_mm512_unpacklo_pd(_mm512_castps_pd(t[k]), _mm512_castps_pd(t[k + 2])));
-        r[k + 1] = _mm512_castpd_ps(_mm512_unpackhi_pd(_mm512_castps_pd(t[k]), _mm512_castps_pd(t[k + 2])));
-        r[k + 2] = _mm512_castpd_ps(_mm512_unpacklo_pd(_mm512_castps_pd(t[k + 1]), _mm512_castps_pd(t[k + 3])));
-        r[k + 3] = _mm512_castpd_ps(_mm512_unpackhi_pd(_mm512_castps_pd(t[k + 1]), _mm512_castps_pd(t[k + 3])));
-    }
-    for (uint32_t k = 0; k < 4; k++) {
-        t[k] = _mm512_shuffle_f32x4(r[k], r[k + 4], 0x88);
-        t[k + 4] = _mm512_shuffle_f32x4(r[k], r[k + 4], 0xdd);
-        t[k + 8] = _mm512_shuffle_f32x4(r[k + 8], r[k + 12], 0x88);
-        t[k + 12] = _mm512_shuffle_f32x4(r[k + 8], r[k + 12], 0xdd);
-    }
-    for (uint32_t k = 0; k < 8; k++) {
-        _mm512_storeu_ps(dst + k * 16, _mm512_shuffle_f32x4(t[k], t[k + 8], 0x88));
-        _mm512_storeu_ps(dst + (k + 8) * 16, _mm512_shuffle_f32x4(t[k], t[k + 8], 0xdd));
-    }
+    transpose16_ps(r);
+    for (uint32_t k = 0; k < 16; k++) _mm512_storeu_ps(dst + k * 16, r[k]);
 }
 
 /* Scores of up to ATTN_LANES_BLOCK rows for heads h0..h0+15.  Rows past
