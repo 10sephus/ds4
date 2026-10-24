@@ -889,7 +889,8 @@ static bool ds41_cpu_matmul(float *out, uint64_t out_stride, const ds4_model *m,
  * synchronous read put them; only the time they are read changes.  A row
  * not in the page cache is a small random read, and the device serves
  * them faster the more are in flight: 64 readers keep a cold chunk's
- * 24576 rows from stalling layer 1. */
+ * 24576 rows from stalling layer 1.  A reader takes one token's rows of
+ * a table at a time, so a chunk of n tokens starts at most n readers. */
 #define DS41_CPU_ENGRAM_READERS 64u
 typedef struct {
     const ds4_engram_table *table;
@@ -930,7 +931,8 @@ static void ds41_cpu_engram_batch_start(ds41_cpu_engram_batch *e, const ds4_engr
     *e = (ds41_cpu_engram_batch){.table = table, .ids = ids, .rows = rows, .n = n};
     pthread_mutex_init(&e->mutex, NULL);
     pthread_cond_init(&e->cond, NULL);
-    while (e->started < DS41_CPU_ENGRAM_READERS &&
+    const uint32_t readers = n < DS41_CPU_ENGRAM_READERS ? n : DS41_CPU_ENGRAM_READERS;
+    while (e->started < readers &&
            !pthread_create(&e->threads[e->started], NULL, ds41_cpu_engram_batch_thread, e))
         e->started++;
     if (!e->started) ds41_cpu_engram_batch_thread(e);
