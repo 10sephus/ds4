@@ -406,6 +406,10 @@ int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
 #if defined(DS4_NO_GPU) && defined(__AVX2__)
 #include <immintrin.h>
 #endif
+#if defined(DS4_NO_GPU) && defined(__AVX512F__) && defined(__AVX512BW__)
+/* glibc's expf for sixteen floats, bitwise (ds4_deepseek41_cpu_x86.inc). */
+static inline __m512 ds41_cpu_expf16(__m512 x);
+#endif
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -12813,16 +12817,16 @@ static inline void moe_mid_store(const moe_mid_tile_ctx *ctx, const ds4_moe_tile
 #if DS4_MOE_X16
 /* moe_mid_store for an x16 kernel tile, the sixteen lanes of a pair
  * together: the clamps and the sign test of sigmoid_stable are masks (a
- * NaN fails every compare, as in the scalar code), the lanes' expf calls
- * stay scalar, and the divisions and products are the single-lane IEEE
- * operations in the scalar order, x * sigmoid, * up, * weight, so every
- * value is the scalar path's.  Lanes past t->n load as zeros and get no
- * expf; their results are never stored. */
+ * NaN fails every compare, as in the scalar code), expf is
+ * ds41_cpu_expf16 (glibc's, bit for bit), and the divisions and products
+ * are the single-lane IEEE operations in the scalar order, x * sigmoid,
+ * * up, * weight, so every value is the scalar path's.  Lanes past t->n
+ * load as zeros; their results are never stored. */
 static inline void moe_mid_store_x16(const moe_mid_tile_ctx *ctx, const ds4_moe_tile *t, uint64_t row0, uint32_t n_pairs,
                                      const float (*gv)[DS4_MOE_TILE], const float (*uv)[DS4_MOE_TILE]) {
     const __mmask16 live = (__mmask16)((1u << t->n) - 1);
     float res[DS4_MOE_ROW_BLOCK][DS4_MOE_TILE];
-    float pw[DS4_MOE_TILE], arg[DS4_MOE_TILE], e[DS4_MOE_TILE];
+    float pw[DS4_MOE_TILE];
     for (uint32_t lane = 0; lane < DS4_MOE_TILE; lane++) pw[lane] = ctx->pair_weight[t->pair[lane]];
     const __m512 pwv = _mm512_loadu_ps(pw);
     const __m512 zero = _mm512_setzero_ps(), one = _mm512_set1_ps(1.0f);
@@ -12841,9 +12845,7 @@ static inline void moe_mid_store_x16(const moe_mid_tile_ctx *ctx, const ds4_moe_
          * (_mm512_xor_ps needs AVX512DQ). */
         const __mmask16 nonneg = _mm512_cmp_ps_mask(g, zero, _CMP_GE_OQ);
         const __m512 neg = _mm512_castsi512_ps(_mm512_xor_si512(_mm512_castps_si512(g), sign));
-        _mm512_storeu_ps(arg, _mm512_mask_blend_ps(nonneg, g, neg));
-        for (uint32_t lane = 0; lane < t->n; lane++) e[lane] = expf(arg[lane]);
-        const __m512 ev = _mm512_maskz_loadu_ps(live, e);
+        const __m512 ev = ds41_cpu_expf16(_mm512_mask_blend_ps(nonneg, g, neg));
         const __m512 den = _mm512_add_ps(one, ev);
         const __m512 sg = _mm512_mask_blend_ps(nonneg, _mm512_div_ps(ev, den), _mm512_div_ps(one, den));
         _mm512_storeu_ps(res[p], _mm512_mul_ps(_mm512_mul_ps(_mm512_mul_ps(g, sg), u), pwv));
