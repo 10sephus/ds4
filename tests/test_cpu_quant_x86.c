@@ -312,21 +312,23 @@ static void indexer_oracle(bool *allowed, float *scores, const float *q, const f
 
 /* Selection alone on crafted scores: ties at every level including the
  * top_k boundary, +-0, +-inf, NaN, DS4_NEG_INF itself and values below it,
- * and fewer candidates than top_k with and without row 0 among them. */
+ * fewer candidates than top_k with and without row 0 among them, and runs
+ * of adjacent floats that differ in their last byte only, positive and
+ * negative, so that every radix pass splits the rows. */
 static void check_indexer_selection(void) {
     const float values[] = {-2.0f, -1.0f, -0.0f, 0.0f, 0.5f, 1.0f, 1.0e30f, 0x1p-149f,
                             DS4_NEG_INF, -1.0e31f, INFINITY, -INFINITY, NAN};
     const unsigned n_values = sizeof(values) / sizeof(*values);
     /* 528, 544 and 545 rows for 512: the one-pass selection's 16 and 32
      * dropped rows, and one past its limit. */
-    const unsigned counts[] = {513, 528, 544, 545, 600, 1500};
+    const unsigned counts[] = {513, 528, 544, 545, 600, 1500, 2051, 4100};
     for (unsigned ci = 0; ci < sizeof(counts) / sizeof(*counts); ci++) {
         const unsigned n_comp = counts[ci];
         float *scores = xmalloc(n_comp * sizeof(float));
         bool *allowed = xmalloc(n_comp * sizeof(bool));
         bool *expected = xmalloc(n_comp * sizeof(bool));
-        indexer_candidate *cand = xmalloc(n_comp * sizeof(indexer_candidate));
-        for (unsigned pattern = 0; pattern < 9; pattern++) {
+        uint32_t *keys = xmalloc(n_comp * sizeof(uint32_t));
+        for (unsigned pattern = 0; pattern < 11; pattern++) {
             for (unsigned c = 0; c < n_comp; c++) {
                 switch (pattern) {
                 case 0: scores[c] = values[quant_random() % n_values]; break;
@@ -337,17 +339,19 @@ static void check_indexer_selection(void) {
                 case 5: scores[c] = NAN; break;
                 case 6: scores[c] = c % 5 ? NAN : (float)(c % 7); break;
                 case 7: scores[c] = c % 5 && c ? (float)(c % 7) : NAN; break;
+                case 8: scores[c] = 1.0f + (float)(quant_random() % 300) * 0x1p-23f; break;
+                case 9: scores[c] = -1.0f - (float)(quant_random() % 700) * 0x1p-23f + (c % 3 ? 0.0f : 0x1p-10f); break;
                 default: scores[c] = c < 512 ? 1.0f : -INFINITY; break;
                 }
             }
             const unsigned top_ks[] = {512, 1, 100, n_comp - 1};
             for (unsigned ti = 0; ti < 4; ti++) {
                 indexer_select_oracle(expected, scores, n_comp, top_ks[ti]);
-                indexer_select_top_k(allowed, cand, scores, n_comp, top_ks[ti]);
+                indexer_select_top_k(allowed, keys, scores, n_comp, top_ks[ti]);
                 CHECK(memcmp(allowed, expected, n_comp * sizeof(bool)) == 0);
             }
         }
-        free(cand); free(expected); free(allowed); free(scores);
+        free(keys); free(expected); free(allowed); free(scores);
     }
 }
 
@@ -382,7 +386,7 @@ static void check_indexer(void) {
             float *expected = xmalloc(n_comp * sizeof(float));
             bool *allowed = xmalloc(n_comp * sizeof(bool));
             bool *allowed_expected = xmalloc(n_comp * sizeof(bool));
-            indexer_candidate *cand = xmalloc(n_comp * sizeof(indexer_candidate));
+            uint32_t *keys = xmalloc(n_comp * sizeof(uint32_t));
             for (unsigned repeat = 0; repeat < 4; repeat++) {
                 /* Random values round at every step, so any reassociation
                  * or fused multiply-add shows; the coarse pass and the
@@ -407,10 +411,10 @@ static void check_indexer(void) {
                 indexer_oracle(allowed_expected, expected, q, weights, comp, n_comp, top_k);
                 indexer_score_rows(scores, qt, q, weights, comp, n_comp);
                 indexer_scores_equal(expected, scores, n_comp);
-                indexer_select_top_k(allowed, cand, scores, n_comp, top_k);
+                indexer_select_top_k(allowed, keys, scores, n_comp, top_k);
                 CHECK(memcmp(allowed, allowed_expected, n_comp * sizeof(bool)) == 0);
             }
-            free(cand); free(allowed_expected); free(allowed); free(expected); free(scores); free(comp);
+            free(keys); free(allowed_expected); free(allowed); free(expected); free(scores); free(comp);
         }
         free(weights); free(qt); free(q);
     }

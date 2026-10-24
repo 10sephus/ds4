@@ -1111,12 +1111,6 @@ DS4_STATIC_ASSERT(ds4_block_q8_k_size, sizeof(block_q8_K) == 292);
 DS4_STATIC_ASSERT(ds4_block_iq2_xxs_size, sizeof(block_iq2_xxs) == 66);
 DS4_STATIC_ASSERT(ds4_block_mxfp4_size, sizeof(block_mxfp4) == 17);
 
-/* One compressed row in the indexer top-k sort. */
-typedef struct {
-    float    score;
-    uint32_t index;
-} indexer_candidate;
-
 /* Rows per item of the lane-wise decode attention stages. */
 #define ATTN_LANES_ROWS_PER_ITEM 16
 
@@ -1170,7 +1164,7 @@ typedef struct {
     uint32_t *index_group_done;  /* staged attention: indexer heads done per group of 16, a line each */
     float *index_weights;
     float *index_scores;
-    indexer_candidate *index_cand;
+    uint32_t *index_keys;   /* indexer top-k order keys */
 
     float *ffn_cur;
     float *ffn_norm;
@@ -16153,7 +16147,7 @@ static void cpu_decode_scratch_init(ds4_cpu_decode_scratch *scratch, uint32_t ct
     scratch->index_group_done = xmalloc_lines((size_t)64u * ((DS4_N_INDEXER_HEAD + 15u) / 16u));
     scratch->index_weights = xmalloc((size_t)DS4_N_INDEXER_HEAD * sizeof(float));
     scratch->index_scores = xmalloc_lines((size_t)comp_cap * sizeof(float));
-    scratch->index_cand = xmalloc((size_t)comp_cap * sizeof(indexer_candidate));
+    scratch->index_keys = xmalloc((size_t)comp_cap * sizeof(uint32_t));
 
     scratch->ffn_cur = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
     scratch->ffn_norm = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
@@ -16209,7 +16203,7 @@ static void cpu_decode_scratch_free(ds4_cpu_decode_scratch *scratch) {
     free(scratch->ffn_moe);
     free(scratch->ffn_norm);
     free(scratch->ffn_cur);
-    free(scratch->index_cand);
+    free(scratch->index_keys);
     free(scratch->index_scores);
     free(scratch->index_weights);
     free(scratch->index_group_done);
@@ -17912,101 +17906,137 @@ static void indexer_score_rows(
                               indexer_score_rows_worker, &ctx, 1);
 }
 
-/* Descending score, ascending index: the order in which argmax rounds with a
- * strict '>' pick rows.  Candidates are never NaN. */
-static int indexer_candidate_cmp(const void *a, const void *b) {
-    const indexer_candidate *x = a, *y = b;
-    if (x->score != y->score) return x->score > y->score ? -1 : 1;
-    return (x->index > y->index) - (x->index < y->index);
-}
-
-/* Moves the first k candidates in indexer_candidate_cmp order to cand[0..k),
- * in no particular order among themselves: quickselect around the middle
- * element, O(n) expected.  The comparator is a strict total order (equal
- * scores fall back to the index), so the set is the one a full sort gives. */
-static void indexer_select_first(indexer_candidate *cand, uint32_t n, uint32_t k) {
-    uint32_t lo = 0, hi = n;
-    while (hi - lo > 1 && lo < k && k < hi) {
-        /* The lower middle: a pivot at hi - 1 would leave a two-element
-         * range unsplit. */
-        const indexer_candidate pivot = cand[lo + (hi - lo - 1) / 2];
-        uint32_t i = lo, j = hi;
-        for (;;) {
-            while (indexer_candidate_cmp(&cand[i], &pivot) < 0) i++;
-            do j--; while (indexer_candidate_cmp(&cand[j], &pivot) > 0);
-            if (i >= j) break;
-            const indexer_candidate t = cand[i];
-            cand[i++] = cand[j];
-            cand[j] = t;
-        }
-        /* cand[lo..j] precede or equal the pivot, cand[j+1..hi) follow it. */
-        if (k <= j) hi = j + 1; else lo = j + 1;
-    }
-}
-
-/* Just past the top-k window (2048 to 2111 tokens: 513 to 528 rows for 512)
- * only a few candidates drop out: one pass keeps the INDEXER_DROP_MAX last
- * in indexer_candidate_cmp order seen so far and the first of them, which a
- * newcomer must follow to take its place; the first is found again only
- * after a replacement. */
-#define INDEXER_DROP_MAX 32
-
 /* Stage 8 of layer_attention_graph() scores every raw and compressed row
  * beside the indexer only while at most this many rows drop out: each one
  * costs a score the listed rows never need, so past 2176 tokens the scores
  * wait for the selection again and score the listed rows only. */
-#define ATTN_SCORE_ALL_DROP_MAX INDEXER_DROP_MAX
+#define ATTN_SCORE_ALL_DROP_MAX 32
+
+/* The order in which argmax rounds with a strict '>' pick rows, as an
+ * unsigned key: a candidate (a score above DS4_NEG_INF, so never NaN) keeps
+ * its float order, the two zeros, equal as floats, share a key, and every
+ * candidate is above 0, the key of the rows that are not candidates.  Rows
+ * of equal key are picked by ascending index. */
+static inline uint32_t indexer_score_key(float score) {
+    if (!(score > DS4_NEG_INF)) return 0;
+    uint32_t u;
+    memcpy(&u, &score, sizeof(u));
+    if (u == 0x80000000u) u = 0;
+    return u & 0x80000000u ? ~u : u | 0x80000000u;
+}
+
+#if defined(DS4_NO_GPU) && defined(__AVX512F__)
+/* indexer_score_key() of sixteen scores: the ordered compare drops NaN with
+ * the rest of the non-candidates, -0.0 becomes +0.0, and the sign spread
+ * over the word flips a negative score's bits and a positive one's sign. */
+static inline __m512i indexer_score_keys16(__m512 score) {
+    const __mmask16 cand = _mm512_cmp_ps_mask(score, _mm512_set1_ps(DS4_NEG_INF), _CMP_GT_OQ);
+    __m512i u = _mm512_castps_si512(score);
+    u = _mm512_mask_mov_epi32(u, _mm512_cmpeq_epi32_mask(u, _mm512_set1_epi32((int)0x80000000u)),
+                              _mm512_setzero_si512());
+    const __m512i flip = _mm512_or_si512(_mm512_srai_epi32(u, 31), _mm512_set1_epi32((int)0x80000000u));
+    return _mm512_maskz_xor_epi32(cand, u, flip);
+}
+#endif
 
 /* Same allowed set as the reference selection, top_k argmax rounds each taking
  * the lowest index with the strictly greatest score among the rows not yet
  * chosen, starting from DS4_NEG_INF: a row that never compares greater than
  * DS4_NEG_INF (NaN or lower) is never a candidate, and once the candidates run
- * out every remaining round falls back to row 0.  Selecting the first top_k
- * candidates is O(n) instead of O(top_k * n).  cand is scratch of n_comp
- * entries. */
+ * out every remaining round falls back to row 0.  With top_k candidates or
+ * more, the rounds pick every row whose key is above the top_k-th largest key
+ * and, of the rows at that key, the first ones by index.  A radix select finds
+ * that key a byte at a time from the top: a pass counts the keys sharing the
+ * bytes found so far by their next byte and keeps the bucket where the top_k-th
+ * key falls, and only that bucket's keys go on to the next pass, so the whole
+ * selection is O(n) without comparisons between rows.  keys is scratch of
+ * n_comp entries. */
 static void indexer_select_top_k(
-        bool              * allowed,
-        indexer_candidate * cand,
-        const float       * scores,
-        uint32_t            n_comp,
-        uint32_t            top_k) {
-    uint32_t n_cand = 0;
-    for (uint32_t c = 0; c < n_comp; c++) {
-        if (scores[c] > DS4_NEG_INF) cand[n_cand++] = (indexer_candidate){ scores[c], c };
+        bool        * allowed,
+        uint32_t    * keys,
+        const float * scores,
+        uint32_t      n_comp,
+        uint32_t      top_k) {
+    /* The scores come from every thread of the dispatch: ask for all their
+     * lines at once instead of meeting the misses one by one. */
+    for (uint32_t c = 0; c < n_comp; c += 16) __builtin_prefetch(scores + c, 0, 3);
+    uint32_t n_cand = 0, c = 0;
+#if defined(DS4_NO_GPU) && defined(__AVX512F__)
+    for (; c + 16 <= n_comp; c += 16) {
+        const __m512i key = indexer_score_keys16(_mm512_loadu_ps(scores + c));
+        _mm512_storeu_si512(keys + c, key);
+        n_cand += (uint32_t)__builtin_popcount(_mm512_test_epi32_mask(key, key));
     }
-
-    memset(allowed, 0, (size_t)n_comp * sizeof(allowed[0]));
+#endif
+    for (; c < n_comp; c++) {
+        keys[c] = indexer_score_key(scores[c]);
+        n_cand += keys[c] != 0;
+    }
     if (n_cand < top_k) {
-        allowed[0] = true;
-        top_k = n_cand;
-    }
-    const uint32_t drop = n_cand - top_k;
-    if (drop <= INDEXER_DROP_MAX) {
-        indexer_candidate last[INDEXER_DROP_MAX];
-        uint32_t first = 0;
-        for (uint32_t i = 0; i < n_cand; i++) {
-            allowed[cand[i].index] = true;
-            if (i < drop) {
-                last[i] = cand[i];
-                if (i + 1 == drop) {
-                    for (uint32_t j = 1; j < drop; j++) {
-                        if (indexer_candidate_cmp(&last[j], &last[first]) < 0) first = j;
-                    }
-                }
-                continue;
-            }
-            if (drop == 0 || indexer_candidate_cmp(&cand[i], &last[first]) < 0) continue;
-            last[first] = cand[i];
-            first = 0;
-            for (uint32_t j = 1; j < drop; j++) {
-                if (indexer_candidate_cmp(&last[j], &last[first]) < 0) first = j;
-            }
-        }
-        for (uint32_t j = 0; j < drop; j++) allowed[last[j].index] = false;
+        for (c = 0; c < n_comp; c++) allowed[c] = keys[c] != 0;
+        if (n_comp) allowed[0] = true;
         return;
     }
-    indexer_select_first(cand, n_cand, top_k);
-    for (uint32_t k = 0; k < top_k; k++) allowed[cand[k].index] = true;
+
+    /* The top byte, counted in four interleaved tables so that equal bytes
+     * in a row do not wait on each other's increments. */
+    uint32_t hist4[4][256], hist[256];
+    memset(hist4, 0, sizeof(hist4));
+    for (c = 0; c < n_comp; c++) hist4[c & 3][keys[c] >> 24]++;
+    for (uint32_t i = 0; i < 256; i++) hist[i] = hist4[0][i] + hist4[1][i] + hist4[2][i] + hist4[3][i];
+    /* need: how many keys sharing prefix's bytes still go in, the buckets
+     * above the one it falls in having gone in whole. */
+    uint32_t prefix = 0, need = top_k, n = n_comp;
+    for (int shift = 24;; shift -= 8) {
+        uint32_t bucket = 255;
+        while (hist[bucket] < need) need -= hist[bucket--];
+        prefix |= bucket << shift;
+        if (shift == 0) break;
+        /* Keep the keys of that bucket, in place. */
+        const uint32_t high = ~0u << shift;
+        uint32_t m = 0, i = 0;
+#if defined(DS4_NO_GPU) && defined(__AVX512F__)
+        for (; i + 16 <= n; i += 16) {
+            const __m512i key = _mm512_loadu_si512(keys + i);
+            const __mmask16 keep = _mm512_cmpeq_epi32_mask(_mm512_and_si512(key, _mm512_set1_epi32((int)high)),
+                                                           _mm512_set1_epi32((int)prefix));
+            _mm512_mask_compressstoreu_epi32(keys + m, keep, key);
+            m += (uint32_t)__builtin_popcount(keep);
+        }
+#endif
+        for (; i < n; i++) {
+            if ((keys[i] & high) == prefix) keys[m++] = keys[i];
+        }
+        n = m;
+        memset(hist, 0, sizeof(hist));
+        for (i = 0; i < n; i++) hist[keys[i] >> (shift - 8) & 255]++;
+    }
+
+    /* prefix is the top_k-th largest key: the rows above it and the first
+     * need rows at it, in index order. */
+    c = 0;
+#if defined(DS4_NO_GPU) && defined(__AVX512F__)
+    for (; c + 16 <= n_comp; c += 16) {
+        const __m512i key = indexer_score_keys16(_mm512_loadu_ps(scores + c));
+        __mmask16 pick = _mm512_cmpgt_epu32_mask(key, _mm512_set1_epi32((int)prefix));
+        __mmask16 at = _mm512_cmpeq_epi32_mask(key, _mm512_set1_epi32((int)prefix));
+        for (; at && need; need--) {
+            pick |= at & (__mmask16)-at;
+            at &= at - 1;
+        }
+        _mm_storeu_si128((__m128i *)(allowed + c),
+                         _mm512_cvtepi32_epi8(_mm512_maskz_mov_epi32(pick, _mm512_set1_epi32(1))));
+    }
+#endif
+    for (; c < n_comp; c++) {
+        const uint32_t key = indexer_score_key(scores[c]);
+        bool pick = key > prefix;
+        if (key == prefix && need) {
+            pick = true;
+            need--;
+        }
+        allowed[c] = pick;
+    }
 }
 
 /* Indexer query and head weights for one token.  Decode passes its scratch so
@@ -18065,13 +18095,13 @@ static bool *indexer_allowed_decode_one(
     float *qt = xmalloc(q_dim * sizeof(qt[0]));
     float *weights = xmalloc((size_t)DS4_N_INDEXER_HEAD * sizeof(weights[0]));
     float *scores = xmalloc((size_t)n_comp * sizeof(scores[0]));
-    indexer_candidate *cand = xmalloc((size_t)n_comp * sizeof(cand[0]));
+    uint32_t *keys = xmalloc((size_t)n_comp * sizeof(keys[0]));
 
     indexer_query_decode_one(q, weights, model, layer, cur, qr_norm, il, pos, NULL);
     indexer_score_rows(scores, qt, q, weights, index_comp, n_comp);
-    indexer_select_top_k(allowed, cand, scores, n_comp, top_k);
+    indexer_select_top_k(allowed, keys, scores, n_comp, top_k);
 
-    free(cand);
+    free(keys);
     free(scores);
     free(weights);
     free(qt);
@@ -18104,7 +18134,7 @@ static bool *indexer_allowed_decode_one_decode_scratch(
                              cur, qr_norm, il, pos, scratch);
     indexer_score_rows(scratch->index_scores, scratch->index_qt, scratch->index_q,
                        scratch->index_weights, index_comp, n_comp);
-    indexer_select_top_k(allowed, scratch->index_cand, scratch->index_scores, n_comp, top_k);
+    indexer_select_top_k(allowed, scratch->index_keys, scratch->index_scores, n_comp, top_k);
     return allowed;
 }
 
@@ -18712,7 +18742,7 @@ static void attn_graph_rows_all(attn_graph_ctx *g) {
 static void attn_graph_index_select(void *vctx) {
     attn_graph_ctx *g = vctx;
     ds4_cpu_decode_scratch *scratch = g->scratch;
-    indexer_select_top_k(scratch->index_allowed, scratch->index_cand, scratch->index_scores,
+    indexer_select_top_k(scratch->index_allowed, scratch->index_keys, scratch->index_scores,
                          g->n_index, g->top_k);
     attn_graph_rows(g);
 }
