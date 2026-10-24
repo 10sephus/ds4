@@ -17290,13 +17290,14 @@ static void attn_lanes_sum_worker(void *vctx, uint64_t item0, uint64_t item1) {
         const uint32_t h1 = h0 + 16 < ctx->n_head ? h0 + 16 : ctx->n_head;
         const uint32_t d1 = d0 + 16 < head_dim ? d0 + 16 : head_dim;
         const float *w = attn_lanes_score(ctx, h0, 0);
-        float inv[16], denom[16] = {0};
+        float denom[16] = {0};
         if (ctx->hmax) {
             for (uint32_t h = h0; h < h1; h++) denom[h - h0] = expf(ctx->sinks[h] - ctx->hmax[h]);
         }
 #if defined(DS4_NO_GPU) && defined(__AVX512F__)
         if (h1 == h0 + 16 && d1 == d0 + 16) {
             __m512 acc[16];
+            float inv[16];
             __m512 den = _mm512_loadu_ps(denom);
             for (uint32_t l = 0; l < 16; l++) acc[l] = _mm512_setzero_ps();
             for (uint32_t r = 0; r < ctx->n_rows; r++) {
@@ -17720,13 +17721,6 @@ static void indexer_select_first(indexer_candidate *cand, uint32_t n, uint32_t k
     }
 }
 
-/* Same allowed set as the reference selection, top_k argmax rounds each taking
- * the lowest index with the strictly greatest score among the rows not yet
- * chosen, starting from DS4_NEG_INF: a row that never compares greater than
- * DS4_NEG_INF (NaN or lower) is never a candidate, and once the candidates run
- * out every remaining round falls back to row 0.  Selecting the first top_k
- * candidates is O(n) instead of O(top_k * n).  cand is scratch of n_comp
- * entries. */
 /* Just past the top-k window (2048 to 2111 tokens: 513 to 528 rows for 512)
  * only a few candidates drop out: one pass keeps the INDEXER_DROP_MAX last
  * in indexer_candidate_cmp order seen so far and the first of them, which a
@@ -17734,6 +17728,13 @@ static void indexer_select_first(indexer_candidate *cand, uint32_t n, uint32_t k
  * after a replacement. */
 #define INDEXER_DROP_MAX 32
 
+/* Same allowed set as the reference selection, top_k argmax rounds each taking
+ * the lowest index with the strictly greatest score among the rows not yet
+ * chosen, starting from DS4_NEG_INF: a row that never compares greater than
+ * DS4_NEG_INF (NaN or lower) is never a candidate, and once the candidates run
+ * out every remaining round falls back to row 0.  Selecting the first top_k
+ * candidates is O(n) instead of O(top_k * n).  cand is scratch of n_comp
+ * entries. */
 static void indexer_select_top_k(
         bool              * allowed,
         indexer_candidate * cand,
