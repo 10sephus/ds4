@@ -15996,16 +15996,16 @@ static void cpu_decode_scratch_init(ds4_cpu_decode_scratch *scratch, uint32_t ct
     scratch->attn_low = xmalloc((size_t)DS4_N_OUT_GROUP * DS4_N_LORA_O * sizeof(float));
     scratch->attn_out = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
     scratch->after_attn_hc = xmalloc((size_t)hc_dim * sizeof(float));
-    scratch->attn_score = xmalloc((size_t)16u * ((DS4_N_HEAD + 15u) / 16u) * attn_score_cap * sizeof(float));
+    scratch->attn_score = xmalloc_lines((size_t)16u * ((DS4_N_HEAD + 15u) / 16u) * attn_score_cap * sizeof(float));
     scratch->attn_qt = xmalloc((size_t)q_dim * sizeof(float));
     scratch->attn_rows = xmalloc((size_t)attn_score_cap * sizeof(float *));
-    scratch->attn_cmax = xmalloc((size_t)((DS4_N_HEAD + 15u) / 16u) *
+    scratch->attn_cmax = xmalloc_lines((size_t)((DS4_N_HEAD + 15u) / 16u) *
                                  ((attn_score_cap + ATTN_LANES_ROWS_PER_ITEM - 1) / ATTN_LANES_ROWS_PER_ITEM) *
                                  16u * sizeof(float));
     scratch->attn_inv = xmalloc((size_t)DS4_N_HEAD * sizeof(float));
     scratch->attn_hmax = xmalloc((size_t)16u * ((DS4_N_HEAD + 15u) / 16u) * sizeof(float));
     scratch->attn_rows_all = xmalloc((size_t)attn_score_cap * sizeof(float *));
-    scratch->attn_weight = xmalloc((size_t)16u * ((DS4_N_HEAD + 15u) / 16u) * attn_score_cap * sizeof(float));
+    scratch->attn_weight = xmalloc_lines((size_t)16u * ((DS4_N_HEAD + 15u) / 16u) * attn_score_cap * sizeof(float));
     scratch->attn_pick = xmalloc((size_t)attn_score_cap * sizeof(uint32_t));
     scratch->attn_listed = xmalloc((size_t)(attn_score_cap + ATTN_LANES_ROWS_PER_ITEM - 1) / ATTN_LANES_ROWS_PER_ITEM);
 
@@ -16022,7 +16022,7 @@ static void cpu_decode_scratch_init(ds4_cpu_decode_scratch *scratch, uint32_t ct
     scratch->index_head_done = xcalloc(DS4_N_INDEXER_HEAD, sizeof(uint32_t));
     scratch->index_group_done = xmalloc_lines((size_t)64u * ((DS4_N_INDEXER_HEAD + 15u) / 16u));
     scratch->index_weights = xmalloc((size_t)DS4_N_INDEXER_HEAD * sizeof(float));
-    scratch->index_scores = xmalloc((size_t)comp_cap * sizeof(float));
+    scratch->index_scores = xmalloc_lines((size_t)comp_cap * sizeof(float));
     scratch->index_cand = xmalloc((size_t)comp_cap * sizeof(indexer_candidate));
 
     scratch->ffn_cur = xmalloc((size_t)DS4_N_EMBD * sizeof(float));
@@ -17535,10 +17535,11 @@ typedef struct {
     uint32_t      n_comp;
 } indexer_score_ctx;
 
-/* One item is a group of INDEXER_SCORE_ROWS rows: a row costs about a
+/* One item is a group of INDEXER_SCORE_ROWS rows: a row costs about half a
  * microsecond, so claiming rows one by one would spend as long on the
- * cursor as on the dots. */
-#define INDEXER_SCORE_ROWS 8
+ * cursor as on the dots, and sixteen scores fill one cache line of the
+ * decode scratch, so no two items write the same line. */
+#define INDEXER_SCORE_ROWS 16
 
 #if defined(DS4_NO_GPU) && defined(__AVX512F__)
 /* The score of one row from its four sixteen-head dot vectors, in the order
