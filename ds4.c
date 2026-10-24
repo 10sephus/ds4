@@ -2206,7 +2206,11 @@ typedef struct {
     uint64_t half_rows;
     uint64_t end[2];
     ds4_pool_cursor cursor[2];
-    uint64_t done __attribute__((aligned(64)));    /* rows completed */
+    /* Rows completed per cursor, mostly bumped by threads of its node, and
+     * the cursors with rows left: a stage of many short claims would
+     * otherwise bounce one counter line between the sockets per claim. */
+    ds4_pool_cursor done[2];
+    uint32_t open_cursors __attribute__((aligned(64)));
     uint32_t ready __attribute__((aligned(64)));   /* rows and finish completed */
 } ds4_pool_stage;
 
@@ -2314,14 +2318,17 @@ static void ds4_pool_work(int node) {
 
 /* One chunk of a stage from one node's cursor, as ds4_pool_claim() hands
  * them out; false once the cursor has passed its end.  The thread whose rows
- * complete the stage runs its finish step and then marks it ready for the
- * stages that wait on it; the acquire-release count makes every row visible
- * to that thread. */
+ * complete the last open cursor runs the finish step and then marks the
+ * stage ready for the stages that wait on it; the acquire-release counts
+ * make every row visible to that thread.  A cursor already past its end is
+ * only read, so the threads leaving a stage do not take its line from the
+ * other node's claimers. */
 static bool ds4_stage_claim_chunk(ds4_pool_stage *s, int node) {
     const uint64_t group = s->group_rows;
     const uint64_t half = node ? group - s->half_rows : s->half_rows;
     const uint64_t first = node ? s->half_rows : 0;
     const uint64_t end = s->end[node];
+    if (__atomic_load_n(&s->cursor[node].v, __ATOMIC_RELAXED) >= end) return false;
     uint64_t v = __atomic_fetch_add(&s->cursor[node].v, s->chunk, __ATOMIC_RELAXED);
     if (v >= end) return false;
     const uint64_t v_end = v + s->chunk < end ? v + s->chunk : end;
@@ -2334,7 +2341,8 @@ static bool ds4_stage_claim_chunk(ds4_pool_stage *s, int node) {
         s->fn(s->ctx, row0, row0 + n);
         v += n;
     }
-    if (__atomic_add_fetch(&s->done, claimed, __ATOMIC_ACQ_REL) == s->n_rows) {
+    if (__atomic_add_fetch(&s->done[node].v, claimed, __ATOMIC_ACQ_REL) == end &&
+        __atomic_sub_fetch(&s->open_cursors, 1, __ATOMIC_ACQ_REL) == 0) {
         if (s->finish) s->finish(s->finish_ctx);
         __atomic_store_n(&s->ready, 1, __ATOMIC_RELEASE);
     }
@@ -2699,7 +2707,9 @@ static void ds4_pool_run_stages(ds4_pool_stage *stages, uint32_t n_stages) {
         s->end[1] = groups * (s->group_rows - half) + (tail > half ? tail - half : 0);
         s->cursor[0].v = 0;
         s->cursor[1].v = 0;
-        s->done = 0;
+        s->done[0].v = 0;
+        s->done[1].v = 0;
+        s->open_cursors = (s->end[0] > 0) + (s->end[1] > 0);
         s->ready = 0;
         if (s->n_rows == 0) {
             if (s->finish) s->finish(s->finish_ctx);
