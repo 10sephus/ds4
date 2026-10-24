@@ -16314,19 +16314,52 @@ typedef struct {
     float          * out;
     const uint16_t * w;
     const float    * xt;      /* [tile][in_dim][16] */
-    float          * wf;      /* per-thread f32 weight block, COMP_TILE_ROWS rows of wf_stride */
-    uint64_t         wf_stride;
+    float          * wf;      /* per-thread f32 weight block, [column][COMP_TILE_ROWS] */
     uint64_t         in_dim;
     uint32_t         width;
     uint32_t         n_tiles;
 } compressor_tile_ctx;
 
-/* Row stride of the f32 weight block: in_dim plus one cache line.  At
- * in_dim 4096 the rows would sit exactly 16 KB apart, so the sixteen
- * broadcast streams of the kernel shared one L1 set (8 ways) and thrashed
- * it; a line of padding puts consecutive rows in consecutive sets. */
-static uint64_t compressor_tile_wf_stride(uint64_t in_dim) {
-    return (in_dim + 15) / 16 * 16 + 16;
+/* Floats of a thread's weight block: the sixteen rows column-major, the
+ * columns padded to the eight-column conversion steps.  Column-major, the
+ * sixteen broadcasts of a column come from one cache line; row-major the
+ * kernel read sixteen streams and ran about a fifth slower even from L1. */
+static uint64_t compressor_tile_wf_floats(uint64_t in_dim) {
+    return (in_dim + 7) / 8 * 8 * COMP_TILE_ROWS;
+}
+
+/* Convert eight columns of the sixteen F16 rows to f32 and store them
+ * column-major: an 8x8 transpose on each 256-bit half (rows 0-7 and 8-15)
+ * with the usual unpack and shuffle steps, then each column's sixteen rows
+ * are gathered from the two halves.  VCVTPH2PS gives the value f16_to_f32
+ * gives (the row-major conversion relied on the same). */
+static inline void compressor_tile_convert8(float *wc, const uint16_t *const rows[COMP_TILE_ROWS], uint64_t i) {
+    __m512 z[8], t[8], u[8];
+    for (unsigned k = 0; k < 8; k++) {
+        const __m256 lo = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(rows[k] + i)));
+        const __m256 hi = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(rows[k + 8] + i)));
+        z[k] = _mm512_insertf32x8(_mm512_castps256_ps512(lo), hi, 1);
+    }
+    for (unsigned k = 0; k < 4; k++) {
+        t[2 * k] = _mm512_unpacklo_ps(z[2 * k], z[2 * k + 1]);
+        t[2 * k + 1] = _mm512_unpackhi_ps(z[2 * k], z[2 * k + 1]);
+    }
+    u[0] = _mm512_shuffle_ps(t[0], t[2], _MM_SHUFFLE(1, 0, 1, 0));
+    u[1] = _mm512_shuffle_ps(t[0], t[2], _MM_SHUFFLE(3, 2, 3, 2));
+    u[2] = _mm512_shuffle_ps(t[1], t[3], _MM_SHUFFLE(1, 0, 1, 0));
+    u[3] = _mm512_shuffle_ps(t[1], t[3], _MM_SHUFFLE(3, 2, 3, 2));
+    u[4] = _mm512_shuffle_ps(t[4], t[6], _MM_SHUFFLE(1, 0, 1, 0));
+    u[5] = _mm512_shuffle_ps(t[4], t[6], _MM_SHUFFLE(3, 2, 3, 2));
+    u[6] = _mm512_shuffle_ps(t[5], t[7], _MM_SHUFFLE(1, 0, 1, 0));
+    u[7] = _mm512_shuffle_ps(t[5], t[7], _MM_SHUFFLE(3, 2, 3, 2));
+    /* u[j] lane 0: column j rows 0-3, lane 1: column j + 4 rows 0-3, lanes
+     * 2-3 the same for rows 8-11; u[j + 4] holds rows 4-7 and 12-15. */
+    const __m512i lo_idx = _mm512_set_epi32(27, 26, 25, 24, 11, 10, 9, 8, 19, 18, 17, 16, 3, 2, 1, 0);
+    const __m512i hi_idx = _mm512_set_epi32(31, 30, 29, 28, 15, 14, 13, 12, 23, 22, 21, 20, 7, 6, 5, 4);
+    for (unsigned j = 0; j < 4; j++) {
+        _mm512_storeu_ps(wc + (i + j) * COMP_TILE_ROWS, _mm512_permutex2var_ps(u[j], lo_idx, u[j + 4]));
+        _mm512_storeu_ps(wc + (i + j + 4) * COMP_TILE_ROWS, _mm512_permutex2var_ps(u[j], hi_idx, u[j + 4]));
+    }
 }
 
 static void compressor_tile_pack_worker(void *vctx, uint64_t t0, uint64_t t1) {
@@ -16345,9 +16378,8 @@ static void compressor_tile_pack_worker(void *vctx, uint64_t t0, uint64_t t1) {
 static void compressor_tile_worker(void *vctx, uint64_t i0, uint64_t i1) {
     const compressor_tile_ctx *ctx = vctx;
     const uint64_t n = ctx->in_dim;
-    const uint64_t ws = ctx->wf_stride;
     const uint64_t n_rg = ((uint64_t)ctx->width + COMP_TILE_ROWS - 1) / COMP_TILE_ROWS;
-    float *wf = ctx->wf + (uint64_t)g_pool_thread * COMP_TILE_ROWS * ws;
+    float *wf = ctx->wf + (uint64_t)g_pool_thread * compressor_tile_wf_floats(n);
     for (uint64_t item = i0; item < i1; item++) {
         /* Tile block outer: the threads claim consecutive items, so they
          * share one tile block (1 MB of activations) from L3 while each
@@ -16358,13 +16390,12 @@ static void compressor_tile_worker(void *vctx, uint64_t i0, uint64_t i1) {
         const uint64_t rg = item - tb * n_rg;
         const uint64_t o = rg * COMP_TILE_ROWS;
         const uint64_t n_rows = ctx->width - o < COMP_TILE_ROWS ? ctx->width - o : COMP_TILE_ROWS;
-        for (uint64_t r = 0; r < COMP_TILE_ROWS; r++) {
-            const uint16_t *row = ctx->w + (o + (r < n_rows ? r : 0)) * n;
-            uint64_t i = 0;
-            for (; i + 8 <= n; i += 8) {
-                _mm256_storeu_ps(wf + r * ws + i, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(row + i))));
-            }
-            for (; i < n; i++) wf[r * ws + i] = f16_to_f32(row[i]);
+        const uint16_t *rows[COMP_TILE_ROWS];
+        for (uint64_t r = 0; r < COMP_TILE_ROWS; r++) rows[r] = ctx->w + (o + (r < n_rows ? r : 0)) * n;
+        uint64_t i = 0;
+        for (; i + 8 <= n; i += 8) compressor_tile_convert8(wf, rows, i);
+        for (; i < n; i++) {
+            for (uint64_t r = 0; r < COMP_TILE_ROWS; r++) wf[i * COMP_TILE_ROWS + r] = f16_to_f32(rows[r][i]);
         }
         const uint64_t tile_hi = (tb + 1) * COMP_TILE_BLOCK < ctx->n_tiles ? (tb + 1) * COMP_TILE_BLOCK : ctx->n_tiles;
         for (uint64_t tile = tb * COMP_TILE_BLOCK; tile < tile_hi; tile++) {
@@ -16373,8 +16404,9 @@ static void compressor_tile_worker(void *vctx, uint64_t i0, uint64_t i1) {
             for (unsigned r = 0; r < COMP_TILE_ROWS; r++) acc[r] = _mm512_setzero_ps();
             for (uint64_t i = 0; i < n; i++) {
                 const __m512 xv = _mm512_loadu_ps(xt + i * 16);
+                const float *wc = wf + i * COMP_TILE_ROWS;
                 for (unsigned r = 0; r < COMP_TILE_ROWS; r++) {
-                    acc[r] = _mm512_add_ps(acc[r], _mm512_mul_ps(_mm512_set1_ps(wf[r * ws + i]), xv));
+                    acc[r] = _mm512_add_ps(acc[r], _mm512_mul_ps(_mm512_set1_ps(wc[r]), xv));
                 }
             }
             for (uint64_t r = 0; r < n_rows; r++) {
@@ -16392,12 +16424,11 @@ static uint32_t compressor_project_tiles(float *out, const uint16_t *w, const fl
                                          uint32_t n_tok, bool pack) {
     compressor_tile_ctx ctx = {
         .out = (float *)x, .w = w, .xt = xt, .in_dim = in_dim, .width = width, .n_tiles = n_tok / 16,
-        .wf_stride = compressor_tile_wf_stride(in_dim),
     };
     if (ctx.n_tiles == 0) return 0;
     if (pack) ds4_parallel_for_min_rows(ctx.n_tiles, compressor_tile_pack_worker, &ctx, 1);
     ctx.out = out;
-    ctx.wf = pf_buf(PF_COMP_WF, (size_t)ds4_pool_threads() * COMP_TILE_ROWS * ctx.wf_stride * sizeof(float));
+    ctx.wf = pf_buf(PF_COMP_WF, (size_t)ds4_pool_threads() * compressor_tile_wf_floats(in_dim) * sizeof(float));
     const uint64_t items = (uint64_t)(width + COMP_TILE_ROWS - 1) / COMP_TILE_ROWS *
                            ((ctx.n_tiles + COMP_TILE_BLOCK - 1) / COMP_TILE_BLOCK);
     ds4_parallel_for_items(items, compressor_tile_worker, &ctx);
