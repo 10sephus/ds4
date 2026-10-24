@@ -12572,16 +12572,16 @@ static inline __m512i moe_bcast_u8x4(const uint8_t *p) {
  * stays in L1 while the rows stream from L2 once per tile. */
 static inline void moe_iq2_xxs_decode_row_sb(const block_iq2_xxs *x, uint32_t nb, uint32_t n_rows, uint32_t r,
                                              uint8_t *w, int32_t *ls, float *ds) {
+    /* lsv holds each sub-block's scale in both of its dword lanes. */
+    const __m512i even = _mm512_set_epi32(14, 12, 10, 8, 6, 4, 2, 0, 14, 12, 10, 8, 6, 4, 2, 0);
     for (uint32_t i = 0; i < nb; i++) {
         __m512i u[4], lsv;
-        int32_t lanes[16];
         iq2xxs_block_weights(x + i, u, &lsv);
         uint8_t *wi = w + ((size_t)i * n_rows + r) * QK_K;
         for (int s = 0; s < 4; s++) _mm512_storeu_si512((void *)(wi + s * 64), u[s]);
-        _mm512_storeu_si512((void *)lanes, lsv);
-        int32_t *li = ls + ((size_t)i * n_rows + r) * (QK_K / 32);
-        for (int ib = 0; ib < QK_K / 32; ib++) li[ib] = lanes[2 * ib];
-        ds[(size_t)i * n_rows + r] = f16_to_f32(x[i].d);
+        _mm256_storeu_si256((__m256i *)(ls + ((size_t)i * n_rows + r) * (QK_K / 32)),
+                            _mm512_castsi512_si256(_mm512_permutexvar_epi32(even, lsv)));
+        ds[(size_t)i * n_rows + r] = q8_0_scale_f32(x[i].d);
     }
 }
 
@@ -12620,12 +12620,12 @@ static inline void moe_q2_k_decode_row_sb(const block_q2_K *x, uint32_t nb, uint
                                           uint8_t *w, int32_t *ms, float *dd, float *dm) {
     for (uint32_t i = 0; i < nb; i++) {
         moe_q2_k_decode(x + i, w + ((size_t)i * n_rows + r) * QK_K);
-        int32_t *mi = ms + ((size_t)i * n_rows + r) * (QK_K / 32);
-        for (int p = 0; p < QK_K / 32; p++) {
-            mi[p] = (x[i].scales[2 * p] >> 4) | ((x[i].scales[2 * p + 1] >> 4) << 16);
-        }
-        dd[(size_t)i * n_rows + r] = f16_to_f32(x[i].d);
-        dm[(size_t)i * n_rows + r] = f16_to_f32(x[i].dmin);
+        /* Minimum pair p as one dword: the high nibbles of scales 2p and
+         * 2p + 1 in its two words. */
+        const __m256i mins = _mm256_srli_epi16(_mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)x[i].scales)), 4);
+        _mm256_storeu_si256((__m256i *)(ms + ((size_t)i * n_rows + r) * (QK_K / 32)), mins);
+        dd[(size_t)i * n_rows + r] = q8_0_scale_f32(x[i].d);
+        dm[(size_t)i * n_rows + r] = q8_0_scale_f32(x[i].dmin);
     }
 }
 #endif
