@@ -12500,11 +12500,78 @@ typedef struct {
 #define DS4_MOE_TILE_Q_STRIDE  (QK_K * DS4_MOE_TILE)
 #define DS4_MOE_TILE_BS_STRIDE (QK_K / 16 * DS4_MOE_TILE)
 
+#if defined(DS4_NO_GPU) && defined(__AVX512F__)
+/* r[i] becomes the column i of the 16x16 block whose row l was r[l]: unpack
+ * pairs, then quads, then 128-bit lanes.  Pure data movement. */
+static inline void transpose16_ps(__m512 r[16]) {
+    __m512 t[16];
+    for (uint32_t k = 0; k < 16; k += 2) {
+        t[k] = _mm512_unpacklo_ps(r[k], r[k + 1]);
+        t[k + 1] = _mm512_unpackhi_ps(r[k], r[k + 1]);
+    }
+    for (uint32_t k = 0; k < 16; k += 4) {
+        r[k] = _mm512_castpd_ps(_mm512_unpacklo_pd(_mm512_castps_pd(t[k]), _mm512_castps_pd(t[k + 2])));
+        r[k + 1] = _mm512_castpd_ps(_mm512_unpackhi_pd(_mm512_castps_pd(t[k]), _mm512_castps_pd(t[k + 2])));
+        r[k + 2] = _mm512_castpd_ps(_mm512_unpacklo_pd(_mm512_castps_pd(t[k + 1]), _mm512_castps_pd(t[k + 3])));
+        r[k + 3] = _mm512_castpd_ps(_mm512_unpackhi_pd(_mm512_castps_pd(t[k + 1]), _mm512_castps_pd(t[k + 3])));
+    }
+    for (uint32_t k = 0; k < 4; k++) {
+        t[k] = _mm512_shuffle_f32x4(r[k], r[k + 4], 0x88);
+        t[k + 4] = _mm512_shuffle_f32x4(r[k], r[k + 4], 0xdd);
+        t[k + 8] = _mm512_shuffle_f32x4(r[k + 8], r[k + 12], 0x88);
+        t[k + 12] = _mm512_shuffle_f32x4(r[k + 8], r[k + 12], 0xdd);
+    }
+    for (uint32_t k = 0; k < 8; k++) {
+        r[k] = _mm512_shuffle_f32x4(t[k], t[k + 8], 0x88);
+        r[k + 8] = _mm512_shuffle_f32x4(t[k], t[k + 8], 0xdd);
+    }
+}
+#endif
+
 /* Interleave the lanes' Q8_K rows for vpdpbusd.  Natural order (down): the
  * 64 four-byte groups m of a superblock hold elements 4m..4m+3.  IQ2_XXS
  * order (gate/up): group 16s + m holds elements 16m + s + {0, 4, 8, 12},
- * the dword m of weight vector s that iq2xxs_block_weights() produces. */
+ * the dword m of weight vector s that iq2xxs_block_weights() produces,
+ * which is dword 16s + m of the lane's iq2xxs_q8 row.  Either way a
+ * superblock's groups are the transpose of the lanes' 64 group dwords, done
+ * sixteen groups at a time in registers (pure data movement), and the
+ * block-sum pairs the transpose of their eight dwords. */
 static void moe_tile_pack(ds4_moe_tile *t, uint32_t nb, bool iq2_order) {
+#if DS4_MOE_X16
+    static const int8_t zeros[QK_K];
+    for (uint32_t i = 0; i < nb; i++) {
+        int8_t *q = t->q + (size_t)i * DS4_MOE_TILE_Q_STRIDE;
+        float *d = t->d + (size_t)i * DS4_MOE_TILE;
+        int16_t *bs = t->bsums + (size_t)i * DS4_MOE_TILE_BS_STRIDE;
+        const int8_t *qsrc[DS4_MOE_TILE];
+        const int16_t *bsrc[DS4_MOE_TILE];
+        for (uint32_t lane = 0; lane < DS4_MOE_TILE; lane++) {
+            if (lane >= t->n) {
+                d[lane] = 0.0f;
+                qsrc[lane] = zeros;
+                bsrc[lane] = (const int16_t *)zeros;
+                continue;
+            }
+            const block_q8_K *b = t->row[lane] + i;
+            d[lane] = b->d;
+            qsrc[lane] = iq2_order ? &t->iq2[lane][i].qs[0][0] : b->qs;
+            bsrc[lane] = b->bsums;
+        }
+        __m512 v[16];
+        for (uint32_t g0 = 0; g0 < QK_K / 4; g0 += 16) {
+            for (uint32_t lane = 0; lane < DS4_MOE_TILE; lane++) {
+                v[lane] = _mm512_loadu_ps((const float *)(qsrc[lane] + g0 * 4));
+            }
+            transpose16_ps(v);
+            for (uint32_t k = 0; k < 16; k++) _mm512_storeu_ps((float *)(q + (g0 + k) * 64), v[k]);
+        }
+        for (uint32_t lane = 0; lane < DS4_MOE_TILE; lane++) {
+            v[lane] = _mm512_castpd_ps(_mm512_zextpd256_pd512(_mm256_loadu_pd((const double *)bsrc[lane])));
+        }
+        transpose16_ps(v);
+        for (uint32_t k = 0; k < QK_K / 32; k++) _mm512_storeu_ps((float *)(bs + k * 2 * DS4_MOE_TILE), v[k]);
+    }
+#else
     for (uint32_t i = 0; i < nb; i++) {
         int8_t *q = t->q + (size_t)i * DS4_MOE_TILE_Q_STRIDE;
         float *d = t->d + (size_t)i * DS4_MOE_TILE;
@@ -12530,6 +12597,7 @@ static void moe_tile_pack(ds4_moe_tile *t, uint32_t nb, bool iq2_order) {
             for (uint32_t g = 0; g < QK_K / 16; g++) bs[(g / 2 * DS4_MOE_TILE + lane) * 2 + (g & 1)] = b->bsums[g];
         }
     }
+#endif
 }
 
 typedef struct {
@@ -14052,34 +14120,6 @@ typedef struct {
     uint32_t     n_embd;
     uint32_t     n_hc;
 } hc_post_batch_ctx;
-
-#if defined(DS4_NO_GPU) && defined(__AVX512F__)
-/* r[i] becomes the column i of the 16x16 block whose row l was r[l]: unpack
- * pairs, then quads, then 128-bit lanes.  Pure data movement. */
-static inline void transpose16_ps(__m512 r[16]) {
-    __m512 t[16];
-    for (uint32_t k = 0; k < 16; k += 2) {
-        t[k] = _mm512_unpacklo_ps(r[k], r[k + 1]);
-        t[k + 1] = _mm512_unpackhi_ps(r[k], r[k + 1]);
-    }
-    for (uint32_t k = 0; k < 16; k += 4) {
-        r[k] = _mm512_castpd_ps(_mm512_unpacklo_pd(_mm512_castps_pd(t[k]), _mm512_castps_pd(t[k + 2])));
-        r[k + 1] = _mm512_castpd_ps(_mm512_unpackhi_pd(_mm512_castps_pd(t[k]), _mm512_castps_pd(t[k + 2])));
-        r[k + 2] = _mm512_castpd_ps(_mm512_unpacklo_pd(_mm512_castps_pd(t[k + 1]), _mm512_castps_pd(t[k + 3])));
-        r[k + 3] = _mm512_castpd_ps(_mm512_unpackhi_pd(_mm512_castps_pd(t[k + 1]), _mm512_castps_pd(t[k + 3])));
-    }
-    for (uint32_t k = 0; k < 4; k++) {
-        t[k] = _mm512_shuffle_f32x4(r[k], r[k + 4], 0x88);
-        t[k + 4] = _mm512_shuffle_f32x4(r[k], r[k + 4], 0xdd);
-        t[k + 8] = _mm512_shuffle_f32x4(r[k + 8], r[k + 12], 0x88);
-        t[k + 12] = _mm512_shuffle_f32x4(r[k + 8], r[k + 12], 0xdd);
-    }
-    for (uint32_t k = 0; k < 8; k++) {
-        r[k] = _mm512_shuffle_f32x4(t[k], t[k + 8], 0x88);
-        r[k + 8] = _mm512_shuffle_f32x4(t[k], t[k + 8], 0xdd);
-    }
-}
-#endif
 
 static void hc_post_batch_worker(void *vctx, uint64_t t0, uint64_t t1) {
     hc_post_batch_ctx *ctx = vctx;
