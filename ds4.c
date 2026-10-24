@@ -1557,6 +1557,8 @@ enum {
     PF_MOE_XQ, PF_MOE_XQ_IQ2, PF_MOE_MID, PF_MOE_MIDQ, PF_MOE_DOWN, PF_MOE_SCRATCH,
     PF_MOE_TILES, PF_MOE_TILE_Q, PF_MOE_TILE_D, PF_MOE_TILE_BS, PF_MOE_GROUPS,
     PF_Q8_XQ, PF_Q8_XS, PF_Q8_TILES_XQ, PF_Q8_TILES_XS, PF_OUT_LOW, PF_COMP_XT, PF_COMP_WF,
+    PF_COMP_ROWS, PF_COMP_SCORES, PF_COMP_SNAP, PF_COMP_EMIT, PF_INDEX_ROWS, PF_INDEX_SCORES,
+    PF_ROUTER_LOGITS,
     PF_BUF_COUNT
 };
 
@@ -15763,13 +15765,12 @@ static void moe_route_batch(
         .norm = norm,
         .token_ids = token_ids,
     };
-    float *logits = NULL;
 #if defined(DS4_NO_GPU) && defined(__AVX512F__) && defined(__F16C__)
     const ds4_tensor *gate_inp = layer->ffn_gate_inp;
     const uint64_t in_dim = DS4_N_EMBD;
     if (gate_inp->type == 1 && gate_inp->ndim == 2 && gate_inp->dim[0] == in_dim &&
         gate_inp->dim[1] == DS4_N_EXPERT && n_tok >= 16) {
-        logits = xmalloc((size_t)(n_tok / 16) * 16 * DS4_N_EXPERT * sizeof(logits[0]));
+        float *logits = pf_buf(PF_ROUTER_LOGITS, (size_t)(n_tok / 16) * 16 * DS4_N_EXPERT * sizeof(logits[0]));
         float *xt = pf_buf(PF_COMP_XT, (size_t)(n_tok / 16) * 16 * in_dim * sizeof(float));
         route_ctx.logits = logits;
         route_ctx.n_logits = compressor_project_tiles(logits, tensor_data(model, gate_inp), norm, xt,
@@ -15777,7 +15778,6 @@ static void moe_route_batch(
     }
 #endif
     ds4_parallel_for_min_rows(n_tok, moe_route_worker, &route_ctx, 1);
-    free(logits);
 }
 
 /* Prefill routed MoE for IQ2_XXS gate/up and Q2_K down experts (the caller
@@ -18925,18 +18925,18 @@ static void layer_attention_raw_swa_batch(
 
     if (ratio != 0) {
         tx = profile ? now_sec() : 0.0;
-        comp_rows = xmalloc((size_t)n_tok * comp_width * sizeof(comp_rows[0]));
-        comp_scores = xmalloc((size_t)n_tok * comp_width * sizeof(comp_scores[0]));
+        comp_rows = pf_buf(PF_COMP_ROWS, (size_t)n_tok * comp_width * sizeof(comp_rows[0]));
+        comp_scores = pf_buf(PF_COMP_SCORES, (size_t)n_tok * comp_width * sizeof(comp_scores[0]));
         compressor_project_batch(comp_rows, comp_scores, model,
                                  layer->attn_compressor_kv,
                                  layer->attn_compressor_gate,
                                  attn_norm, n_tok);
         ape_rows = compressor_ape_rows(model, layer->attn_compressor_ape, comp_width, ratio);
-        snapshots = xmalloc((size_t)(n_tok / ratio + 1) * compressor_snapshot_floats(DS4_N_HEAD_DIM, ratio) * sizeof(snapshots[0]));
+        snapshots = pf_buf(PF_COMP_SNAP, (size_t)(n_tok / ratio + 1) * compressor_snapshot_floats(DS4_N_HEAD_DIM, ratio) * sizeof(snapshots[0]));
         emit_pos = xmalloc((size_t)(n_tok / ratio + 1) * sizeof(emit_pos[0]));
         if (ratio == 4) {
-            index_rows = xmalloc((size_t)n_tok * index_width * sizeof(index_rows[0]));
-            index_scores = xmalloc((size_t)n_tok * index_width * sizeof(index_scores[0]));
+            index_rows = pf_buf(PF_INDEX_ROWS, (size_t)n_tok * index_width * sizeof(index_rows[0]));
+            index_scores = pf_buf(PF_INDEX_SCORES, (size_t)n_tok * index_width * sizeof(index_scores[0]));
             compressor_project_batch(index_rows, index_scores, model,
                                      layer->indexer_compressor_kv,
                                      layer->indexer_compressor_gate,
@@ -18956,7 +18956,7 @@ static void layer_attention_raw_swa_batch(
         n_emit = compressor_update_batch(ape_rows, comp_rows, comp_scores,
                                          cache->attn_state_kv, cache->attn_state_score,
                                          DS4_N_HEAD_DIM, ratio, pos0, n_tok, snapshots, emit_pos);
-        float *emitted = xmalloc((size_t)(n_emit + 1) * DS4_N_HEAD_DIM * sizeof(emitted[0]));
+        float *emitted = pf_buf(PF_COMP_EMIT, (size_t)(n_emit + 1) * DS4_N_HEAD_DIM * sizeof(emitted[0]));
         compressor_emit_deferred(emitted, snapshots, emit_pos, n_emit, model,
                                  layer->attn_compressor_norm, DS4_N_HEAD_DIM, ratio, il);
         for (uint32_t w = 0; w < n_emit; w++) {
@@ -18977,7 +18977,6 @@ static void layer_attention_raw_swa_batch(
             }
             free(index_ape);
         }
-        free(emitted);
         if (profile) t_tl_compress += now_sec() - tx;
     }
 
@@ -19064,13 +19063,8 @@ static void layer_attention_raw_swa_batch(
         }
     }
 
-    free(index_scores);
-    free(index_rows);
-    free(comp_scores);
-    free(comp_rows);
     free(ape_rows);
     free(emit_pos);
-    free(snapshots);
     free(allowed_bits);
     free(allowed_mask);
     free(comp_counts);
