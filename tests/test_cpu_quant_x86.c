@@ -1830,11 +1830,14 @@ static void check_compressor_project_batch_shape(uint32_t width, uint32_t n_tok)
     quant_free(wb);
 }
 
-/* The deferred prefill compressor (update, snapshot, parallel emit) against
- * the streaming update token by token: emitted rows, scores, state and the
- * emit count bitwise, from a mid-window start and with empty score rows. */
-static void check_compressor_deferred_shape(uint32_t head_dim, uint32_t pos0, uint32_t n_tok) {
-    const uint32_t ratio = 4, width = 2 * head_dim, rows = 2 * ratio;
+/* The batched compressor update (parallel snapshots and final state) and its
+ * parallel emits against the streaming update token by token: emitted rows,
+ * scores, final state and emit count bitwise, for ratio 4 and 128, from
+ * window starts, mid-window starts and with several windows per batch. */
+static void check_compressor_batch_shape(uint32_t head_dim, uint32_t ratio, uint32_t pos0, uint32_t n_tok) {
+    const ds4_shape saved = g_ds4_shape;
+    g_ds4_shape = DS4_SHAPE_FLASH;
+    const uint32_t width = (ratio == 4 ? 2u : 1u) * head_dim, rows = ratio == 4 ? 2u * ratio : ratio;
     const size_t ape_bytes = (size_t)width * ratio * sizeof(uint16_t);
     const size_t norm_bytes = (size_t)head_dim * sizeof(float);
     quant_buffer wb = quant_alloc(ape_bytes + norm_bytes);
@@ -1855,10 +1858,9 @@ static void check_compressor_deferred_shape(uint32_t head_dim, uint32_t pos0, ui
     for (uint64_t i = 0; i < n; i++) { kv[i] = quant_float(); sc_a[i] = sc_b[i] = quant_float(); }
     for (uint64_t i = 0; i < st; i++) {
         st_kv_a[i] = st_kv_b[i] = quant_float();
-        /* The second half's rows past pos0's window start are empty, as
-         * compressor_finish_prefill_state_cpu leaves them. */
         const uint32_t r = (uint32_t)(i / width);
-        st_sc_a[i] = st_sc_b[i] = r >= ratio + pos0 % ratio ? DS4_NEG_INF : quant_float();
+        const uint32_t first_empty = ratio == 4 ? ratio + pos0 % ratio : pos0 % ratio;
+        st_sc_a[i] = st_sc_b[i] = r >= first_empty ? DS4_NEG_INF : quant_float();
     }
 
     const uint32_t cap = n_tok / ratio + 2;
@@ -1876,36 +1878,44 @@ static void check_compressor_deferred_shape(uint32_t head_dim, uint32_t pos0, ui
     const uint64_t snap = compressor_snapshot_floats(head_dim, ratio);
     float *snapshots = xmalloc((size_t)(n_tok / ratio + 1) * snap * sizeof(float));
     uint32_t *emit_pos = xmalloc((size_t)(n_tok / ratio + 1) * sizeof(uint32_t));
-    uint32_t n_b = 0;
-    for (uint32_t tk = 0; tk < n_tok; tk++) {
-        if (compressor_update_deferred(ape_rows, kv + (uint64_t)tk * width, sc_b + (uint64_t)tk * width,
-                                       st_kv_b, st_sc_b, head_dim, ratio, pos0 + tk, snapshots + n_b * snap)) {
-            emit_pos[n_b++] = pos0 + tk;
-        }
-    }
+    const uint32_t n_b = compressor_update_batch(ape_rows, kv, sc_b, st_kv_b, st_sc_b, head_dim, ratio,
+                                                 pos0, n_tok, snapshots, emit_pos);
     CHECK(n_b == n_a);
     float *emitted = xmalloc((size_t)(n_b + 1) * head_dim * sizeof(float));
     compressor_emit_deferred(emitted, snapshots, emit_pos, n_b, &m, &tnorm, head_dim, ratio, 3);
     uint32_t n_pushed = 0;
     for (uint32_t w = 0; w < n_b; w++) kv_cache_push_comp(comp_b, &n_pushed, cap, head_dim, emitted + (uint64_t)w * head_dim);
 
-    for (uint64_t i = 0; i < (uint64_t)n_a * head_dim; i++) quant_bits_equal("deferred compressor row", comp_a[i], comp_b[i], (unsigned)i);
-    for (uint64_t i = 0; i < n; i++) quant_bits_equal("deferred compressor score", sc_a[i], sc_b[i], (unsigned)i);
+    for (uint64_t i = 0; i < (uint64_t)n_a * head_dim; i++) quant_bits_equal("batched compressor row", comp_a[i], comp_b[i], (unsigned)i);
+    for (uint64_t i = 0; i < n; i++) quant_bits_equal("batched compressor score", sc_a[i], sc_b[i], (unsigned)i);
     for (uint64_t i = 0; i < st; i++) {
-        quant_bits_equal("deferred compressor state kv", st_kv_a[i], st_kv_b[i], (unsigned)i);
-        quant_bits_equal("deferred compressor state score", st_sc_a[i], st_sc_b[i], (unsigned)i);
+        quant_bits_equal("batched compressor state kv", st_kv_a[i], st_kv_b[i], (unsigned)i);
+        quant_bits_equal("batched compressor state score", st_sc_a[i], st_sc_b[i], (unsigned)i);
     }
     free(emitted); free(emit_pos); free(snapshots); free(ape_rows); free(out); free(comp_b); free(comp_a);
     free(st_sc_b); free(st_kv_b); free(st_sc_a); free(st_kv_a); free(sc_b); free(sc_a); free(kv);
     quant_free(wb);
+    g_ds4_shape = saved;
 }
 
 static void check_compressor_deferred(void) {
-    check_compressor_deferred_shape(512, 0, 23);
-    check_compressor_deferred_shape(512, 2, 17);
-    check_compressor_deferred_shape(128, 7, 30);
-    check_compressor_deferred_shape(128, 1, 3);
-    printf("CPU deferred prefill compressor bitwise with the streaming update PASS\n");
+    const uint32_t threads[] = {1, 3, 16};
+    for (unsigned k = 0; k < 3; k++) {
+        g_requested_threads = threads[k];
+        check_compressor_batch_shape(512, 4, 0, 23);
+        check_compressor_batch_shape(512, 4, 2, 17);
+        check_compressor_batch_shape(512, 4, 5, 1);
+        check_compressor_batch_shape(128, 4, 7, 30);
+        check_compressor_batch_shape(128, 4, 1, 3);
+        check_compressor_batch_shape(128, 4, 4, 4);
+        check_compressor_batch_shape(512, 128, 0, 300);
+        check_compressor_batch_shape(512, 128, 130, 200);
+        check_compressor_batch_shape(512, 128, 127, 1);
+        check_compressor_batch_shape(512, 128, 5, 60);
+        ds4_threads_shutdown();
+    }
+    g_requested_threads = 0;
+    printf("CPU batched prefill compressor update bitwise with the streaming update PASS\n");
 }
 
 static void check_compressor_project_batch(void) {
