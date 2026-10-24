@@ -14675,8 +14675,18 @@ static void hc_pre_norm_batch(
     };
 #if defined(DS4_NO_GPU) && defined(__AVX512F__) && defined(__F16C__)
     if (hc_pre_norm_lanes_ok(&ctx)) {
-        ctx.n_lanes = n_tok / 16;
-        ds4_parallel_for_min_rows(ctx.n_lanes + n_tok % 16, hc_pre_norm_items_worker, &ctx, 1);
+        /* Sixteen-token groups first, then single tokens, which cost about
+         * a sixth of a group each: enough of them that the threads without
+         * a group in the last round of groups stay busy instead of
+         * parking (a parked thread is slow to wake on a loaded host). */
+        const uint64_t n_threads = ds4_pool_threads();
+        uint64_t n_lanes = n_tok / 16;
+        while (n_lanes > 0 && n_lanes % n_threads != 0 &&
+               n_tok - 16 * n_lanes < 6 * (n_threads - n_lanes % n_threads)) {
+            n_lanes--;
+        }
+        ctx.n_lanes = n_lanes;
+        ds4_parallel_for_min_rows(n_lanes + (n_tok - 16 * n_lanes), hc_pre_norm_items_worker, &ctx, 1);
         return;
     }
 #endif
