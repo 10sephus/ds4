@@ -807,36 +807,52 @@ static void ds41_cpu_f16_batch2_worker(void *vctx, uint64_t first, uint64_t last
 }
 
 /* Few rows, such as the 24 of an HC mixer or the 32 of the indexer weights,
- * for many tokens: a unit is a tile and a block of 16 tokens, so the rows
- * still give every thread work.  Lanes past the last row read that row
- * again and are not stored. */
+ * for many tokens: a unit is a pair of tiles and a block of eight tokens,
+ * so the rows still give every thread work and both tiles share each read
+ * of the tokens' inputs (80 KiB per token for an HC mixer).  Lanes past
+ * the last row read that row again and are not stored. */
 static void ds41_cpu_f16_batch_small_worker(void *vctx, uint64_t first, uint64_t last) {
     const ds41_cpu_f16_batch_ctx *c = vctx;
-    const uint32_t blocks = (c->n + 15) / 16;
-    __m512 w[32], acc[16];
-    const float *xp[16];
+    const uint32_t blocks = (c->n + 7) / 8;
+    __m512 wa[32], wb[32], acca[8], accb[8];
+    const float *xp[8];
     for (uint64_t unit = first; unit < last; unit++) {
-        const uint64_t row = unit / blocks * 16;
-        const uint32_t t0 = (uint32_t)(unit % blocks) * 16;
-        const uint32_t nt = c->n - t0 < 16 ? c->n - t0 : 16;
-        const uint32_t valid = c->rows - row < 16 ? (uint32_t)(c->rows - row) : 16;
-        int32_t off[16];
-        for (uint32_t r = 0; r < 16; r++)
-            off[r] = (int32_t)((r < valid ? r : valid - 1) * c->row_bytes);
-        const __m512i offsets = _mm512_loadu_si512(off);
-        const __mmask16 store = (__mmask16)((1u << valid) - 1u);
+        const uint64_t row = unit / blocks * 32;
+        const uint32_t t0 = (uint32_t)(unit % blocks) * 8;
+        const uint32_t nt = c->n - t0 < 8 ? c->n - t0 : 8;
+        __m512i offsets[2];
+        __mmask16 store[2];
+        uint32_t valid[2];
+        for (unsigned k = 0; k < 2; k++) {
+            const uint64_t r0 = row + 16u * k;
+            valid[k] = r0 >= c->rows ? 0 : c->rows - r0 < 16 ? (uint32_t)(c->rows - r0) : 16;
+            int32_t off[16];
+            for (uint32_t r = 0; r < 16; r++)
+                off[r] = (int32_t)((r < valid[k] ? r : valid[k] ? valid[k] - 1 : 0) * c->row_bytes);
+            offsets[k] = _mm512_loadu_si512(off);
+            store[k] = (__mmask16)((1u << valid[k]) - 1u);
+        }
         const uint8_t *rows = c->data + row * c->row_bytes;
         for (uint32_t t = 0; t < nt; t++) {
-            acc[t] = _mm512_setzero_ps();
+            acca[t] = accb[t] = _mm512_setzero_ps();
             xp[t] = c->x + (uint64_t)(t0 + t) * c->x_stride;
         }
         for (uint64_t i = 0; i < c->in_dim; i += 32) {
-            ds41_cpu_f16_decode16(w, rows + 2 * i, offsets);
-            ds41_cpu_apply16(acc, w, xp, nt, i, 32);
+            ds41_cpu_f16_decode16(wa, rows + 2 * i, offsets[0]);
+            if (valid[1]) {
+                ds41_cpu_f16_decode16(wb, rows + 16 * c->row_bytes + 2 * i, offsets[1]);
+                ds41_cpu_apply16x2(acca, accb, wa, wb, xp, nt, i, 32);
+            } else {
+                ds41_cpu_apply16(acca, wa, xp, nt, i, 32);
+            }
         }
-        for (uint32_t t = 0; t < nt; t++)
-            _mm512_mask_storeu_ps(c->out + (uint64_t)(t0 + t) * c->out_stride + row, store,
-                                  c->round ? ds41_cpu_bf16_16(acc[t]) : acc[t]);
+        for (uint32_t t = 0; t < nt; t++) {
+            float *out = c->out + (uint64_t)(t0 + t) * c->out_stride + row;
+            _mm512_mask_storeu_ps(out, store[0], c->round ? ds41_cpu_bf16_16(acca[t]) : acca[t]);
+            if (valid[1])
+                _mm512_mask_storeu_ps(out + 16, store[1],
+                                      c->round ? ds41_cpu_bf16_16(accb[t]) : accb[t]);
+        }
     }
 }
 
@@ -1135,7 +1151,7 @@ static bool ds41_cpu_matmul_f16(float *out, uint64_t out_stride, const ds4_model
     /* Matrices of fewer tiles than threads by token blocks too. */
     ds4_threads_init();
     if (rows % 16 || rows / 16 < g_pool.n_threads)
-        ds4_parallel_for_min_rows((rows + 15) / 16 * ((n + 15) / 16),
+        ds4_parallel_for_min_rows((rows + 31) / 32 * ((n + 7) / 8),
                                   ds41_cpu_f16_batch_small_worker, &ctx, 1);
     else if (rows % 32 == 0 && rows / 32 >= g_pool.n_threads)
         ds4_parallel_for_min_rows(rows / 32, ds41_cpu_f16_batch2_worker, &ctx, 1);
