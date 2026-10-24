@@ -696,6 +696,27 @@ static void check_f32_batch(void) {
     }
 }
 
+/* The batch's mid rows back in entry order: the dispatcher splits each
+ * expert's entries into nearly equal runs of at most DS41_CPU_PASS, and a
+ * run of len entries from k0 holds them transposed from k0 * hidden. */
+static void routed_mid_rows(float *rows, const float *mid, const uint32_t *entry,
+                            const int *selected, uint32_t pairs, uint32_t hidden) {
+    for (uint32_t k = 0; k < pairs;) {
+        uint32_t e = k;
+        while (e < pairs && selected[entry[e]] == selected[entry[k]]) e++;
+        const uint32_t runs = (e - k + DS41_CPU_PASS - 1) / DS41_CPU_PASS;
+        for (uint32_t r = 0, k0 = k; r < runs; r++) {
+            const uint32_t len = (e - k0 + runs - r - 1) / (runs - r);
+            for (uint32_t t = 0; t < len; t++)
+                for (uint32_t i = 0; i < hidden; i++)
+                    rows[(size_t)entry[k0 + t] * hidden + i] =
+                        mid[(size_t)k0 * hidden + (size_t)i * len + t];
+            k0 += len;
+        }
+        k = e;
+    }
+}
+
 static void check_routed_batch(uint32_t embd, uint32_t hidden, float clamp) {
     g_ds4_shape = DS4_SHAPE_FLASH41;
     g_ds4_shape.n_embd = embd;
@@ -727,13 +748,14 @@ static void check_routed_batch(uint32_t embd, uint32_t hidden, float clamp) {
         float *x = malloc((size_t)nt * embd * sizeof(float));
         float *ma = malloc((size_t)nt * 3 * hidden * sizeof(float));
         float *mb = malloc((size_t)nt * 3 * hidden * sizeof(float));
+        float *mr = malloc((size_t)nt * 3 * hidden * sizeof(float));
         float *oa = malloc((size_t)nt * embd * sizeof(float));
         float *ob = malloc((size_t)nt * embd * sizeof(float));
         float *partial = malloc((size_t)nt * 3 * embd * sizeof(float));
         float *weights = malloc((size_t)nt * 3 * sizeof(float));
         int *selected = malloc((size_t)nt * 3 * sizeof(int));
         uint32_t *entry = malloc((size_t)nt * 3 * sizeof(uint32_t));
-        CHECK(x && ma && mb && oa && ob && partial && weights && selected && entry);
+        CHECK(x && ma && mb && mr && oa && ob && partial && weights && selected && entry);
         for (uint32_t i = 0; i < nt * embd; i++) x[i] = test_float();
         for (uint32_t t = 0; t < nt; t++) {
             /* Three distinct experts, mostly 0..2 so that experts are shared. */
@@ -756,11 +778,12 @@ static void check_routed_batch(uint32_t embd, uint32_t hidden, float clamp) {
                         sum = sum + partial[((size_t)t * 3 + k) * embd + i];
                     ob[(size_t)t * embd + i] = sum;
                 }
-            test_equal("routed batch mid", ma, mb, (size_t)nt * 3 * hidden);
+            routed_mid_rows(mr, mb, entry, selected, nt * 3, hidden);
+            test_equal("routed batch mid", ma, mr, (size_t)nt * 3 * hidden);
             test_equal("routed batch out", oa, ob, (size_t)nt * embd);
         }
         free(entry); free(selected); free(weights); free(partial);
-        free(ob); free(oa); free(mb); free(ma); free(x);
+        free(ob); free(oa); free(mr); free(mb); free(ma); free(x);
     }
     test_free(w);
 }

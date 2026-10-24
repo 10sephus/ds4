@@ -604,6 +604,43 @@ static void ds41_cpu_apply16(__m512 *acc, const __m512 *w, const float *const *x
     }
 }
 
+/* ds41_cpu_apply16 for inputs stored transposed, input i of token t at
+ * xt[i * nt + t]: a group's broadcasts are then the memory operands of its
+ * multiplies at fixed offsets from one pointer, which steps nt floats per
+ * input, instead of indexed operands the core splits in two.  The products
+ * and their order per token are those of ds41_cpu_apply16. */
+static inline __attribute__((always_inline)) void ds41_cpu_apply16t_group(
+        __m512 *acc, const __m512 *w, const float *xb, uint32_t nt, uint32_t n,
+        const unsigned g) {
+    __m512 a[8];
+    for (unsigned t = 0; t < g; t++) a[t] = acc[t];
+    for (uint32_t i = 0; i < n; i++, xb += nt) {
+        const __m512 wi = w[i];
+        for (unsigned t = 0; t < g; t++)
+            a[t] = _mm512_add_ps(a[t], _mm512_mul_ps(wi, _mm512_set1_ps(xb[t])));
+    }
+    for (unsigned t = 0; t < g; t++) acc[t] = a[t];
+}
+
+static void ds41_cpu_apply16t(__m512 *acc, const __m512 *w, const float *xt,
+                              uint32_t nt, uint64_t off, uint32_t n) {
+    for (uint32_t t = 0, groups = (nt + 7) / 8; t < nt; groups--) {
+        const uint32_t g = (nt - t + groups - 1) / groups;
+        const float *xb = xt + off * nt + t;
+        switch (g) {
+        case 8: ds41_cpu_apply16t_group(acc + t, w, xb, nt, n, 8); break;
+        case 7: ds41_cpu_apply16t_group(acc + t, w, xb, nt, n, 7); break;
+        case 6: ds41_cpu_apply16t_group(acc + t, w, xb, nt, n, 6); break;
+        case 5: ds41_cpu_apply16t_group(acc + t, w, xb, nt, n, 5); break;
+        case 4: ds41_cpu_apply16t_group(acc + t, w, xb, nt, n, 4); break;
+        case 3: ds41_cpu_apply16t_group(acc + t, w, xb, nt, n, 3); break;
+        case 2: ds41_cpu_apply16t_group(acc + t, w, xb, nt, n, 2); break;
+        default: ds41_cpu_apply16t_group(acc + t, w, xb, nt, n, 1); break;
+        }
+        t += g;
+    }
+}
+
 static void ds41_cpu_apply16x2(__m512 *a, __m512 *b, const __m512 *wa, const __m512 *wb,
                                const float *const *x, uint32_t nt, uint64_t off, uint32_t n) {
     for (uint32_t t = 0, groups = (nt + 3) / 4; t < nt; groups--) {
@@ -1084,8 +1121,10 @@ static int ds41_cpu_desc_u32(const void *a, const void *b) {
 
 /* Routed experts of a token chunk in tasks of at most one token pass: task
  * j covers entries [first[j], end[j]), token * 6 + slot pairs of one expert
- * in token order, with that expert's rows.  mid and partial are indexed by
- * entry.  A chunk has at most DS41_CPU_ROUTED_TOKENS tokens, so at most
+ * in token order, with that expert's rows.  partial is indexed by entry;
+ * the mid rows of a pass of nt entries from k0 fill mid from k0 * n_ff_exp
+ * transposed, input i of its token t at i * nt + t, for the down worker's
+ * broadcasts.  A chunk has at most DS41_CPU_ROUTED_TOKENS tokens, so at most
  * DS41_CPU_ROUTED_TASKS tasks. */
 #define DS41_CPU_ROUTED_TOKENS 512u
 #define DS41_CPU_ROUTED_TASKS (DS4_MAX_EXPERT + \
@@ -1132,10 +1171,13 @@ static void ds41_cpu_routed_mid_batch_worker(void *vctx, uint64_t first, uint64_
                     ds41_cpu_apply16x2(ag, au, wg, wu, xp, nt, b * QK_K + ib * 32u, 32);
                 }
             }
+            float *midt = c->mid + (uint64_t)k0 * DS4_N_FF_EXP + row * nt;
+            const __m512i stride = _mm512_mullo_epi32(_mm512_setr_epi32(
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15), _mm512_set1_epi32((int)nt));
             for (uint32_t t = 0; t < nt; t++) {
                 const uint32_t k = c->entry[k0 + t];
-                _mm512_storeu_ps(c->mid + (uint64_t)k * DS4_N_FF_EXP + row,
-                                 ds41_cpu_swiglu16(ag[t], au[t], c->clamp, c->weight[k]));
+                _mm512_i32scatter_ps(midt + t, stride,
+                                     ds41_cpu_swiglu16(ag[t], au[t], c->clamp, c->weight[k]), 4);
             }
         }
     }
@@ -1146,17 +1188,14 @@ static void ds41_cpu_routed_down_batch_worker(void *vctx, uint64_t first, uint64
     const uint32_t tiles = DS4_N_EMBD / 16;
     const __m512i od = ds41_cpu_row_offsets(c->down_row_bytes);
     __m512 w[128], acc[DS41_CPU_PASS];
-    const float *xp[DS41_CPU_PASS];
     for (uint64_t unit = first; unit < last; unit++) {
         const uint32_t j = (uint32_t)(unit / tiles);
         const uint64_t row = (unit % tiles) * 16;
         const uint8_t *rows = c->down[j] + row * c->down_row_bytes;
         for (uint32_t k0 = c->first[j]; k0 < c->end[j]; k0 += DS41_CPU_PASS) {
             const uint32_t nt = c->end[j] - k0 < DS41_CPU_PASS ? c->end[j] - k0 : DS41_CPU_PASS;
-            for (uint32_t t = 0; t < nt; t++) {
-                acc[t] = _mm512_setzero_ps();
-                xp[t] = c->mid + (uint64_t)c->entry[k0 + t] * DS4_N_FF_EXP;
-            }
+            const float *xt = c->mid + (uint64_t)k0 * DS4_N_FF_EXP;
+            for (uint32_t t = 0; t < nt; t++) acc[t] = _mm512_setzero_ps();
             for (uint64_t b = 0; b < DS4_N_FF_EXP / QK_K; b++) {
                 const uint8_t *block = rows + b * sizeof(block_q2_K);
                 const __m512i halves = _mm512_i32gather_epi32(
@@ -1165,7 +1204,7 @@ static void ds41_cpu_routed_down_batch_worker(void *vctx, uint64_t first, uint64
                 const __m512 dmin = ds41_cpu_half16(_mm512_srli_epi32(halves, 16));
                 for (unsigned h = 0; h < 2; h++) {
                     ds41_cpu_q2k_decode16(w, block, h, d, dmin, od);
-                    ds41_cpu_apply16(acc, w, xp, nt, b * QK_K + h * 128u, 128);
+                    ds41_cpu_apply16t(acc, w, xt, nt, b * QK_K + h * 128u, 128);
                 }
             }
             for (uint32_t t = 0; t < nt; t++)
