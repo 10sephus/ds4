@@ -2189,7 +2189,10 @@ typedef struct {
 
 /* One stage of a staged dispatch (ds4_pool_run_stages): a row-parallel kernel
  * like a plain dispatch, the earlier stages it waits for, and an optional
- * serial step run by the thread that completes its last row. */
+ * serial step run by the thread that completes its last row.  A stage whose
+ * row r reads the weights [r * row_bytes, (r + 1) * row_bytes) from weights,
+ * known before its inputs are, can say so: a thread that would otherwise
+ * spin on a dependency then claims rows of it ahead and prefetches them. */
 typedef struct {
     ds4_parallel_fn fn;
     void *ctx;
@@ -2201,6 +2204,8 @@ typedef struct {
                                        claim rows of this one meanwhile */
     void (*finish)(void *ctx);      /* NULL, or the serial step after the last row */
     void *finish_ctx;
+    const uint8_t *weights;         /* NULL, or the weights of the rows */
+    uint64_t row_bytes;
     /* Set up by ds4_pool_run_stages(); the claim layout is the plain one. */
     uint64_t chunk;
     uint64_t half_rows;
@@ -2316,39 +2321,51 @@ static void ds4_pool_work(int node) {
     ds4_pool_claim(1 - node);
 }
 
-/* One chunk of a stage from one node's cursor, as ds4_pool_claim() hands
- * them out; false once the cursor has passed its end.  The thread whose rows
+/* The first row of virtual index v of node's cursor and the rows from it to
+ * the end of its group half, at most v_end - v. */
+static uint64_t ds4_stage_row(const ds4_pool_stage *s, int node, uint64_t v,
+                              uint64_t v_end, uint64_t *n) {
+    const uint64_t half = node ? s->group_rows - s->half_rows : s->half_rows;
+    const uint64_t g = v / half;
+    const uint64_t i = v - g * half;
+    *n = half - i < v_end - v ? half - i : v_end - v;
+    return g * s->group_rows + (node ? s->half_rows : 0) + i;
+}
+
+/* Run the virtual rows [v, v_end) claimed from node's cursor, one group half
+ * at a time so that every call sees contiguous rows.  The thread whose rows
  * complete the last open cursor runs the finish step and then marks the
  * stage ready for the stages that wait on it; the acquire-release counts
- * make every row visible to that thread.  A cursor already past its end is
- * only read, so the threads leaving a stage do not take its line from the
- * other node's claimers. */
-static bool ds4_stage_claim_chunk(ds4_pool_stage *s, int node) {
-    const uint64_t group = s->group_rows;
-    const uint64_t half = node ? group - s->half_rows : s->half_rows;
-    const uint64_t first = node ? s->half_rows : 0;
-    const uint64_t end = s->end[node];
-    if (__atomic_load_n(&s->cursor[node].v, __ATOMIC_RELAXED) >= end) return false;
-    uint64_t v = __atomic_fetch_add(&s->cursor[node].v, s->chunk, __ATOMIC_RELAXED);
-    if (v >= end) return false;
-    const uint64_t v_end = v + s->chunk < end ? v + s->chunk : end;
+ * make every row visible to that thread. */
+static void ds4_stage_run(ds4_pool_stage *s, int node, uint64_t v, uint64_t v_end) {
     const uint64_t claimed = v_end - v;
     while (v < v_end) {
-        const uint64_t g = v / half;
-        const uint64_t i = v - g * half;
-        const uint64_t n = half - i < v_end - v ? half - i : v_end - v;
-        const uint64_t row0 = g * group + first + i;
+        uint64_t n;
+        const uint64_t row0 = ds4_stage_row(s, node, v, v_end, &n);
         s->fn(s->ctx, row0, row0 + n);
         v += n;
     }
-    if (__atomic_add_fetch(&s->done[node].v, claimed, __ATOMIC_ACQ_REL) == end &&
+    if (__atomic_add_fetch(&s->done[node].v, claimed, __ATOMIC_ACQ_REL) == s->end[node] &&
         __atomic_sub_fetch(&s->open_cursors, 1, __ATOMIC_ACQ_REL) == 0) {
         if (s->finish) s->finish(s->finish_ctx);
         __atomic_store_n(&s->ready, 1, __ATOMIC_RELEASE);
     }
+}
+
+/* One chunk of a stage from one node's cursor, as ds4_pool_claim() hands
+ * them out; false once the cursor has passed its end.  A cursor already past
+ * its end is only read, so the threads leaving a stage do not take its line
+ * from the other node's claimers. */
+static bool ds4_stage_claim_chunk(ds4_pool_stage *s, int node) {
+    const uint64_t end = s->end[node];
+    if (__atomic_load_n(&s->cursor[node].v, __ATOMIC_RELAXED) >= end) return false;
+    const uint64_t v = __atomic_fetch_add(&s->cursor[node].v, s->chunk, __ATOMIC_RELAXED);
+    if (v >= end) return false;
+    ds4_stage_run(s, node, v, v + s->chunk < end ? v + s->chunk : end);
     return true;
 }
 
+/* ds4_pool_claim() for one stage. */
 static void ds4_stage_claim(ds4_pool_stage *s, int node) {
     while (ds4_stage_claim_chunk(s, node)) {}
 }
@@ -2361,8 +2378,8 @@ static bool ds4_stage_inputs_ready(const ds4_pool_stage *stages, uint32_t k) {
 }
 
 /* While a thread waits for stage k's inputs: one chunk of a later stage that
- * allows it, whose inputs are ready and which has rows left. */
-static bool ds4_stage_claim_ahead(ds4_pool_stage *stages, uint32_t n_stages, uint32_t k, int node) {
+ * allows it (ahead), whose inputs are ready and which has rows left. */
+static bool ds4_stage_run_ahead(ds4_pool_stage *stages, uint32_t n_stages, uint32_t k, int node) {
     for (uint32_t j = k + 1; j < n_stages; j++) {
         ds4_pool_stage *s = &stages[j];
         if (!s->ahead || !ds4_stage_inputs_ready(stages, j)) continue;
@@ -2375,20 +2392,72 @@ static bool ds4_stage_claim_ahead(ds4_pool_stage *stages, uint32_t n_stages, uin
     return false;
 }
 
+/* Weight bytes a waiting thread claims ahead: a few claims of the large
+ * projections, well inside a core's L2. */
+#define DS4_STAGE_AHEAD_BYTES (384u * 1024u)
+
+/* Rows of a later stage claimed by a thread before that stage's inputs are
+ * ready, and the part of their weights still to prefetch. */
+typedef struct {
+    uint32_t stage;     /* n_stages: nothing claimed */
+    uint64_t v, v_end;
+    const uint8_t *pf, *pf_end;
+} ds4_stage_ahead;
+
+/* Claim, on the home cursor, rows of the first stage from k on whose
+ * weights are known.  They are an ordinary claim: the thread runs them when
+ * it reaches that stage, before claiming more. */
+static void ds4_stage_claim_ahead(ds4_pool_stage *stages, uint32_t n_stages, uint32_t k,
+                                  int node, ds4_stage_ahead *a) {
+    for (uint32_t j = k; j < n_stages; j++) {
+        ds4_pool_stage *s = &stages[j];
+        if (!s->weights || !s->row_bytes) continue;
+        const uint64_t end = s->end[node];
+        if (__atomic_load_n(&s->cursor[node].v, __ATOMIC_RELAXED) >= end) continue;
+        uint64_t claims = DS4_STAGE_AHEAD_BYTES / (s->chunk * s->row_bytes);
+        if (claims < 1) claims = 1;
+        const uint64_t v = __atomic_fetch_add(&s->cursor[node].v, claims * s->chunk, __ATOMIC_RELAXED);
+        if (v >= end) continue;
+        uint64_t n;
+        a->stage = j;
+        a->v = v;
+        a->v_end = v + claims * s->chunk < end ? v + claims * s->chunk : end;
+        a->pf = s->weights + ds4_stage_row(s, node, v, a->v_end, &n) * s->row_bytes;
+        a->pf_end = a->pf + n * s->row_bytes;
+        return;
+    }
+}
+
 /* Walk the stages in order: wait for the stage's dependencies, then claim rows
  * on the home node and on the other node, as ds4_pool_work() does.  A thread
  * that runs out of rows in one stage starts on the next, so the tail of one
- * kernel overlaps the next independent one instead of waiting at a join, and
- * a thread held up by a stage's inputs runs rows of a later stage marked
+ * kernel overlaps the next independent one instead of waiting at a join.  A
+ * thread held up by a stage's inputs streams the weights of rows it claimed
+ * ahead on a stage that declares them, and runs rows of a later stage marked
  * ahead whose inputs are ready, one chunk at a time, checking again after
- * each. */
+ * each.  Either way only which thread computes a row changes. */
 static void ds4_stages_work(ds4_pool_stage *stages, uint32_t n_stages, int node) {
+    ds4_stage_ahead ahead = {.stage = n_stages};
     for (uint32_t k = 0; k < n_stages; k++) {
         ds4_pool_stage *s = &stages[k];
-        for (uint32_t spins = 0; !ds4_stage_inputs_ready(stages, k); spins++) {
-            if (ds4_stage_claim_ahead(stages, n_stages, k, node)) continue;
-            ds4_cpu_relax();
-            if ((spins & 4095u) == 4095u) sched_yield();
+        if (!ds4_stage_inputs_ready(stages, k)) {
+            if (ahead.stage == n_stages) ds4_stage_claim_ahead(stages, n_stages, k, node, &ahead);
+            for (uint32_t spins = 0; !ds4_stage_inputs_ready(stages, k); spins++) {
+                if (ahead.pf < ahead.pf_end) {
+                    for (uint32_t line = 0; line < 4; line++)
+                        __builtin_prefetch(ahead.pf + 64u * line, 0, 2);
+                    ahead.pf += 4u * 64u;
+                    continue;
+                }
+                if (ds4_stage_run_ahead(stages, n_stages, k, node)) continue;
+                ds4_cpu_relax();
+                if ((spins & 4095u) == 4095u) sched_yield();
+            }
+        }
+        if (ahead.stage == k) {
+            ds4_stage_run(s, node, ahead.v, ahead.v_end);
+            ahead.stage = n_stages;
+            ahead.pf = ahead.pf_end = NULL;
         }
         ds4_stage_claim(s, node);
         ds4_stage_claim(s, 1 - node);

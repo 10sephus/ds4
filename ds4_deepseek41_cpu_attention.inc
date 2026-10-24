@@ -322,7 +322,8 @@ static ds4_pool_stage ds41_cpu_q8_stage(ds41_cpu_q8_ctx *c, const ds4_model *m,
         .rows = rows, .group_rows = rows,
     };
     return (ds4_pool_stage){.fn = ds41_cpu_q8_bf16_worker, .ctx = c,
-                            .n_rows = tiles, .group_rows = tiles};
+                            .n_rows = tiles, .group_rows = tiles,
+                            .weights = c->ref.data, .row_bytes = 16 * c->ref.blocks * 34};
 }
 
 static ds4_pool_stage ds41_cpu_f16_stage(matvec_f16_ctx *c, const ds4_model *m,
@@ -332,7 +333,9 @@ static ds4_pool_stage ds41_cpu_f16_stage(matvec_f16_ctx *c, const ds4_model *m,
     *c = (matvec_f16_ctx){.out = out, .data = tensor_data(m, t), .x = x,
                           .in_dim = t->dim[0], .out_dim = t->dim[1]};
     return (ds4_pool_stage){.fn = round ? ds41_cpu_f16_bf16_worker : matvec_f16_group_worker,
-                            .ctx = c, .n_rows = groups, .group_rows = groups};
+                            .ctx = c, .n_rows = groups, .group_rows = groups,
+                            .weights = (const uint8_t *)c->data,
+                            .row_bytes = DS4_F16_ROWS * c->in_dim * 2};
 }
 
 /* Every projection of the attention input and of the Q low-rank vector,
@@ -662,7 +665,8 @@ static void ds41_cpu_out_graph_run(ds41_cpu_attention_state *s, const ds4_model 
         { .fn = attn_lanes_sum_worker, .ctx = &g.lanes, .n_rows = sums, .group_rows = sums,
           .deps = 1u << 1, .finish = ds41_cpu_out_heads, .finish_ctx = &g },
         { .fn = ds41_cpu_q8_bf16_worker, .ctx = &g.out_a, .n_rows = 8192 / 16,
-          .group_rows = 8192 / 16, .deps = 1u << 2 },
+          .group_rows = 8192 / 16, .deps = 1u << 2,
+          .weights = g.out_a.ref.data, .row_bytes = 16 * g.out_a.ref.blocks * 34 },
         ds41_cpu_q8_stage(&g.out_b, m, l->attn_output_b, block, s->low),
         /* Light elementwise work: claims of 256 columns. */
         { .fn = ds41_cpu_hc_post_worker, .ctx = (void *)post, .n_rows = 5120,

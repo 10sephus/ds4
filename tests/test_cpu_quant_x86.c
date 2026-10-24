@@ -1174,6 +1174,90 @@ static void check_thread_pool(void) {
 }
 
 
+/* Staged dispatches: every row of every stage runs exactly once, only after
+ * the stages it depends on finished, and each finish step runs once after
+ * its stage's last row.  The slow one-row first stage makes the other
+ * threads wait, so they claim rows of the stages with weights ahead (some
+ * claims spanning NUMA group halves) and run them when they get there. */
+typedef struct {
+    uint32_t *seen;
+    const uint32_t *dep;    /* finished flag of a dependency, or NULL */
+    uint64_t n_rows;
+    uint32_t slow_us;
+    uint32_t finished;
+    uint32_t bad;
+} stage_test_ctx;
+
+static void stage_test_worker(void *vctx, uint64_t r0, uint64_t r1) {
+    stage_test_ctx *c = vctx;
+    if (c->dep && !__atomic_load_n(c->dep, __ATOMIC_ACQUIRE))
+        __atomic_store_n(&c->bad, 1, __ATOMIC_RELAXED);
+    if (c->slow_us) {
+        const double until = now_sec() + c->slow_us * 1e-6;
+        while (now_sec() < until) ds4_cpu_relax();
+    }
+    for (uint64_t r = r0; r < r1; r++) __atomic_add_fetch(&c->seen[r], 1, __ATOMIC_RELAXED);
+}
+
+static void stage_test_finish(void *vctx) {
+    stage_test_ctx *c = vctx;
+    for (uint64_t r = 0; r < c->n_rows; r++)
+        if (__atomic_load_n(&c->seen[r], __ATOMIC_RELAXED) != 1) c->bad = 1;
+    __atomic_store_n(&c->finished, 1, __ATOMIC_RELEASE);
+}
+
+static void check_pool_stages(void) {
+    enum { N = 5 };
+    const uint64_t rows[N] = {1, 777, 7 * 333 + 100, 50, 3000};
+    const uint64_t groups[N] = {1, 777, 333, 50, 1};
+    const uint64_t row_bytes[N] = {0, 64 * 1024, 128, 0, 4096};
+    const uint32_t deps[N] = {0, 1u << 0, 1u << 1, (1u << 0) | (1u << 2), 1u << 3};
+    const uint32_t threads[] = {1, 3, 7, 16, 40};
+    uint8_t *weights = calloc(64u << 20, 1);
+    stage_test_ctx c[N];
+    CHECK(weights);
+    for (int k = 0; k < N; k++) {
+        c[k].seen = calloc(rows[k], sizeof(uint32_t));
+        CHECK(c[k].seen);
+    }
+    alarm(600);
+    ds4_numa_init();
+    const bool numa = g_numa.on;
+    for (int mode = numa; mode >= 0; mode--) {
+        g_numa.on = mode;
+        for (size_t t = 0; t < sizeof(threads) / sizeof(*threads); t++) {
+            g_requested_threads = threads[t];
+            for (uint32_t round = 0; round < 40; round++) {
+                ds4_pool_stage st[N];
+                for (int k = 0; k < N; k++) {
+                    memset(c[k].seen, 0, rows[k] * sizeof(uint32_t));
+                    c[k].n_rows = rows[k];
+                    c[k].slow_us = k == 0 ? 200 + 50 * (round % 4) : 0;
+                    c[k].finished = c[k].bad = 0;
+                    c[k].dep = k ? &c[k - 1].finished : NULL;
+                    st[k] = (ds4_pool_stage){.fn = stage_test_worker, .ctx = &c[k],
+                        .n_rows = rows[k], .group_rows = groups[k], .min_chunk = k == 2 ? 3 : 0,
+                        .deps = deps[k], .finish = stage_test_finish, .finish_ctx = &c[k],
+                        .weights = row_bytes[k] ? weights : NULL, .row_bytes = row_bytes[k]};
+                }
+                ds4_pool_run_stages(st, N);
+                for (int k = 0; k < N; k++) {
+                    CHECK(c[k].finished == 1 && c[k].bad == 0);
+                    for (uint64_t r = 0; r < rows[k]; r++) CHECK(c[k].seen[r] == 1);
+                }
+            }
+            ds4_threads_shutdown();
+            printf("CPU staged dispatch with claims ahead: %u threads%s PASS\n",
+                   threads[t], mode ? " (NUMA)" : "");
+        }
+    }
+    g_numa.on = numa;
+    g_requested_threads = 0;
+    for (int k = 0; k < N; k++) free(c[k].seen);
+    free(weights);
+}
+
+
 /* Scalar references for the decode glue as it was written before the loops
  * were restructured: per-head RoPE angles, element-at-a-time HC mixing, one
  * head at a time RMS sums, and the E4M3 table search. */
@@ -2629,6 +2713,7 @@ int main(void) {
     puts("CPU raw KV window slides like the memmove it replaces PASS");
     check_attn_graph();
     check_thread_pool();
+    check_pool_stages();
     check_ds41_q8_grouped();
     puts("CPU V4.1 grouped and paired Q8_0 projections bitwise against the reference PASS");
     check_f16_round_trip();
