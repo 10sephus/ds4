@@ -418,6 +418,90 @@ static void ds41_cpu_down_worker(void *vctx, uint64_t first, uint64_t last) {
     }
 }
 
+/* glibc's expf for sixteen floats, bitwise: the FMA build that x86-64 glibc
+ * (2.27 and later) runs on every AVX-512 CPU, the algorithm of Arm's
+ * optimized routines.  x * 32 / ln 2 = k + r, then 2^(k/32) from a table
+ * times a cubic in r, in double precision with the same fused operations,
+ * rounded to float once.  The special cases (|x| >= 88, infinities, NaN)
+ * return what __expf returns.  tests/test_deepseek41_cpu_x86.c compares it
+ * with the C library's expf. */
+static const uint64_t ds41_expf_tab[32] __attribute__((aligned(64))) = {
+    0x3ff0000000000000ull, 0x3fefd9b0d3158574ull, 0x3fefb5586cf9890full, 0x3fef9301d0125b51ull,
+    0x3fef72b83c7d517bull, 0x3fef54873168b9aaull, 0x3fef387a6e756238ull, 0x3fef1e9df51fdee1ull,
+    0x3fef06fe0a31b715ull, 0x3feef1a7373aa9cbull, 0x3feedea64c123422ull, 0x3feece086061892dull,
+    0x3feebfdad5362a27ull, 0x3feeb42b569d4f82ull, 0x3feeab07dd485429ull, 0x3feea47eb03a5585ull,
+    0x3feea09e667f3bcdull, 0x3fee9f75e8ec5f74ull, 0x3feea11473eb0187ull, 0x3feea589994cce13ull,
+    0x3feeace5422aa0dbull, 0x3feeb737b0cdc5e5ull, 0x3feec49182a3f090ull, 0x3feed503b23e255dull,
+    0x3feee89f995ad3adull, 0x3feeff76f2fb5e47ull, 0x3fef199bdd85529cull, 0x3fef3720dcef9069ull,
+    0x3fef5818dcfba487ull, 0x3fef7c97337b9b5full, 0x3fefa4afa2a490daull, 0x3fefd0765b6e4540ull,
+};
+
+static inline __m512d ds41_cpu_expf8(__m512d xd, const __m512d *t) {
+    const __m512d invln2n = _mm512_set1_pd(0x1.71547652b82fep+5);
+    const __m512d shift = _mm512_set1_pd(0x1.8p+52);
+    const __m512d z = _mm512_fmadd_pd(invln2n, xd, shift);
+    const __m512i ki = _mm512_castpd_si512(z);
+    const __m512d r = _mm512_fmsub_pd(invln2n, xd, _mm512_sub_pd(z, shift));
+    const __mmask8 high = _mm512_test_epi64_mask(ki, _mm512_set1_epi64(16));
+    const __m512d tk = _mm512_mask_blend_pd(high, _mm512_permutex2var_pd(t[0], ki, t[1]),
+                                            _mm512_permutex2var_pd(t[2], ki, t[3]));
+    const __m512d s = _mm512_castsi512_pd(_mm512_add_epi64(_mm512_castpd_si512(tk),
+                                                           _mm512_slli_epi64(ki, 47)));
+    const __m512d p = _mm512_fmadd_pd(r, _mm512_set1_pd(0x1.c6af84b912394p-20),
+                                      _mm512_set1_pd(0x1.ebfce50fac4f3p-13));
+    const __m512d q = _mm512_fmadd_pd(r, _mm512_set1_pd(0x1.62e42ff0c52d6p-6),
+                                      _mm512_set1_pd(1.0));
+    return _mm512_mul_pd(_mm512_fmadd_pd(p, _mm512_mul_pd(r, r), q), s);
+}
+
+static inline __m512 ds41_cpu_expf16(__m512 x) {
+    const __m512d *t = (const __m512d *)ds41_expf_tab;
+    const __m512d lo = _mm512_cvtps_pd(_mm512_castps512_ps256(x));
+    const __m512d hi = _mm512_cvtps_pd(_mm256_castpd_ps(
+        _mm512_extractf64x4_pd(_mm512_castps_pd(x), 1)));
+    __m512 y = _mm512_castpd_ps(_mm512_insertf64x4(
+        _mm512_castpd256_pd512(_mm256_castps_pd(_mm512_cvtpd_ps(ds41_cpu_expf8(lo, t)))),
+        _mm256_castps_pd(_mm512_cvtpd_ps(ds41_cpu_expf8(hi, t))), 1));
+    const __m512i bits = _mm512_castps_si512(x);
+    const __m512i abstop = _mm512_and_si512(_mm512_srli_epi32(bits, 20), _mm512_set1_epi32(0x7ff));
+    const __mmask16 special = _mm512_cmpge_epi32_mask(abstop, _mm512_set1_epi32(0x42b));
+    if (special) {
+        /* In __expf's order: below log(0x1p-149) the value underflow
+         * rounds to, below log(0x1p-150) zero, above log(0x1p128)
+         * infinity, x + x for an infinity or NaN and zero for -inf. */
+        y = _mm512_mask_mov_ps(y, special & _mm512_cmp_ps_mask(x, _mm512_set1_ps(-0x1.9d1d9ep6f),
+                                                               _CMP_LT_OQ),
+                               _mm512_set1_ps(0x1p-149f));
+        y = _mm512_mask_mov_ps(y, special & _mm512_cmp_ps_mask(x, _mm512_set1_ps(-0x1.9fe368p6f),
+                                                               _CMP_LT_OQ), _mm512_setzero_ps());
+        y = _mm512_mask_mov_ps(y, special & _mm512_cmp_ps_mask(x, _mm512_set1_ps(0x1.62e42ep6f),
+                                                               _CMP_GT_OQ),
+                               _mm512_set1_ps(INFINITY));
+        y = _mm512_mask_add_ps(y, _mm512_cmpge_epi32_mask(abstop, _mm512_set1_epi32(0x7f8)), x, x);
+        y = _mm512_mask_mov_ps(y, _mm512_cmpeq_epi32_mask(bits, _mm512_set1_epi32((int)0xff800000u)),
+                               _mm512_setzero_ps());
+    }
+    return y;
+}
+
+/* fmaxf(score, peak), the argument order the scalar loop below compiles
+ * to, per lane: the larger, peak on a tie; for a quiet NaN the other
+ * operand, else (a signaling NaN, or two NaNs) score + peak. */
+static inline __m512 ds41_cpu_fmaxf16(__m512 score, __m512 peak) {
+    const __m512i quiet = _mm512_set1_epi32(0x00400000);
+    __m512 m = _mm512_mask_mov_ps(peak, _mm512_cmp_ps_mask(score, peak, _CMP_GT_OQ), score);
+    const __mmask16 nan_s = _mm512_cmp_ps_mask(score, score, _CMP_UNORD_Q);
+    const __mmask16 nan_p = _mm512_cmp_ps_mask(peak, peak, _CMP_UNORD_Q);
+    if (nan_s | nan_p) {
+        const __mmask16 quiet_s = nan_s & _mm512_test_epi32_mask(_mm512_castps_si512(score), quiet);
+        const __mmask16 quiet_p = nan_p & _mm512_test_epi32_mask(_mm512_castps_si512(peak), quiet);
+        m = _mm512_mask_mov_ps(m, nan_p & ~nan_s & quiet_p, score);
+        m = _mm512_mask_add_ps(m, (nan_s & nan_p) | (nan_s & ~quiet_s) | (nan_p & ~quiet_p),
+                               score, peak);
+    }
+    return m;
+}
+
 /* Batched prefill kernels.  A tile's weights are decoded once per block and
  * applied to many tokens.  For every (row, token) the products and additions
  * are those of the one-token kernels above, in the same order, so each

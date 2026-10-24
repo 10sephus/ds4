@@ -765,6 +765,85 @@ static void check_routed_batch(uint32_t embd, uint32_t hidden, float clamp) {
     test_free(w);
 }
 
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+/* The vector expf against the C library's on every float, 2^16 patterns a
+ * pool row, and the vector fmaxf against fmaxf(score, peak) called through
+ * a pointer, as the scalar weight loop calls it. */
+static void check_expf_worker(void *vctx, uint64_t first, uint64_t last) {
+    int *bad = vctx;
+    float in[16] __attribute__((aligned(64))), out[16] __attribute__((aligned(64)));
+    for (uint64_t b = first << 16; b < last << 16; b += 16) {
+        for (int k = 0; k < 16; k++) {
+            const uint32_t u = (uint32_t)(b + (uint64_t)k);
+            memcpy(&in[k], &u, sizeof(u));
+        }
+        _mm512_store_ps(out, ds41_cpu_expf16(_mm512_load_ps(in)));
+        for (int k = 0; k < 16; k++) {
+            const float ref = expf(in[k]);
+            if (memcmp(&ref, &out[k], sizeof(ref))) __atomic_store_n(bad, 1, __ATOMIC_RELAXED);
+        }
+    }
+}
+
+static void check_expf_fmaxf(void) {
+    int bad = 0;
+    ds4_parallel_for(1u << 16, check_expf_worker, &bad);
+    ds4_threads_shutdown();
+    CHECK(!bad);
+    const uint32_t specials[16] = {
+        0x00000000u, 0x80000000u, 0x7f800000u, 0xff800000u, 0x7fc00000u, 0xffc00001u,
+        0x7f800001u, 0xff800123u, 0x42b17217u, 0x42b17218u, 0xc2cff1b4u, 0xc2cff1b5u,
+        0xc2ce8ecfu, 0xc2ce8ed0u, 0x42b00000u, 0xc2b00000u,
+    };
+    float (*volatile fmax_call)(float, float) = fmaxf;
+    float a[16] __attribute__((aligned(64))), p[16] __attribute__((aligned(64)));
+    float out[16] __attribute__((aligned(64)));
+    for (int it = 0; it < 4096; it++) {
+        for (int k = 0; k < 16; k++) {
+            const uint32_t ua = it < 16 ? specials[it] : test_random();
+            const uint32_t ub = it < 16 ? specials[k] : (test_random() & 7) ? test_random() : ua;
+            memcpy(&a[k], &ua, sizeof(ua));
+            memcpy(&p[k], &ub, sizeof(ub));
+        }
+        _mm512_store_ps(out, ds41_cpu_fmaxf16(_mm512_load_ps(a), _mm512_load_ps(p)));
+        for (int k = 0; k < 16; k++) {
+            const float ref = fmax_call(a[k], p[k]);
+            CHECK(memcmp(&ref, &out[k], sizeof(ref)) == 0);
+        }
+    }
+}
+
+/* The sink softmax weights of 64 heads in head groups against the scalar
+ * loop one head at a time, with -inf, huge and tiny scores. */
+static void check_attention_weights(void) {
+    const uint32_t rows[] = {1, 7, 16, 133, 640};
+    for (size_t ri = 0; ri < sizeof(rows) / sizeof(*rows); ri++) {
+        const uint32_t n_rows = rows[ri];
+        const size_t cells = 4u * 640u * 16u;
+        float *a = malloc(cells * sizeof(float)), *b = malloc(cells * sizeof(float));
+        float sinks[64], inv_a[64], inv_b[64];
+        CHECK(a && b);
+        for (size_t i = 0; i < cells; i++) {
+            const uint32_t pick = test_random() % 64;
+            a[i] = pick == 0 ? -INFINITY : pick == 1 ? -1.0e30f : pick == 2 ? 1.0e-40f :
+                   test_float() * (pick < 8 ? 120.0f : 8.0f);
+        }
+        memcpy(b, a, cells * sizeof(float));
+        for (int h = 0; h < 64; h++) sinks[h] = test_float() * 4.0f;
+        layer_attention_lanes_ctx ca = {.sinks = sinks, .score = a, .inv = inv_a, .n_head = 64,
+                                        .score_stride = 640, .n_rows = n_rows};
+        layer_attention_lanes_ctx cb = ca;
+        cb.score = b;
+        cb.inv = inv_b;
+        ds41_cpu_attention_weight_worker(&ca, 0, 64);
+        for (uint64_t h = 0; h < 64; h++) ds41_cpu_attention_weight_worker(&cb, h, h + 1);
+        test_equal("attention weights", a, b, cells);
+        test_equal("attention inverse sums", inv_a, inv_b, 64);
+        free(b); free(a);
+    }
+}
+#endif
+
 int main(void) {
     const ds4_shape saved = g_ds4_shape;
 #if defined(__AVX512F__) && defined(__AVX512BW__)
@@ -773,6 +852,8 @@ int main(void) {
     check_iq2xxs_pair();
     check_q2k_pair();
     check_q4_tails();
+    check_expf_fmaxf();
+    check_attention_weights();
 #endif
     /* Both pool layouts: NUMA halves per group (on a two-node host) and one cursor. */
     ds4_numa_init();

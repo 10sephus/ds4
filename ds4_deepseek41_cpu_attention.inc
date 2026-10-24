@@ -413,9 +413,27 @@ static bool ds41_cpu_proj_graph_run(ds41_cpu_attention_state *s, const ds4_model
  * from the sink, then the expf chain and the denominator in row order.  The
  * score and weighted-sum passes are the V4 ones: per head and row the same
  * products and sums in the same order as dot_f32 and axpy_f32 over the
- * staged rows, so every head output is bitwise the serial result. */
+ * staged rows, so every head output is bitwise the serial result.  Whole
+ * groups of sixteen heads run a lane per head with the same steps. */
 static void ds41_cpu_attention_weight_worker(void *vctx, uint64_t h0, uint64_t h1) {
     const layer_attention_lanes_ctx *ctx = vctx;
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    for (; h0 % 16 == 0 && h0 + 16 <= h1; h0 += 16) {
+        float *score = attn_lanes_score(ctx, (uint32_t)h0, 0);
+        const __m512 sinks = _mm512_loadu_ps(ctx->sinks + h0);
+        __m512 peak = sinks;
+        for (uint32_t r = 0; r < ctx->n_rows; r++)
+            peak = ds41_cpu_fmaxf16(_mm512_loadu_ps(score + (uint64_t)r * 16), peak);
+        __m512 sum = ds41_cpu_expf16(_mm512_sub_ps(sinks, peak));
+        for (uint32_t r = 0; r < ctx->n_rows; r++) {
+            const __m512 e = ds41_cpu_expf16(_mm512_sub_ps(_mm512_loadu_ps(score + (uint64_t)r * 16),
+                                                           peak));
+            _mm512_storeu_ps(score + (uint64_t)r * 16, e);
+            sum = _mm512_add_ps(sum, e);
+        }
+        _mm512_storeu_ps(ctx->inv + h0, _mm512_div_ps(_mm512_set1_ps(1.0f), sum));
+    }
+#endif
     for (uint64_t h = h0; h < h1; h++) {
         float *score = attn_lanes_score(ctx, (uint32_t)h, 0);
         float peak = ctx->sinks[h];
