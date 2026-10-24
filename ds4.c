@@ -10849,6 +10849,15 @@ static inline float q8_0_scale_f32(uint16_t bits) {
     return f16_to_f32(bits);
 }
 
+/* The weight byte sum of a block: vpsadbw adds the bytes + 128 in four
+ * qword lanes, exactly, then the lanes fold to one. */
+static inline int32_t q8_0_block_sum(const uint8_t *w) {
+    const __m256i v = _mm256_loadu_si256((const __m256i *)w);
+    const __m256i s = _mm256_sad_epu8(_mm256_xor_si256(v, _mm256_set1_epi8((char)0x80)), _mm256_setzero_si256());
+    const __m128i h = _mm_add_epi64(_mm256_castsi256_si128(s), _mm256_extracti128_si256(s, 1));
+    return (int32_t)_mm_cvtsi128_si32(_mm_add_epi64(h, _mm_unpackhi_epi64(h, h))) - 32 * 128;
+}
+
 static void q8_0_tab8_build(q8_0_tab8 *tab, const uint8_t *data, uint64_t row_bytes,
                             uint64_t n_rows, uint64_t blocks) {
     for (uint64_t b = 0; b < blocks; b++) {
@@ -10858,10 +10867,8 @@ static void q8_0_tab8_build(q8_0_tab8 *tab, const uint8_t *data, uint64_t row_by
             uint16_t scale_bits;
             memcpy(&scale_bits, blk, sizeof(scale_bits));
             memcpy(tab[b].w[i], blk + 2, 32);
-            int32_t sum = 0;
-            for (unsigned k = 0; k < 32; k++) sum += (int8_t)tab[b].w[i][k];
             tab[b].ws[i] = q8_0_scale_f32(scale_bits);
-            tab[b].dot0[i] = -128 * sum;
+            tab[b].dot0[i] = -128 * q8_0_block_sum(blk + 2);
         }
     }
 }
