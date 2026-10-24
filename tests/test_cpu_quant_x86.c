@@ -317,7 +317,9 @@ static void check_indexer_selection(void) {
     const float values[] = {-2.0f, -1.0f, -0.0f, 0.0f, 0.5f, 1.0f, 1.0e30f, 0x1p-149f,
                             DS4_NEG_INF, -1.0e31f, INFINITY, -INFINITY, NAN};
     const unsigned n_values = sizeof(values) / sizeof(*values);
-    const unsigned counts[] = {513, 600, 1500};
+    /* 528, 544 and 545 rows for 512: the one-pass selection's 16 and 32
+     * dropped rows, and one past its limit. */
+    const unsigned counts[] = {513, 528, 544, 545, 600, 1500};
     for (unsigned ci = 0; ci < sizeof(counts) / sizeof(*counts); ci++) {
         const unsigned n_comp = counts[ci];
         float *scores = xmalloc(n_comp * sizeof(float));

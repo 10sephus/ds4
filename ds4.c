@@ -17727,6 +17727,13 @@ static void indexer_select_first(indexer_candidate *cand, uint32_t n, uint32_t k
  * out every remaining round falls back to row 0.  Selecting the first top_k
  * candidates is O(n) instead of O(top_k * n).  cand is scratch of n_comp
  * entries. */
+/* Just past the top-k window (2048 to 2111 tokens: 513 to 528 rows for 512)
+ * only a few candidates drop out: one pass keeps the INDEXER_DROP_MAX last
+ * in indexer_candidate_cmp order seen so far and the first of them, which a
+ * newcomer must follow to take its place; the first is found again only
+ * after a replacement. */
+#define INDEXER_DROP_MAX 32
+
 static void indexer_select_top_k(
         bool              * allowed,
         indexer_candidate * cand,
@@ -17742,6 +17749,31 @@ static void indexer_select_top_k(
     if (n_cand < top_k) {
         allowed[0] = true;
         top_k = n_cand;
+    }
+    const uint32_t drop = n_cand - top_k;
+    if (drop <= INDEXER_DROP_MAX) {
+        indexer_candidate last[INDEXER_DROP_MAX];
+        uint32_t first = 0;
+        for (uint32_t i = 0; i < n_cand; i++) {
+            allowed[cand[i].index] = true;
+            if (i < drop) {
+                last[i] = cand[i];
+                if (i + 1 == drop) {
+                    for (uint32_t j = 1; j < drop; j++) {
+                        if (indexer_candidate_cmp(&last[j], &last[first]) < 0) first = j;
+                    }
+                }
+                continue;
+            }
+            if (drop == 0 || indexer_candidate_cmp(&cand[i], &last[first]) < 0) continue;
+            last[first] = cand[i];
+            first = 0;
+            for (uint32_t j = 1; j < drop; j++) {
+                if (indexer_candidate_cmp(&last[j], &last[first]) < 0) first = j;
+            }
+        }
+        for (uint32_t j = 0; j < drop; j++) allowed[last[j].index] = false;
+        return;
     }
     indexer_select_first(cand, n_cand, top_k);
     for (uint32_t k = 0; k < top_k; k++) allowed[cand[k].index] = true;
