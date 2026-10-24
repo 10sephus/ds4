@@ -2196,6 +2196,8 @@ typedef struct {
     uint64_t group_rows;
     uint64_t min_chunk;
     uint32_t deps;                  /* bit k: wait until stage k is finished */
+    bool ahead;                     /* a thread held up by an earlier stage may
+                                       claim rows of this one meanwhile */
     void (*finish)(void *ctx);      /* NULL, or the serial step after the last row */
     void *finish_ctx;
     /* Set up by ds4_pool_run_stages(); the claim layout is the plain one. */
@@ -2309,48 +2311,75 @@ static void ds4_pool_work(int node) {
     ds4_pool_claim(1 - node);
 }
 
-/* ds4_pool_claim() for one stage.  The thread whose rows complete the stage
- * runs its finish step and then marks it ready for the stages that wait on
- * it; the acquire-release count makes every row visible to that thread. */
-static void ds4_stage_claim(ds4_pool_stage *s, int node) {
+/* One chunk of a stage from one node's cursor, as ds4_pool_claim() hands
+ * them out; false once the cursor has passed its end.  The thread whose rows
+ * complete the stage runs its finish step and then marks it ready for the
+ * stages that wait on it; the acquire-release count makes every row visible
+ * to that thread. */
+static bool ds4_stage_claim_chunk(ds4_pool_stage *s, int node) {
     const uint64_t group = s->group_rows;
     const uint64_t half = node ? group - s->half_rows : s->half_rows;
     const uint64_t first = node ? s->half_rows : 0;
     const uint64_t end = s->end[node];
-    for (;;) {
-        uint64_t v = __atomic_fetch_add(&s->cursor[node].v, s->chunk, __ATOMIC_RELAXED);
-        if (v >= end) return;
-        const uint64_t v_end = v + s->chunk < end ? v + s->chunk : end;
-        const uint64_t claimed = v_end - v;
-        while (v < v_end) {
-            const uint64_t g = v / half;
-            const uint64_t i = v - g * half;
-            const uint64_t n = half - i < v_end - v ? half - i : v_end - v;
-            const uint64_t row0 = g * group + first + i;
-            s->fn(s->ctx, row0, row0 + n);
-            v += n;
-        }
-        if (__atomic_add_fetch(&s->done, claimed, __ATOMIC_ACQ_REL) == s->n_rows) {
-            if (s->finish) s->finish(s->finish_ctx);
-            __atomic_store_n(&s->ready, 1, __ATOMIC_RELEASE);
+    uint64_t v = __atomic_fetch_add(&s->cursor[node].v, s->chunk, __ATOMIC_RELAXED);
+    if (v >= end) return false;
+    const uint64_t v_end = v + s->chunk < end ? v + s->chunk : end;
+    const uint64_t claimed = v_end - v;
+    while (v < v_end) {
+        const uint64_t g = v / half;
+        const uint64_t i = v - g * half;
+        const uint64_t n = half - i < v_end - v ? half - i : v_end - v;
+        const uint64_t row0 = g * group + first + i;
+        s->fn(s->ctx, row0, row0 + n);
+        v += n;
+    }
+    if (__atomic_add_fetch(&s->done, claimed, __ATOMIC_ACQ_REL) == s->n_rows) {
+        if (s->finish) s->finish(s->finish_ctx);
+        __atomic_store_n(&s->ready, 1, __ATOMIC_RELEASE);
+    }
+    return true;
+}
+
+static void ds4_stage_claim(ds4_pool_stage *s, int node) {
+    while (ds4_stage_claim_chunk(s, node)) {}
+}
+
+static bool ds4_stage_inputs_ready(const ds4_pool_stage *stages, uint32_t k) {
+    for (uint32_t d = 0; d < k; d++) {
+        if ((stages[k].deps & (1u << d)) && !__atomic_load_n(&stages[d].ready, __ATOMIC_ACQUIRE)) return false;
+    }
+    return true;
+}
+
+/* While a thread waits for stage k's inputs: one chunk of a later stage that
+ * allows it, whose inputs are ready and which has rows left. */
+static bool ds4_stage_claim_ahead(ds4_pool_stage *stages, uint32_t n_stages, uint32_t k, int node) {
+    for (uint32_t j = k + 1; j < n_stages; j++) {
+        ds4_pool_stage *s = &stages[j];
+        if (!s->ahead || !ds4_stage_inputs_ready(stages, j)) continue;
+        for (int side = 0; side < 2; side++) {
+            const int nd = side ? 1 - node : node;
+            if (__atomic_load_n(&s->cursor[nd].v, __ATOMIC_RELAXED) < s->end[nd] &&
+                ds4_stage_claim_chunk(s, nd)) return true;
         }
     }
+    return false;
 }
 
 /* Walk the stages in order: wait for the stage's dependencies, then claim rows
  * on the home node and on the other node, as ds4_pool_work() does.  A thread
  * that runs out of rows in one stage starts on the next, so the tail of one
- * kernel overlaps the next independent one instead of waiting at a join. */
+ * kernel overlaps the next independent one instead of waiting at a join, and
+ * a thread held up by a stage's inputs runs rows of a later stage marked
+ * ahead whose inputs are ready, one chunk at a time, checking again after
+ * each. */
 static void ds4_stages_work(ds4_pool_stage *stages, uint32_t n_stages, int node) {
     for (uint32_t k = 0; k < n_stages; k++) {
         ds4_pool_stage *s = &stages[k];
-        for (uint32_t d = 0; d < k; d++) {
-            if (!(s->deps & (1u << d))) continue;
-            const uint32_t *ready = &stages[d].ready;
-            for (uint32_t spins = 0; !__atomic_load_n(ready, __ATOMIC_ACQUIRE); spins++) {
-                ds4_cpu_relax();
-                if ((spins & 4095u) == 4095u) sched_yield();
-            }
+        for (uint32_t spins = 0; !ds4_stage_inputs_ready(stages, k); spins++) {
+            if (ds4_stage_claim_ahead(stages, n_stages, k, node)) continue;
+            ds4_cpu_relax();
+            if ((spins & 4095u) == 4095u) sched_yield();
         }
         ds4_stage_claim(s, node);
         ds4_stage_claim(s, 1 - node);
@@ -18159,10 +18188,11 @@ static void layer_attention_raw_swa_batch(
  *                                   the one that completes sixteen heads
  *                                   their transpose
  *   6  q tail (16-head groups)      after 3: head norms, RoPE, transpose
- *   7  attention scores             after 2, 6, with the chunk maxima; once
+ *   7  indexer scores               after 2, 4, 5, then top-k and the row list
+ *   8  attention scores             after 2, 6, with the chunk maxima; once
  *                                   the indexer selects, of every raw and
- *                                   compressed row, beside stage 8
- *   8  indexer scores               after 2, 4, 5, then top-k and the row list
+ *                                   compressed row, beside stage 7, and run
+ *                                   ahead by threads waiting for its inputs
  *   9  softmax weights              after 7, 8 (the head maxima from the
  *                                   chunk maxima, as layer_attention_lanes()
  *                                   does, of the listed rows only)
@@ -18581,7 +18611,7 @@ static void layer_attention_graph(
     /* n_chunks covers every row that may be listed: the raw window and the
      * compressed rows, or the top-k of them once the indexer selects; items
      * past the rows actually listed do nothing, so the list may shrink in
-     * stage 8.  Then every row is scored into attn_score as lanes_all, and
+     * stage 7.  Then every row is scored into attn_score as lanes_all, and
      * the listed rows' weights go to attn_weight. */
     const uint32_t n_visible = g.top_k && g.top_k < g.n_comp ? g.top_k : g.n_comp;
     g.lanes = (layer_attention_lanes_ctx) {
@@ -18657,12 +18687,12 @@ static void layer_attention_graph(
         { .fn = attn_graph_q_tail_worker, .ctx = &g,
           .n_rows = head_groups, .group_rows = head_groups,
           .deps = 1u << 3, .finish = mark, .finish_ctx = &g.mark[2] },
-        { .fn = attn_lanes_score_worker, .ctx = g.top_k ? &g.lanes_all : &g.lanes,
-          .n_rows = n_score_all, .group_rows = n_score_all, .deps = (1u << 2) | (1u << 6) },
         { .fn = indexer_score_rows_worker, .ctx = &g.index_score,
           .n_rows = g.top_k ? n_index_items : 0, .group_rows = g.top_k ? n_index_items : 1,
           .deps = (1u << 2) | (1u << 4) | (1u << 5),
           .finish = g.top_k ? attn_graph_index_select : NULL, .finish_ctx = &g },
+        { .fn = attn_lanes_score_worker, .ctx = g.top_k ? &g.lanes_all : &g.lanes,
+          .n_rows = n_score_all, .group_rows = n_score_all, .deps = (1u << 2) | (1u << 6), .ahead = true },
         { .fn = attn_lanes_weight_worker, .ctx = &g.lanes,
           .n_rows = n_score, .group_rows = n_score, .deps = (1u << 7) | (1u << 8) },
         { .fn = attn_lanes_sum_worker, .ctx = &g.lanes,
