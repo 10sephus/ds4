@@ -2053,14 +2053,14 @@ static void check_attn_graph(void) {
         g_ds4_compress_ratios[ils[r]] = ratios[r];
     }
 
-    const uint32_t cap_raw = 16, comp_cap = 24;
+    const uint32_t cap_raw = 16, comp_cap = 64;
     attn_test_cache ca[3], cb[3];
     for (int r = 0; r < 3; r++) {
         attn_test_cache_alloc(&ca[r], ratios[r], cap_raw, comp_cap);
         attn_test_cache_alloc(&cb[r], ratios[r], cap_raw, comp_cap);
     }
     ds4_cpu_decode_scratch scratch;
-    cpu_decode_scratch_init(&scratch, 128);
+    cpu_decode_scratch_init(&scratch, 256);
     float *res = xmalloc(hc_dim * sizeof(float)), *dirs = xmalloc(4 * E * sizeof(float));
     float *hc0 = xmalloc(hc_dim * sizeof(float)), *q0 = xmalloc(q_dim * sizeof(float));
     float *kv0 = xmalloc(D * sizeof(float)), *heads0 = xmalloc(q_dim * sizeof(float));
@@ -2069,14 +2069,20 @@ static void check_attn_graph(void) {
     float *isc0 = xmalloc(comp_cap * sizeof(float));
     attn_test_fill(dirs, 4 * E, 0.01f);
 
-    const struct { int r; uint32_t pos, n_raw, n_comp; bool steer; } cases[] = {
-        {0, 5, 5, 0, false},       /* dense layer, window filling */
-        {1, 131, 16, 20, false},   /* ratio 4: full window, compression, 21 > top-k rows: indexer */
-        {1, 130, 16, 20, false},   /* ratio 4: the indexer selects without a compression step */
-        {1, 130, 9, 3, false},     /* ratio 4: no compression, every compressed row visible */
-        {2, 255, 16, 1, false},    /* ratio 128: compression */
-        {1, 131, 16, 20, true},    /* steering keeps the HC post serial */
-        {1, 7, 8, 1, false},       /* ratio 4: compression into the second row */
+    /* top_k 0 keeps the indexer's 6; the attention scores every row while
+     * the indexer selects, so the cases with more compressed rows have
+     * chunks of them with no, some and all of their rows listed. */
+    const struct { int r; uint32_t pos, n_raw, n_comp; bool steer; uint32_t top_k; } cases[] = {
+        {0, 5, 5, 0, false, 0},       /* dense layer, window filling */
+        {1, 131, 16, 20, false, 0},   /* ratio 4: full window, compression, 21 > top-k rows: indexer */
+        {1, 130, 16, 20, false, 0},   /* ratio 4: the indexer selects without a compression step */
+        {1, 130, 9, 3, false, 0},     /* ratio 4: no compression, every compressed row visible */
+        {2, 255, 16, 1, false, 0},    /* ratio 128: compression */
+        {1, 131, 16, 20, true, 0},    /* steering keeps the HC post serial */
+        {1, 7, 8, 1, false, 0},       /* ratio 4: compression into the second row */
+        {1, 251, 16, 60, false, 0},   /* ratio 4: 6 of 61 compressed rows */
+        {1, 250, 16, 60, false, 57},  /* ratio 4: 57 of 60, whole chunks listed */
+        {1, 251, 16, 60, false, 33},  /* ratio 4: 33 of 61 */
     };
     const size_t n_cases = sizeof(cases) / sizeof(*cases);
 
@@ -2091,6 +2097,7 @@ static void check_attn_graph(void) {
             for (size_t ci = 0; ci < n_cases; ci++) {
                 const int r = cases[ci].r;
                 const float *steer = cases[ci].steer ? dirs : NULL;
+                g_ds4_shape.n_indexer_top_k = cases[ci].top_k ? cases[ci].top_k : 6;
                 attn_test_cache_fill(&ca[r], cases[ci].n_raw, cases[ci].n_comp);
                 attn_test_cache_copy(&cb[r], &ca[r]);
                 attn_test_fill(res, hc_dim, ci & 1 ? 20.0f : 1.0f);

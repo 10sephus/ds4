@@ -1146,6 +1146,15 @@ typedef struct {
     const float **attn_rows;
     float *attn_cmax;
     float *attn_inv;
+    /* Staged attention on a ratio-4 layer whose indexer selects: every raw and
+     * compressed row is scored while the indexer runs (attn_rows_all, its
+     * scores in attn_score), and the weights of the rows the indexer keeps go
+     * to attn_weight; attn_pick holds the index in attn_rows_all of each
+     * listed row and attn_listed the listed rows of each chunk of them. */
+    const float **attn_rows_all;
+    float *attn_weight;
+    uint32_t *attn_pick;
+    uint8_t *attn_listed;
 
     float *comp;
     float *index_comp;
@@ -15983,6 +15992,10 @@ static void cpu_decode_scratch_init(ds4_cpu_decode_scratch *scratch, uint32_t ct
                                  ((attn_score_cap + ATTN_LANES_ROWS_PER_ITEM - 1) / ATTN_LANES_ROWS_PER_ITEM) *
                                  16u * sizeof(float));
     scratch->attn_inv = xmalloc((size_t)DS4_N_HEAD * sizeof(float));
+    scratch->attn_rows_all = xmalloc((size_t)attn_score_cap * sizeof(float *));
+    scratch->attn_weight = xmalloc((size_t)16u * ((DS4_N_HEAD + 15u) / 16u) * attn_score_cap * sizeof(float));
+    scratch->attn_pick = xmalloc((size_t)attn_score_cap * sizeof(uint32_t));
+    scratch->attn_listed = xmalloc((size_t)(attn_score_cap + ATTN_LANES_ROWS_PER_ITEM - 1) / ATTN_LANES_ROWS_PER_ITEM);
 
     scratch->comp = xmalloc((size_t)DS4_N_HEAD_DIM * sizeof(float));
     scratch->index_comp = xmalloc((size_t)DS4_N_INDEXER_HEAD_DIM * sizeof(float));
@@ -16064,6 +16077,10 @@ static void cpu_decode_scratch_free(ds4_cpu_decode_scratch *scratch) {
     free(scratch->comp_kv_cur);
     free(scratch->index_comp);
     free(scratch->comp);
+    free(scratch->attn_listed);
+    free(scratch->attn_pick);
+    free(scratch->attn_weight);
+    free(scratch->attn_rows_all);
     free(scratch->attn_inv);
     free(scratch->attn_cmax);
     free(scratch->attn_rows);
@@ -16997,11 +17014,21 @@ static void layer_attention_mixed_one(
  * qt is the transposed query, [n_head/16][head_dim][16]; score holds
  * [n_head/16][score_stride][16] floats, row-major within a head group; cmax
  * holds [n_head/16][n_chunks][16] chunk maxima (the V4.1 path, with its own
- * weight pass, passes none). */
+ * weight pass, passes none).
+ *
+ * The staged decode graph may score a superset of the rows instead, every
+ * raw and compressed row before the indexer has chosen (all): the listed
+ * rows are then rows pick[r] of it, and stage B reads their scores there and
+ * writes their weights to score.  The head maximum folds the chunks of the
+ * superset in order, a chunk whose rows are all listed by its maximum and
+ * any other by the maximum of its listed rows; the listed rows keep their
+ * order inside the superset, and a fold that keeps a value only when it is
+ * strictly greater lands on the first value to reach the maximum however
+ * the sequence is cut into pieces, so the result is the serial scan's. */
 #define ATTN_LANES_BLOCK 8
 #define ATTN_LANES_PREFETCH 4
 
-typedef struct {
+typedef struct layer_attention_lanes_ctx {
     float               * out_heads;
     const float         * sinks;
     const float         * q;
@@ -17016,6 +17043,14 @@ typedef struct {
     uint32_t              n_rows;
     uint32_t              n_chunks;
     uint32_t              n_dim_chunks;
+    /* NULL, or the scored superset: its first n_raw rows are raw rows, its
+     * compressed row c is listed when allowed[c], listed row r is its row
+     * pick[r] and its chunk c holds listed[c] listed rows. */
+    const struct layer_attention_lanes_ctx * all;
+    const uint32_t      * pick;
+    const uint8_t       * listed;
+    const bool          * allowed;
+    uint32_t              n_raw;
 } layer_attention_lanes_ctx;
 
 static inline float *attn_lanes_score(const layer_attention_lanes_ctx *ctx, uint32_t h, uint32_t r) {
@@ -17116,12 +17151,32 @@ static void attn_lanes_score_worker(void *vctx, uint64_t item0, uint64_t item1) 
     }
 }
 
-/* The maximum of each head of group g: its sink, then the chunk maxima. */
+/* The maximum of each head of group g: its sink, then the chunk maxima (of
+ * the scored superset when there is one, a chunk with unlisted rows by the
+ * maximum of its listed rows). */
 static void attn_lanes_head_max(const layer_attention_lanes_ctx *ctx, uint32_t g, float *max) {
     const uint32_t n = g * 16 + 16 < ctx->n_head ? 16 : ctx->n_head - g * 16;
+    const layer_attention_lanes_ctx *src = ctx->all ? ctx->all : ctx;
     for (uint32_t l = 0; l < n; l++) max[l] = ctx->sinks[g * 16 + l];
-    for (uint32_t c = 0; c < ctx->n_chunks; c++) {
-        const float *cmax = ctx->cmax + ((uint64_t)g * ctx->n_chunks + c) * 16;
+    for (uint32_t c = 0; c < src->n_chunks; c++) {
+        const float *cmax = src->cmax + ((uint64_t)g * src->n_chunks + c) * 16;
+        float part[16];
+        if (ctx->all) {
+            const uint32_t r0 = c * ATTN_LANES_ROWS_PER_ITEM;
+            const uint32_t r1 = r0 >= src->n_rows ? r0 :
+                                r0 + ATTN_LANES_ROWS_PER_ITEM < src->n_rows ? r0 + ATTN_LANES_ROWS_PER_ITEM : src->n_rows;
+            if (ctx->listed[c] != r1 - r0) {
+                for (uint32_t l = 0; l < n; l++) part[l] = -INFINITY;
+                for (uint32_t r = r0; r < r1; r++) {
+                    if (r >= ctx->n_raw && !ctx->allowed[r - ctx->n_raw]) continue;
+                    const float *v = attn_lanes_score(src, g * 16, r);
+                    for (uint32_t l = 0; l < n; l++) {
+                        if (v[l] > part[l]) part[l] = v[l];
+                    }
+                }
+                cmax = part;
+            }
+        }
         for (uint32_t l = 0; l < n; l++) {
             if (cmax[l] > max[l]) max[l] = cmax[l];
         }
@@ -17139,7 +17194,8 @@ static void attn_lanes_weight_worker(void *vctx, uint64_t item0, uint64_t item1)
         attn_lanes_head_max(ctx, g, max);
         for (uint32_t r = r0; r < r1; r++) {
             float *w = attn_lanes_score(ctx, g * 16, r);
-            for (uint32_t l = 0; l < n; l++) w[l] = expf(w[l] - max[l]);
+            const float *s = ctx->all ? attn_lanes_score(ctx->all, g * 16, ctx->pick[r]) : w;
+            for (uint32_t l = 0; l < n; l++) w[l] = expf(s[l] - max[l]);
         }
     }
 }
@@ -18063,10 +18119,13 @@ static void layer_attention_raw_swa_batch(
  *                                   head runs its RoPE and FP4 round trip,
  *                                   then the transpose
  *   6  q tail (16-head groups)      after 3: head norms, RoPE, transpose
- *   7  indexer scores               after 2, 4, 5, then top-k and the row list
- *   8  attention scores             after 2, 6, 7, with the chunk maxima
- *   9  softmax weights              after 8 (the head maxima from the chunk
- *                                   maxima, as layer_attention_lanes() does)
+ *   7  attention scores             after 2, 6, with the chunk maxima; once
+ *                                   the indexer selects, of every raw and
+ *                                   compressed row, beside stage 8
+ *   8  indexer scores               after 2, 4, 5, then top-k and the row list
+ *   9  softmax weights              after 7, 8 (the head maxima from the
+ *                                   chunk maxima, as layer_attention_lanes()
+ *                                   does, of the listed rows only)
  *  10  softmax denominators         after 9
  *  11  weighted sums                after 10
  *  12  output tail (head groups)    after 11: inverse RoPE and quantization
@@ -18120,6 +18179,7 @@ typedef struct {
     matvec_f16_ctx index_q;
     indexer_score_ctx index_score;
     layer_attention_lanes_ctx lanes;
+    layer_attention_lanes_ctx lanes_all;   /* every row, scored beside the indexer */
     matvec_q8_0_grouped_ctx out_a;
     matvec_q8_0_ctx out_b;
 } attn_graph_ctx;
@@ -18158,6 +18218,7 @@ static void attn_graph_q_a(void *vctx) {
 }
 
 static void attn_graph_rows(attn_graph_ctx *g);
+static void attn_graph_rows_all(attn_graph_ctx *g);
 
 /* The serial kv steps of the plain path, as one work item beside q_b. */
 static void attn_graph_kv_worker(void *vctx, uint64_t i0, uint64_t i1) {
@@ -18173,9 +18234,10 @@ static void attn_graph_kv_worker(void *vctx, uint64_t i0, uint64_t i1) {
     rope_tail_layer_inplace(scratch->kv, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT, g->pos, g->il, false);
     dsv4_fp8_kv_quantize_row_inplace_cpu(scratch->kv, DS4_N_HEAD_DIM, DS4_N_ROT);
     kv_cache_push_raw(cache, scratch->kv);
-    /* The push may slide the window, so the rows are listed after it (or
-     * after the indexer's selection, which runs later). */
+    /* The push may slide the window, so the rows are listed after it (the
+     * rows the indexer keeps after its selection, which runs later). */
     if (!g->top_k) attn_graph_rows(g);
+    else attn_graph_rows_all(g);
     if (g->ratio == 0) return;
     if (compressor_update_one(scratch->comp, model,
                               layer->attn_compressor_ape, layer->attn_compressor_norm,
@@ -18259,18 +18321,38 @@ static void attn_graph_index_qt(void *vctx) {
 }
 
 /* The attention rows in order: the raw window, then the visible compressed
- * rows, as layer_attention_lanes() lists them. */
+ * rows, as layer_attention_lanes() lists them.  Once the indexer selects,
+ * also where each sits among all the rows stage 7 scored, and how many of
+ * each chunk of those are listed. */
 static void attn_graph_rows(attn_graph_ctx *g) {
     const ds4_layer_cache *cache = g->cache;
-    const float **rows = g->scratch->attn_rows;
-    const bool *allowed = g->top_k ? g->scratch->index_allowed : NULL;
+    ds4_cpu_decode_scratch *scratch = g->scratch;
+    const float **rows = scratch->attn_rows;
+    const bool *allowed = g->top_k ? scratch->index_allowed : NULL;
+    uint32_t *pick = scratch->attn_pick;
     uint32_t n = 0;
-    for (uint32_t r = 0; r < g->n_raw; r++) rows[n++] = cache->raw_kv + (uint64_t)r * DS4_N_HEAD_DIM;
+    for (uint32_t r = 0; r < g->n_raw; r++) {
+        pick[n] = r;
+        rows[n++] = cache->raw_kv + (uint64_t)r * DS4_N_HEAD_DIM;
+    }
     for (uint32_t r = 0; r < g->n_comp; r++) {
         if (allowed && !allowed[r]) continue;
+        pick[n] = g->n_raw + r;
         rows[n++] = cache->attn_comp_kv + (uint64_t)r * DS4_N_HEAD_DIM;
     }
     g->lanes.n_rows = n;
+    if (allowed) {
+        memset(scratch->attn_listed, 0, g->lanes_all.n_chunks);
+        for (uint32_t r = 0; r < n; r++) scratch->attn_listed[pick[r] / ATTN_LANES_ROWS_PER_ITEM]++;
+    }
+}
+
+/* Every raw and compressed row, for the scores beside the indexer. */
+static void attn_graph_rows_all(attn_graph_ctx *g) {
+    const ds4_layer_cache *cache = g->cache;
+    const float **rows = g->scratch->attn_rows_all;
+    for (uint32_t r = 0; r < g->n_raw; r++) rows[r] = cache->raw_kv + (uint64_t)r * DS4_N_HEAD_DIM;
+    for (uint32_t r = 0; r < g->n_comp; r++) rows[g->n_raw + r] = cache->attn_comp_kv + (uint64_t)r * DS4_N_HEAD_DIM;
 }
 
 static void attn_graph_index_select(void *vctx) {
@@ -18454,7 +18536,8 @@ static void layer_attention_graph(
     /* n_chunks covers every row that may be listed: the raw window and the
      * compressed rows, or the top-k of them once the indexer selects; items
      * past the rows actually listed do nothing, so the list may shrink in
-     * stage 7. */
+     * stage 8.  Then every row is scored into attn_score as lanes_all, and
+     * the listed rows' weights go to attn_weight. */
     const uint32_t n_visible = g.top_k && g.top_k < g.n_comp ? g.top_k : g.n_comp;
     g.lanes = (layer_attention_lanes_ctx) {
         .out_heads = scratch->heads,
@@ -18462,7 +18545,7 @@ static void layer_attention_graph(
         .q = scratch->q,
         .qt = scratch->attn_qt,
         .rows = scratch->attn_rows,
-        .score = scratch->attn_score,
+        .score = g.top_k ? scratch->attn_weight : scratch->attn_score,
         .cmax = scratch->attn_cmax,
         .inv = scratch->attn_inv,
         .n_head = n_head,
@@ -18470,6 +18553,18 @@ static void layer_attention_graph(
         .n_chunks = (g.n_raw + n_visible + ATTN_LANES_ROWS_PER_ITEM - 1) / ATTN_LANES_ROWS_PER_ITEM,
         .n_dim_chunks = (head_dim + 15) / 16,
     };
+    if (g.top_k) {
+        g.lanes_all = g.lanes;
+        g.lanes_all.rows = scratch->attn_rows_all;
+        g.lanes_all.score = scratch->attn_score;
+        g.lanes_all.n_rows = g.n_raw + g.n_comp;
+        g.lanes_all.n_chunks = (g.n_raw + g.n_comp + ATTN_LANES_ROWS_PER_ITEM - 1) / ATTN_LANES_ROWS_PER_ITEM;
+        g.lanes.all = &g.lanes_all;
+        g.lanes.pick = scratch->attn_pick;
+        g.lanes.listed = scratch->attn_listed;
+        g.lanes.allowed = scratch->index_allowed;
+        g.lanes.n_raw = g.n_raw;
+    }
     g.out_a = (matvec_q8_0_grouped_ctx) {
         .out = scratch->attn_low,
         .data = tensor_data(model, layer->attn_output_a),
@@ -18494,6 +18589,7 @@ static void layer_attention_graph(
     const uint64_t n_weight_groups = (DS4_N_INDEXER_HEAD + DS4_F16_ROWS - 1) / DS4_F16_ROWS;
     const uint64_t n_index_items = (g.n_index + INDEXER_SCORE_ROWS - 1) / INDEXER_SCORE_ROWS;
     const uint64_t n_score = (uint64_t)head_groups * g.lanes.n_chunks;
+    const uint64_t n_score_all = g.top_k ? (uint64_t)head_groups * g.lanes_all.n_chunks : n_score;
     const uint64_t n_sum = (uint64_t)head_groups * g.lanes.n_dim_chunks;
     void (*mark)(void *) = g.profile ? attn_graph_mark : NULL;
     ds4_pool_stage stages[16] = {
@@ -18516,14 +18612,14 @@ static void layer_attention_graph(
         { .fn = attn_graph_q_tail_worker, .ctx = &g,
           .n_rows = head_groups, .group_rows = head_groups,
           .deps = 1u << 3, .finish = mark, .finish_ctx = &g.mark[2] },
+        { .fn = attn_lanes_score_worker, .ctx = g.top_k ? &g.lanes_all : &g.lanes,
+          .n_rows = n_score_all, .group_rows = n_score_all, .deps = (1u << 2) | (1u << 6) },
         { .fn = indexer_score_rows_worker, .ctx = &g.index_score,
           .n_rows = g.top_k ? n_index_items : 0, .group_rows = g.top_k ? n_index_items : 1,
           .deps = (1u << 2) | (1u << 4) | (1u << 5),
           .finish = g.top_k ? attn_graph_index_select : NULL, .finish_ctx = &g },
-        { .fn = attn_lanes_score_worker, .ctx = &g.lanes,
-          .n_rows = n_score, .group_rows = n_score, .deps = (1u << 2) | (1u << 6) | (1u << 7) },
         { .fn = attn_lanes_weight_worker, .ctx = &g.lanes,
-          .n_rows = n_score, .group_rows = n_score, .deps = 1u << 8 },
+          .n_rows = n_score, .group_rows = n_score, .deps = (1u << 7) | (1u << 8) },
         { .fn = attn_lanes_denom_worker, .ctx = &g.lanes,
           .n_rows = head_groups, .group_rows = head_groups, .deps = 1u << 9 },
         { .fn = attn_lanes_sum_worker, .ctx = &g.lanes,
