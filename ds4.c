@@ -12831,7 +12831,8 @@ static inline void moe_mid_store_x16(const moe_mid_tile_ctx *ctx, const ds4_moe_
     float pw[DS4_MOE_TILE], arg[DS4_MOE_TILE], e[DS4_MOE_TILE];
     for (uint32_t lane = 0; lane < DS4_MOE_TILE; lane++) pw[lane] = ctx->pair_weight[t->pair[lane]];
     const __m512 pwv = _mm512_loadu_ps(pw);
-    const __m512 zero = _mm512_setzero_ps(), one = _mm512_set1_ps(1.0f), sign = _mm512_set1_ps(-0.0f);
+    const __m512 zero = _mm512_setzero_ps(), one = _mm512_set1_ps(1.0f);
+    const __m512i sign = _mm512_set1_epi32(INT32_MIN);
     const __m512 clampv = _mm512_set1_ps(ctx->clamp), nclampv = _mm512_set1_ps(-ctx->clamp);
     const bool clamp = ctx->clamp > 1.0e-6f;
     for (uint32_t p = 0; p < n_pairs; p++) {
@@ -12842,9 +12843,11 @@ static inline void moe_mid_store_x16(const moe_mid_tile_ctx *ctx, const ds4_moe_
             u = _mm512_mask_blend_ps(_mm512_cmp_ps_mask(u, nclampv, _CMP_LT_OQ), u, nclampv);
         }
         /* sigmoid_stable: 1 / (1 + expf(-x)) for x >= 0, else e / (1 + e)
-         * with e = expf(x); the negation is the sign flip. */
+         * with e = expf(x); the negation is the sign flip, an integer xor
+         * (_mm512_xor_ps needs AVX512DQ). */
         const __mmask16 nonneg = _mm512_cmp_ps_mask(g, zero, _CMP_GE_OQ);
-        _mm512_storeu_ps(arg, _mm512_mask_blend_ps(nonneg, g, _mm512_xor_ps(g, sign)));
+        const __m512 neg = _mm512_castsi512_ps(_mm512_xor_si512(_mm512_castps_si512(g), sign));
+        _mm512_storeu_ps(arg, _mm512_mask_blend_ps(nonneg, g, neg));
         for (uint32_t lane = 0; lane < t->n; lane++) e[lane] = expf(arg[lane]);
         const __m512 ev = _mm512_maskz_loadu_ps(live, e);
         const __m512 den = _mm512_add_ps(one, ev);
@@ -16534,7 +16537,9 @@ static inline void compressor_tile_convert8(float *wc, const uint16_t *const row
     for (unsigned k = 0; k < 8; k++) {
         const __m256 lo = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(rows[k] + i)));
         const __m256 hi = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(rows[k + 8] + i)));
-        z[k] = _mm512_insertf32x8(_mm512_castps256_ps512(lo), hi, 1);
+        /* The 256-bit insert on the same bits: vinsertf32x8 needs AVX512DQ. */
+        z[k] = _mm512_castpd_ps(_mm512_insertf64x4(_mm512_castps_pd(_mm512_castps256_ps512(lo)),
+                                                   _mm256_castps_pd(hi), 1));
     }
     for (unsigned k = 0; k < 4; k++) {
         t[2 * k] = _mm512_unpacklo_ps(z[2 * k], z[2 * k + 1]);
