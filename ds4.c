@@ -16466,11 +16466,16 @@ static void compressor_tile_worker(void *vctx, uint64_t i0, uint64_t i1) {
     const compressor_tile_ctx *ctx = vctx;
     const uint64_t n = ctx->in_dim;
     const uint64_t ws = ctx->wf_stride;
-    const uint64_t n_tb = (ctx->n_tiles + COMP_TILE_BLOCK - 1) / COMP_TILE_BLOCK;
+    const uint64_t n_rg = ((uint64_t)ctx->width + COMP_TILE_ROWS - 1) / COMP_TILE_ROWS;
     float *wf = ctx->wf + (uint64_t)g_pool_thread * COMP_TILE_ROWS * ws;
     for (uint64_t item = i0; item < i1; item++) {
-        const uint64_t rg = item / n_tb;
-        const uint64_t tb = item - rg * n_tb;
+        /* Tile block outer: the threads claim consecutive items, so they
+         * share one tile block (1 MB of activations) from L3 while each
+         * converts its own row group; row group outer, every row group
+         * streamed the whole activation set again (2 GB per matrix at
+         * 2048 tokens). */
+        const uint64_t tb = item / n_rg;
+        const uint64_t rg = item - tb * n_rg;
         const uint64_t o = rg * COMP_TILE_ROWS;
         const uint64_t n_rows = ctx->width - o < COMP_TILE_ROWS ? ctx->width - o : COMP_TILE_ROWS;
         for (uint64_t r = 0; r < COMP_TILE_ROWS; r++) {
