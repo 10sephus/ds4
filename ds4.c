@@ -80892,7 +80892,10 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             }
             const int n = prompt->len - i < (int)DS41_CPU_BATCH ?
                 prompt->len - i : (int)DS41_CPU_BATCH;
-            if (!ds41_cpu_prefill(g, prompt->v + i, (uint32_t)n, s->logits, err, errlen)) {
+            const int next = prompt->len - i - n < (int)DS41_CPU_BATCH ?
+                prompt->len - i - n : (int)DS41_CPU_BATCH;
+            if (!ds41_cpu_prefill(g, prompt->v + i, (uint32_t)n, prompt->v + i + n,
+                                  (uint32_t)next, s->logits, err, errlen)) {
                 s->checkpoint_valid = false;
                 return 1;
             }

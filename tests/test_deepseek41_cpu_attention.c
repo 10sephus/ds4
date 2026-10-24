@@ -262,6 +262,107 @@ static void check_f16_round(void) {
     }
 }
 
+/* One chunk's Engram rows through ds41_cpu_engram_batch_take: hash the
+ * tokens after *h into b->ids, take the read ahead or read them, and
+ * compare the rows with a plain ds4_engram_read of every token's ids. */
+static void engram_chunk(ds41_cpu_batch *b, const ds4_engram_layout *l, ds4_engram_history *h,
+                         const ds4_engram_table tab[2], const int *tokens, uint32_t n,
+                         bool ahead) {
+    const size_t cols = DS4_ENGRAM_COLS, dim = DS4_ENGRAM_DIM;
+    for (uint32_t i = 0; i < n; i++)
+        assert(ds4_engram_hash(l, h, &tokens[i], NULL, 1, b->ids + (size_t)i * 2u * cols));
+    ds41_cpu_engram_batch own, *e = ds41_cpu_engram_batch_take(b, tab, n, &own);
+    assert((e == &b->ahead) == ahead && !b->ahead_live);
+    assert(ds41_cpu_engram_batch_wait(e, 0) && ds41_cpu_engram_batch_wait(e, 1));
+    ds41_cpu_engram_batch_finish(e, false);
+    float *ref = malloc((size_t)n * 2u * cols * dim * sizeof(float));
+    assert(ref);
+    for (uint32_t t = 0; t < n; t++)
+        for (uint32_t i = 0; i < 2; i++)
+            assert(ds4_engram_read(&tab[i], b->ids + ((size_t)t * 2u + i) * cols, cols,
+                                   ref + ((size_t)t * 2u + i) * cols * dim));
+    assert(!memcmp(ref, b->rows, (size_t)n * 2u * cols * dim * sizeof(float)));
+    free(ref);
+}
+
+/* The next chunk's rows read ahead are the bytes its own ids read, a chunk
+ * with other ids or another length stops the read ahead and reads its own,
+ * an invalid token starts none, and a batch freed with reads in flight
+ * joins them. */
+static void check_engram_read_ahead(void) {
+    static uint32_t map[256];
+    for (uint32_t i = 0; i < 256; i++) map[i] = i / 2u;
+    ds4_engram_layout l = {.token_map = map, .vocab_size = 256,
+                           .compressed_vocab_size = 128, .pad_id = 1};
+    for (uint32_t layer = 0; layer < 2; layer++) {
+        for (uint32_t j = 0; j < 4; j++)
+            l.multipliers[layer][j] = 35184372088831ull - 2u * (j + 4u * layer);
+        for (uint32_t j = 0; j < DS4_ENGRAM_COLS; j++) {
+            l.primes[layer][j] = 163u + 2u * j + layer;
+            l.rows[layer] += l.primes[layer][j];
+        }
+    }
+    assert(ds4_engram_layout_valid(&l));
+    /* Two tables back to back; every row decodes (no NaN code, no 255 scale). */
+    char path[] = "/tmp/ds41-engram-XXXXXX";
+    const int fd = mkstemp(path);
+    assert(fd >= 0);
+    for (uint32_t t = 0; t < 2; t++) {
+        for (uint32_t r = 0; r < l.rows[t]; r++) {
+            uint8_t row[DS4_ENGRAM_ROW_BYTES];
+            for (uint32_t j = 0; j < DS4_ENGRAM_DIM; j++)
+                row[j] = (uint8_t)((r * 7u + j * 13u + t * 5u) % 127u) | (uint8_t)((j & 1u) << 7);
+            for (uint32_t k = 0; k < 8; k++)
+                row[DS4_ENGRAM_DIM + k] = (uint8_t)(120u + (r + k + t) % 12u);
+            assert(write(fd, row, sizeof(row)) == (ssize_t)sizeof(row));
+        }
+    }
+    ds4_engram_table tab[2];
+    assert(ds4_engram_table_open(&tab[0], path, 0, l.rows[0]));
+    assert(ds4_engram_table_open(&tab[1], path, (uint64_t)l.rows[0] * DS4_ENGRAM_ROW_BYTES,
+                                 l.rows[1]));
+    unlink(path);
+    close(fd);
+    enum { N = 80 };
+    const size_t ids = (size_t)N * 2u * DS4_ENGRAM_COLS;
+    ds41_cpu_batch *b = calloc(1, sizeof(*b));
+    assert(b);
+    b->ids = malloc(ids * sizeof(uint32_t));
+    b->next_ids = malloc(ids * sizeof(uint32_t));
+    b->rows = malloc(ids * DS4_ENGRAM_DIM * sizeof(float));
+    b->next_rows = malloc(ids * DS4_ENGRAM_DIM * sizeof(float));
+    assert(b->ids && b->next_ids && b->rows && b->next_rows);
+    int a[N], next[N], other[N];
+    for (uint32_t i = 0; i < N; i++) {
+        rng_state = rng_state * 6364136223846793005ull + 1442695040888963407ull;
+        a[i] = (int)((rng_state >> 33) & 255u);
+        next[i] = other[i] = (int)((rng_state >> 45) & 255u);
+    }
+    other[N / 2] = (other[N / 2] + 2) & 255;   /* another compressed id */
+    ds4_engram_history h, h2;
+    ds4_engram_history_reset(&h);
+    engram_chunk(b, &l, &h, tab, a, N, false);
+    float *ahead_rows = b->next_rows;
+    ds41_cpu_engram_batch_ahead(b, &l, h, tab, next, 70);
+    assert(b->ahead_live && b->next_n == 70);
+    h2 = h;
+    engram_chunk(b, &l, &h2, tab, next, 70, true);
+    assert(b->rows == ahead_rows);
+    ds41_cpu_engram_batch_ahead(b, &l, h, tab, next, 70);
+    h2 = h;
+    engram_chunk(b, &l, &h2, tab, other, 70, false);
+    ds41_cpu_engram_batch_ahead(b, &l, h, tab, next, 70);
+    h2 = h;
+    engram_chunk(b, &l, &h2, tab, next, 69, false);
+    const int bad[2] = {3, 256};
+    ds41_cpu_engram_batch_ahead(b, &l, h, tab, bad, 2);
+    assert(!b->ahead_live);
+    ds41_cpu_engram_batch_ahead(b, &l, h, tab, next, N);
+    ds41_cpu_batch_free(b);
+    ds4_engram_table_close(&tab[0]);
+    ds4_engram_table_close(&tab[1]);
+}
+
 int main(void) {
     g_ds4_shape = DS4_SHAPE_FLASH41;
     assert(!ds41_cpu_attention_create(0));
@@ -274,7 +375,9 @@ int main(void) {
     check_index_scores(s);
     check_softmax(s);
     check_f16_round();
+    check_engram_read_ahead();
     ds41_cpu_attention_free(s);
-    puts("V4.1 CPU attention: pair carry, top-k, candidate mask, ring, index scores and sink softmax PASS");
+    puts("V4.1 CPU attention: pair carry, top-k, candidate mask, ring, index scores, sink softmax "
+         "and Engram read ahead PASS");
     return 0;
 }

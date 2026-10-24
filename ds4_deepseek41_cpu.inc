@@ -224,7 +224,7 @@ static void ds41_cpu_hc_post_norm(void *vctx) {
 #define DS41_CPU_BATCH_TOKEN_BYTES (4u * (3u * 4u * 5120u + 4u * 5120u + 52u + 1280u + \
     2u * 64u * 512u + 512u + 8192u + 2u * 24u * 256u + 5u * 5120u + 3u * 2304u + \
     6u * (2304u + 5120u + 1u) + 6u + 48u + 6u + 512u + 24u + 384u + 2u * 4u * 5120u + \
-    2u * 512u + 32u * 128u + 32u))
+    2u * 512u + 32u * 128u + 32u + 2u * 24u * 256u + 48u))
 /* The query side's scratch of one pool thread (see
  * ds41_cpu_batch_attention_worker): the attended row list, the transposed
  * query, the head scores, the index scores and the top-k heap. */
@@ -234,6 +234,27 @@ typedef struct {
     float inv[64];
     ds41_cpu_candidate heap[512];
 } ds41_cpu_batch_attention_scratch;
+
+/* The chunk's Engram rows, read by helper threads while the layers before
+ * 1 and 14 run: every token's row of layer 1's table, then of layer 14's.
+ * The rows are the bytes ds4_engram_read() returns and land where the
+ * synchronous read put them; only the time they are read changes.  A row
+ * not in the page cache is a small random read, and the device serves
+ * them faster the more are in flight: 64 readers keep a cold chunk's
+ * 24576 rows from stalling layer 1.  A reader takes one token's rows of
+ * a table at a time, so a chunk of n tokens starts at most n readers. */
+#define DS41_CPU_ENGRAM_READERS 64u
+typedef struct {
+    const ds4_engram_table *table;
+    const uint32_t *ids;
+    float *rows;
+    uint32_t n, next[2], done[2];
+    int failed, stop;
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    pthread_t threads[DS41_CPU_ENGRAM_READERS];
+    uint32_t started;
+} ds41_cpu_engram_batch;
 
 typedef struct ds41_cpu_batch {
     float *residual, *after_attn, *flat, *x, *norm, *block, *shared;
@@ -252,6 +273,12 @@ typedef struct ds41_cpu_batch {
      * with the batch; a slot's pages are touched only by its thread. */
     uint8_t *attn;
     size_t attn_stride;
+    /* The next chunk's Engram row ids and rows (next_n tokens), which
+     * ahead reads while ahead_live (see ds41_cpu_prefill). */
+    uint32_t *next_ids, next_n;
+    float *next_rows;
+    ds41_cpu_engram_batch ahead;
+    bool ahead_live;
     double *xt;
     int *selected;
     uint32_t *ids, *entry, *sel;
@@ -780,8 +807,11 @@ static void ds41_cpu_batch_fail(ds41_cpu_batch_ctx *c) {
     __atomic_store_n(&c->failed, 1, __ATOMIC_RELAXED);
 }
 
+static void ds41_cpu_engram_batch_finish(ds41_cpu_engram_batch *e, bool stop);
+
 static void ds41_cpu_batch_free(ds41_cpu_batch *b) {
     if (!b) return;
+    if (b->ahead_live) ds41_cpu_engram_batch_finish(&b->ahead, true);
     free(b->residual); free(b->after_attn); free(b->flat); free(b->x);
     free(b->norm); free(b->block); free(b->shared); free(b->pre);
     free(b->attn_split); free(b->ffn_split); free(b->qr); free(b->q);
@@ -792,7 +822,7 @@ static void ds41_cpu_batch_free(ds41_cpu_batch *b) {
     free(b->mix); free(b->probs); free(b->xt);
     free(b->ckv); free(b->cscore); free(b->iq); free(b->iw);
     free(b->prev_window); free(b->rounded_raw); free(b->rounded_comp);
-    free(b->attn);
+    free(b->attn); free(b->next_ids); free(b->next_rows);
     free(b);
 }
 
@@ -838,6 +868,8 @@ static ds41_cpu_batch *ds41_cpu_batch_create(uint32_t ctx) {
     b->weight = malloc(pairs * f);
     b->selected = malloc(pairs * sizeof(int));
     b->ids = malloc(n * 2u * DS4_ENGRAM_COLS * sizeof(uint32_t));
+    b->next_rows = malloc(n * 2u * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM * f);
+    b->next_ids = malloc(n * 2u * DS4_ENGRAM_COLS * sizeof(uint32_t));
     b->entry = malloc(pairs * sizeof(uint32_t));
     b->sel = malloc(n * 512u * sizeof(uint32_t));
     b->mix = malloc(n * 24u * f);
@@ -859,7 +891,8 @@ static ds41_cpu_batch *ds41_cpu_batch_create(uint32_t ctx) {
         !b->engram_kv || !b->shared_gate || !b->shared_up || !b->shared_mid ||
         !b->mid || !b->partial || !b->weight || !b->selected || !b->ids || !b->entry ||
         !b->sel || !b->mix || !b->probs || !b->xt || !b->ckv || !b->cscore ||
-        !b->iq || !b->iw || !b->prev_window || !b->rounded_raw || !b->attn) {
+        !b->iq || !b->iw || !b->prev_window || !b->rounded_raw || !b->attn ||
+        !b->next_rows || !b->next_ids) {
         ds41_cpu_batch_free(b);
         return NULL;
     }
@@ -882,27 +915,6 @@ static bool ds41_cpu_matmul(float *out, uint64_t out_stride, const ds4_model *m,
                              x + (size_t)t * x_stride, round)) return false;
     return true;
 }
-
-/* The chunk's Engram rows, read by helper threads while the layers before
- * 1 and 14 run: every token's row of layer 1's table, then of layer 14's.
- * The rows are the bytes ds4_engram_read() returns and land where the
- * synchronous read put them; only the time they are read changes.  A row
- * not in the page cache is a small random read, and the device serves
- * them faster the more are in flight: 64 readers keep a cold chunk's
- * 24576 rows from stalling layer 1.  A reader takes one token's rows of
- * a table at a time, so a chunk of n tokens starts at most n readers. */
-#define DS41_CPU_ENGRAM_READERS 64u
-typedef struct {
-    const ds4_engram_table *table;
-    const uint32_t *ids;
-    float *rows;
-    uint32_t n, next[2], done[2];
-    int failed, stop;
-    pthread_mutex_t mutex;
-    pthread_cond_t cond;
-    pthread_t threads[DS41_CPU_ENGRAM_READERS];
-    uint32_t started;
-} ds41_cpu_engram_batch;
 
 static void *ds41_cpu_engram_batch_thread(void *vctx) {
     ds41_cpu_engram_batch *e = vctx;
@@ -953,6 +965,43 @@ static void ds41_cpu_engram_batch_finish(ds41_cpu_engram_batch *e, bool stop) {
     for (uint32_t i = 0; i < e->started; i++) pthread_join(e->threads[i], NULL);
     pthread_cond_destroy(&e->cond);
     pthread_mutex_destroy(&e->mutex);
+}
+
+/* The readers of a chunk's rows, b->ids of n tokens: the read ahead when it
+ * read these very ids, whose rows become b->rows (they are the bytes reading
+ * the ids now returns), else own started on them once any other read ahead
+ * is stopped. */
+static ds41_cpu_engram_batch *ds41_cpu_engram_batch_take(ds41_cpu_batch *b,
+                                                         const ds4_engram_table table[2],
+                                                         uint32_t n, ds41_cpu_engram_batch *own) {
+    if (b->ahead_live) {
+        b->ahead_live = false;
+        if (b->next_n == n &&
+            !memcmp(b->next_ids, b->ids, (size_t)n * 2u * DS4_ENGRAM_COLS * sizeof(*b->ids))) {
+            float *rows = b->rows;
+            b->rows = b->next_rows;
+            b->next_rows = rows;
+            return &b->ahead;
+        }
+        ds41_cpu_engram_batch_finish(&b->ahead, true);
+    }
+    ds41_cpu_engram_batch_start(own, table, b->ids, b->rows, n);
+    return own;
+}
+
+/* Start reading ahead the rows of the next chunk's next_n tokens into
+ * b->next_rows, hashed after history, the hash state its own chunk starts
+ * from; nothing when a token is outside the vocabulary. */
+static void ds41_cpu_engram_batch_ahead(ds41_cpu_batch *b, const ds4_engram_layout *layout,
+                                        ds4_engram_history history,
+                                        const ds4_engram_table table[2],
+                                        const int *next, uint32_t next_n) {
+    for (uint32_t i = 0; i < next_n; i++)
+        if (!ds4_engram_hash(layout, &history, &next[i], NULL, 1,
+                             b->next_ids + (size_t)i * 2u * DS4_ENGRAM_COLS)) return;
+    ds41_cpu_engram_batch_start(&b->ahead, table, b->next_ids, b->next_rows, next_n);
+    b->next_n = next_n;
+    b->ahead_live = true;
 }
 
 /* Engram and the flat HC input of each token before attention. */
@@ -1387,19 +1436,27 @@ static bool ds41_cpu_prefill_layer(ds41_cpu_state *s, uint32_t il, uint32_t n,
     return !c.failed;
 }
 
+/* Whether a chunk of n tokens at pos runs layer-major.  Past 2048 blocks
+ * layer 20 masks blocks for the later index sources of its own token only;
+ * such chunks keep the token loop. */
+static bool ds41_cpu_prefill_batched(uint32_t pos, uint32_t n) {
+    const uint32_t ratio20 = ds4_layer_compress_ratio(20);
+    const uint64_t last_comp = ratio20 ? ((uint64_t)pos + n) / ratio20 : 0;
+    return n > 1 && n <= DS41_CPU_BATCH && (last_comp + 7u) / 8u <= 2048u &&
+        (uint64_t)pos + n <= DS41_CPU_BATCH_COMP;
+}
+
 /* Up to DS41_CPU_BATCH prompt tokens at the current position; logits, when
- * given, receive the last token's. */
+ * given, receive the last token's.  next (next_n tokens, maybe none) is the
+ * chunk the caller prefills after this one: its Engram rows are read while
+ * the layers after 14 run, as this chunk's are while the layers before. */
 static bool ds41_cpu_prefill(ds41_cpu_state *s, const int *tokens, uint32_t n,
+                             const int *next, uint32_t next_n,
                              float *logits, char *error, size_t cap) {
     if (!s || !s->valid) return ds41_cpu_error(error, cap, "invalid V4.1 CPU state; reset required");
     if (n > DS41_CPU_BATCH) return ds41_cpu_error(error, cap, "V4.1 CPU prefill chunk too large");
     if (n > s->ctx - s->pos) return ds41_cpu_error(error, cap, "V4.1 CPU context is full");
-    /* Past 2048 blocks layer 20 masks blocks for the later index sources of
-     * its own token only; such chunks keep the token loop. */
-    const uint32_t ratio20 = ds4_layer_compress_ratio(20);
-    const uint64_t last_comp = ratio20 ? ((uint64_t)s->pos + n) / ratio20 : 0;
-    if (n <= 1 || (last_comp + 7u) / 8u > 2048u ||
-        (uint64_t)s->pos + n > DS41_CPU_BATCH_COMP) {
+    if (!ds41_cpu_prefill_batched(s->pos, n)) {
         for (uint32_t i = 0; i < n; i++)
             if (!ds41_cpu_forward(s, tokens[i], i + 1u == n ? logits : NULL, error, cap))
                 return false;
@@ -1419,8 +1476,7 @@ static bool ds41_cpu_prefill(ds41_cpu_state *s, const int *tokens, uint32_t n,
         if (!ds4_engram_hash(&s->engram, &history, &tokens[i], NULL, 1,
                              b->ids + (size_t)i * 2u * DS4_ENGRAM_COLS))
             return ds41_cpu_error(error, cap, "V4.1 Engram hash failed");
-    ds41_cpu_engram_batch rows;
-    ds41_cpu_engram_batch_start(&rows, s->table, b->ids, b->rows, n);
+    ds41_cpu_engram_batch own, *rows = ds41_cpu_engram_batch_take(b, s->table, n, &own);
     double read_seconds = profile ? now_sec() - started : 0;
     for (uint32_t i = 0; i < n; i++) {
         float *x = b->x + (size_t)i * 5120u, *pre = b->pre + (size_t)i * 4u;
@@ -1432,17 +1488,21 @@ static bool ds41_cpu_prefill(ds41_cpu_state *s, const int *tokens, uint32_t n,
     for (uint32_t il = 0; il < 40; il++) {
         if (il == 1 || il == 14) {
             const double wait = profile ? now_sec() : 0;
-            const bool ok = ds41_cpu_engram_batch_wait(&rows, il == 1 ? 0u : 1u);
-            if (il == 14) ds41_cpu_engram_batch_finish(&rows, false);
+            const bool ok = ds41_cpu_engram_batch_wait(rows, il == 1 ? 0u : 1u);
+            if (il == 14) ds41_cpu_engram_batch_finish(rows, false);
             if (profile) read_seconds += now_sec() - wait;
             if (!ok) {
-                if (il == 1) ds41_cpu_engram_batch_finish(&rows, true);
+                if (il == 1) ds41_cpu_engram_batch_finish(rows, true);
                 s->valid = false;
                 return ds41_cpu_error(error, cap, "V4.1 Engram row read failed");
             }
         }
+        /* The readers are free: start on the next chunk's rows, hashed
+         * after this chunk's tokens as its own call will hash them. */
+        if (il == 14 && next && ds41_cpu_prefill_batched(s->pos + n, next_n))
+            ds41_cpu_engram_batch_ahead(b, &s->engram, history, s->table, next, next_n);
         if (!ds41_cpu_prefill_layer(s, il, n, profile ? phase : NULL)) {
-            if (il < 14) ds41_cpu_engram_batch_finish(&rows, true);
+            if (il < 14) ds41_cpu_engram_batch_finish(rows, true);
             s->valid = false;
             if (error && cap) snprintf(error, cap, "V4.1 CPU prefill layer %u failed at token position %u", il, s->pos);
             return false;
