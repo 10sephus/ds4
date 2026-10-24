@@ -502,6 +502,25 @@ static inline __m512 ds41_cpu_fmaxf16(__m512 score, __m512 peak) {
     return m;
 }
 
+/* swiglu's silu(g) * u per lane, times weight: the clamp of g and u, then
+ * silu(x) = x * sigmoid_stable(x), whose branch on x >= 0 becomes a lane
+ * mask, and the products in the scalar order. */
+static inline __m512 ds41_cpu_swiglu16(__m512 g, __m512 u, float clamp, float weight) {
+    if (clamp > 1.0e-6f) {
+        const __m512 hi = _mm512_set1_ps(clamp), lo = _mm512_set1_ps(-clamp);
+        g = _mm512_mask_mov_ps(g, _mm512_cmp_ps_mask(g, hi, _CMP_GT_OQ), hi);
+        u = _mm512_mask_mov_ps(u, _mm512_cmp_ps_mask(u, hi, _CMP_GT_OQ), hi);
+        u = _mm512_mask_mov_ps(u, _mm512_cmp_ps_mask(u, lo, _CMP_LT_OQ), lo);
+    }
+    const __mmask16 pos = _mm512_cmp_ps_mask(g, _mm512_setzero_ps(), _CMP_GE_OQ);
+    const __m512 neg = _mm512_castsi512_ps(_mm512_xor_si512(_mm512_castps_si512(g),
+                                                            _mm512_set1_epi32((int)0x80000000u)));
+    const __m512 one = _mm512_set1_ps(1.0f);
+    const __m512 e = ds41_cpu_expf16(_mm512_mask_mov_ps(g, pos, neg));
+    const __m512 sig = _mm512_div_ps(_mm512_mask_mov_ps(e, pos, one), _mm512_add_ps(one, e));
+    return _mm512_mul_ps(_mm512_mul_ps(_mm512_mul_ps(g, sig), u), _mm512_set1_ps(weight));
+}
+
 /* Batched prefill kernels.  A tile's weights are decoded once per block and
  * applied to many tokens.  For every (row, token) the products and additions
  * are those of the one-token kernels above, in the same order, so each
@@ -1060,20 +1079,8 @@ static void ds41_cpu_routed_mid_batch_worker(void *vctx, uint64_t first, uint64_
             }
             for (uint32_t t = 0; t < nt; t++) {
                 const uint32_t k = c->entry[k0 + t];
-                float gate[16] __attribute__((aligned(64)));
-                float up[16] __attribute__((aligned(64)));
-                _mm512_storeu_ps(gate, ag[t]);
-                _mm512_storeu_ps(up, au[t]);
-                float *mid = c->mid + (uint64_t)k * DS4_N_FF_EXP + row;
-                for (unsigned lane = 0; lane < 16; lane++) {
-                    float g = gate[lane], u = up[lane];
-                    if (c->clamp > 1.0e-6f) {
-                        if (g > c->clamp) g = c->clamp;
-                        if (u > c->clamp) u = c->clamp;
-                        if (u < -c->clamp) u = -c->clamp;
-                    }
-                    mid[lane] = silu(g) * u * c->weight[k];
-                }
+                _mm512_storeu_ps(c->mid + (uint64_t)k * DS4_N_FF_EXP + row,
+                                 ds41_cpu_swiglu16(ag[t], au[t], c->clamp, c->weight[k]));
             }
         }
     }

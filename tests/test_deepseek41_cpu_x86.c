@@ -813,6 +813,47 @@ static void check_expf_fmaxf(void) {
     }
 }
 
+/* The vector swiglu epilogue against swiglu's scalar steps (clamp, silu,
+ * the products), special values included, with and without the clamp. */
+static void check_swiglu16(void) {
+    const uint32_t specials[16] = {
+        0x00000000u, 0x80000000u, 0x7f800000u, 0xff800000u, 0x7fc00000u, 0x00000001u,
+        0x80000001u, 0x42c80000u, 0xc2c80000u, 0x41200000u, 0xc1200000u, 0x41200001u,
+        0x3f800000u, 0xbf800000u, 0x42b17218u, 0xc2cff1b5u,
+    };
+    const float clamps[2] = {10.0f, 0.0f};
+    float g[16] __attribute__((aligned(64))), u[16] __attribute__((aligned(64)));
+    float out[16] __attribute__((aligned(64)));
+    for (int it = 0; it < 4096; it++) {
+        for (int k = 0; k < 16; k++) {
+            if (it < 32) {
+                const uint32_t a = specials[(it + k) % 16], b = specials[(it / 2 + 3 * k) % 16];
+                memcpy(&g[k], &a, sizeof(a));
+                memcpy(&u[k], &b, sizeof(b));
+            } else {
+                g[k] = test_float() * (it % 3 ? 12.0f : 120.0f);
+                u[k] = test_float() * 15.0f;
+            }
+        }
+        const float weight = it % 7 == 0 ? 1.0f : it % 5 ? test_float() : -0.0f;
+        for (int ci = 0; ci < 2; ci++) {
+            const float clamp = clamps[ci];
+            _mm512_store_ps(out, ds41_cpu_swiglu16(_mm512_load_ps(g), _mm512_load_ps(u), clamp, weight));
+            for (int k = 0; k < 16; k++) {
+                float gg = g[k], uu = u[k];
+                if (clamp > 1.0e-6f) {
+                    if (gg > clamp) gg = clamp;
+                    if (uu > clamp) uu = clamp;
+                    if (uu < -clamp) uu = -clamp;
+                }
+                /* With weight 1 the shared expert's swiglu: silu(g) * u alone. */
+                const float ref = weight == 1.0f ? silu(gg) * uu : silu(gg) * uu * weight;
+                CHECK(memcmp(&ref, &out[k], sizeof(ref)) == 0);
+            }
+        }
+    }
+}
+
 /* The index scores of a query, four keys and a head per lane at a time,
  * against ds41_cpu_index_score_worker. */
 static void check_index_scores(void) {
@@ -901,6 +942,7 @@ int main(void) {
     check_q2k_pair();
     check_q4_tails();
     check_expf_fmaxf();
+    check_swiglu16();
     check_index_scores();
     check_attention_scores();
     check_attention_weights();

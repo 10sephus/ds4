@@ -961,8 +961,16 @@ static void ds41_cpu_batch_swiglu_worker(void *vctx, uint64_t t0, uint64_t t1) {
     ds41_cpu_batch_ctx *c = vctx;
     for (uint64_t t = t0; t < t1; t++) {
         float *mid = c->b->shared_mid + t * 2304u;
-        swiglu(mid, c->b->shared_gate + t * 2304u, c->b->shared_up + t * 2304u,
-               2304, DS4_SWIGLU_CLAMP_EXP);
+        const float *gate = c->b->shared_gate + t * 2304u, *up = c->b->shared_up + t * 2304u;
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+        /* silu(g) * u * 1 is silu(g) * u exactly. */
+        for (uint32_t i = 0; i < 2304; i += 16)
+            _mm512_storeu_ps(mid + i, ds41_cpu_swiglu16(_mm512_loadu_ps(gate + i),
+                                                        _mm512_loadu_ps(up + i),
+                                                        DS4_SWIGLU_CLAMP_EXP, 1.0f));
+#else
+        swiglu(mid, gate, up, 2304, DS4_SWIGLU_CLAMP_EXP);
+#endif
         ds41_cpu_bf16_rows(mid, 2304);
     }
 }
