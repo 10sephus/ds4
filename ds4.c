@@ -17267,6 +17267,81 @@ static void attn_lanes_score_block(
         _mm512_storeu_ps(attn_lanes_score(ctx, h0, r0 + j), _mm512_mul_ps(acc[j], scale));
     }
 }
+
+/* expf() of glibc 2.41 on x86-64, sixteen lanes at a time.  The libm ifunc
+ * runs sysdeps/ieee754/flt-32/e_expf.c built with FMA on every CPU with
+ * AVX2 and FMA, so on every AVX-512 CPU; these are its steps in its order,
+ * read off that build's code: in double, kd = fma(N/ln2, x, 0x1.8p52)
+ * (N = 32), whose low bits are k = round(x N/ln2); r = fma(N/ln2, x, -(kd -
+ * 0x1.8p52)); s = 2^(k/N) as the bits of table entry k % N plus k << 47;
+ * y = fma(fma(r, C0, C1), r * r, fma(r, C2, 1)) * s; one rounding to float.
+ * Its branch for |x| >= 88 (and NaN) is taken lane-wise: -inf gives +0, NaN
+ * and +inf x + x, x > 0x1.62e42ep6 +inf, x < -0x1.9fe368p6 +0 (glibc's
+ * 0x1p-95f * 0x1p-95f), x < -0x1.9d1d9ep6 0x1p-149 (0x1.4p-75f squared),
+ * the other lanes the main path.  Neither the exceptions nor errno are
+ * reproduced, only the values: tests/test_cpu_quant_x86.c compares all
+ * 2^32 inputs with expf() bit for bit, so a libm that computes otherwise
+ * fails there. */
+static const uint64_t ds4_expf_table[32] = {
+    0x3ff0000000000000, 0x3fefd9b0d3158574, 0x3fefb5586cf9890f, 0x3fef9301d0125b51,
+    0x3fef72b83c7d517b, 0x3fef54873168b9aa, 0x3fef387a6e756238, 0x3fef1e9df51fdee1,
+    0x3fef06fe0a31b715, 0x3feef1a7373aa9cb, 0x3feedea64c123422, 0x3feece086061892d,
+    0x3feebfdad5362a27, 0x3feeb42b569d4f82, 0x3feeab07dd485429, 0x3feea47eb03a5585,
+    0x3feea09e667f3bcd, 0x3fee9f75e8ec5f74, 0x3feea11473eb0187, 0x3feea589994cce13,
+    0x3feeace5422aa0db, 0x3feeb737b0cdc5e5, 0x3feec49182a3f090, 0x3feed503b23e255d,
+    0x3feee89f995ad3ad, 0x3feeff76f2fb5e47, 0x3fef199bdd85529c, 0x3fef3720dcef9069,
+    0x3fef5818dcfba487, 0x3fef7c97337b9b5f, 0x3fefa4afa2a490da, 0x3fefd0765b6e4540,
+};
+
+static inline __m256 ds4_expf8_main(__m256 x) {
+    const __m512d inv_ln2_n = _mm512_castsi512_pd(_mm512_set1_epi64(0x40471547652b82fe)); /* 0x1.71547652b82fep+5 */
+    const __m512d shift = _mm512_castsi512_pd(_mm512_set1_epi64(0x4338000000000000));     /* 0x1.8p+52 */
+    const __m512d c0 = _mm512_castsi512_pd(_mm512_set1_epi64(0x3ebc6af84b912394));        /* 0x1.c6af84b912394p-20 */
+    const __m512d c1 = _mm512_castsi512_pd(_mm512_set1_epi64(0x3f2ebfce50fac4f3));        /* 0x1.ebfce50fac4f3p-13 */
+    const __m512d c2 = _mm512_castsi512_pd(_mm512_set1_epi64(0x3f962e42ff0c52d6));        /* 0x1.62e42ff0c52d6p-6 */
+    const __m512d xd = _mm512_cvtps_pd(x);
+    __m512d kd = _mm512_fmadd_pd(inv_ln2_n, xd, shift);
+    const __m512i ki = _mm512_castpd_si512(kd);
+    kd = _mm512_sub_pd(kd, shift);
+    const __m512d r = _mm512_fmsub_pd(inv_ln2_n, xd, kd);
+    /* Entries 0-15 and 16-31 by the low four bits of k, then bit 4. */
+    const __m512i lo = _mm512_permutex2var_epi64(_mm512_loadu_si512(ds4_expf_table), ki,
+                                                 _mm512_loadu_si512(ds4_expf_table + 8));
+    const __m512i hi = _mm512_permutex2var_epi64(_mm512_loadu_si512(ds4_expf_table + 16), ki,
+                                                 _mm512_loadu_si512(ds4_expf_table + 24));
+    __m512i t = _mm512_mask_blend_epi64(_mm512_test_epi64_mask(ki, _mm512_set1_epi64(16)), lo, hi);
+    t = _mm512_add_epi64(t, _mm512_slli_epi64(ki, 47));
+    const __m512d z = _mm512_fmadd_pd(r, c0, c1);
+    const __m512d r2 = _mm512_mul_pd(r, r);
+    __m512d y = _mm512_fmadd_pd(r, c2, _mm512_set1_pd(1.0));
+    y = _mm512_fmadd_pd(z, r2, y);
+    return _mm512_cvtpd_ps(_mm512_mul_pd(y, _mm512_castsi512_pd(t)));
+}
+
+static inline __m512 ds4_expf16(__m512 x) {
+    const __m256 lo = ds4_expf8_main(_mm512_castps512_ps256(x));
+    const __m256 hi = ds4_expf8_main(_mm256_castpd_ps(_mm512_extractf64x4_pd(_mm512_castps_pd(x), 1)));
+    __m512 y = _mm512_castpd_ps(_mm512_insertf64x4(_mm512_castpd256_pd512(_mm256_castps_pd(lo)),
+                                                   _mm256_castps_pd(hi), 1));
+    const __m512i xi = _mm512_castps_si512(x);
+    const __m512i abstop = _mm512_and_si512(_mm512_srli_epi32(xi, 20), _mm512_set1_epi32(0x7ff));
+    const __mmask16 big = _mm512_cmpgt_epu32_mask(abstop, _mm512_set1_epi32(0x42a));   /* |x| >= 88 or NaN */
+    if (big) {
+        /* Lowest precedence first: each later mask overrides the earlier. */
+        const __m512 may_uflow = _mm512_castsi512_ps(_mm512_set1_epi32((int)0xc2ce8ecfu));   /* -0x1.9d1d9ep6 */
+        const __m512 uflow = _mm512_castsi512_ps(_mm512_set1_epi32((int)0xc2cff1b4u));       /* -0x1.9fe368p6 */
+        const __m512 oflow = _mm512_castsi512_ps(_mm512_set1_epi32(0x42b17217));            /* 0x1.62e42ep6 */
+        y = _mm512_mask_mov_ps(y, _mm512_mask_cmp_ps_mask(big, x, may_uflow, _CMP_LT_OQ),
+                               _mm512_castsi512_ps(_mm512_set1_epi32(1)));
+        y = _mm512_mask_mov_ps(y, _mm512_mask_cmp_ps_mask(big, x, uflow, _CMP_LT_OQ), _mm512_setzero_ps());
+        y = _mm512_mask_mov_ps(y, _mm512_mask_cmp_ps_mask(big, x, oflow, _CMP_GT_OQ),
+                               _mm512_castsi512_ps(_mm512_set1_epi32(0x7f800000)));
+        y = _mm512_mask_mov_ps(y, _mm512_cmpgt_epu32_mask(abstop, _mm512_set1_epi32(0x7f7)), _mm512_add_ps(x, x));
+        y = _mm512_mask_mov_ps(y, _mm512_cmpeq_epi32_mask(xi, _mm512_set1_epi32((int)0xff800000u)),
+                               _mm512_setzero_ps());
+    }
+    return y;
+}
 #endif
 
 static void attn_lanes_score_worker(void *vctx, uint64_t item0, uint64_t item1) {
@@ -17358,6 +17433,12 @@ static void attn_lanes_weight_worker(void *vctx, uint64_t item0, uint64_t item1)
         for (uint32_t r = r0; r < r1; r++) {
             float *w = attn_lanes_score(ctx, g * 16, r);
             const float *s = ctx->all ? attn_lanes_score(ctx->all, g * 16, ctx->pick[r]) : w;
+#if defined(DS4_NO_GPU) && defined(__AVX512F__)
+            if (n == 16) {
+                _mm512_storeu_ps(w, ds4_expf16(_mm512_sub_ps(_mm512_loadu_ps(s), _mm512_loadu_ps(max))));
+                continue;
+            }
+#endif
             for (uint32_t l = 0; l < n; l++) w[l] = expf(s[l] - max[l]);
         }
     }
@@ -17392,14 +17473,13 @@ static void attn_lanes_sum_worker(void *vctx, uint64_t item0, uint64_t item1) {
         const uint32_t d1 = d0 + 16 < head_dim ? d0 + 16 : head_dim;
         const float *w = attn_lanes_score(ctx, h0, 0);
         float denom[16] = {0};
-        if (ctx->hmax) {
-            for (uint32_t h = h0; h < h1; h++) denom[h - h0] = expf(ctx->sinks[h] - ctx->hmax[h]);
-        }
 #if defined(DS4_NO_GPU) && defined(__AVX512F__)
         if (h1 == h0 + 16 && d1 == d0 + 16) {
             __m512 acc[16];
             float inv[16];
-            __m512 den = _mm512_loadu_ps(denom);
+            __m512 den = ctx->hmax ? ds4_expf16(_mm512_sub_ps(_mm512_loadu_ps(ctx->sinks + h0),
+                                                              _mm512_loadu_ps(ctx->hmax + h0)))
+                                   : _mm512_setzero_ps();
             for (uint32_t l = 0; l < 16; l++) acc[l] = _mm512_setzero_ps();
             for (uint32_t r = 0; r < ctx->n_rows; r++) {
                 /* One line per row at a 2 KB stride defeats the hardware prefetcher. */
@@ -17422,6 +17502,9 @@ static void attn_lanes_sum_worker(void *vctx, uint64_t item0, uint64_t item1) {
             continue;
         }
 #endif
+        if (ctx->hmax) {
+            for (uint32_t h = h0; h < h1; h++) denom[h - h0] = expf(ctx->sinks[h] - ctx->hmax[h]);
+        }
         for (uint32_t h = h0; h < h1; h++) {
             float *oh = ctx->out_heads + (uint64_t)h * head_dim + d0;
             float scale = ctx->hmax ? 0.0f : ctx->inv[h];

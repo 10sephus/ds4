@@ -1476,6 +1476,51 @@ static void lanes_oracle(float *out, const float *sinks, const float *q,
     }
 }
 
+#if defined(DS4_NO_GPU) && defined(__AVX512F__)
+/* ds4_expf16() against this libm's expf() for all 2^32 float bit patterns,
+ * NaNs, infinities, overflow, underflow and subnormal results included,
+ * bit for bit, eight threads of sixteen-lane blocks (a few seconds). */
+typedef struct { uint64_t lo, hi, bad; uint32_t first; } expf_sweep_ctx;
+
+static void *expf_sweep_worker(void *arg) {
+    expf_sweep_ctx *c = arg;
+    for (uint64_t b = c->lo; b < c->hi; b += 16) {
+        uint32_t bits[16], got[16];
+        for (uint32_t j = 0; j < 16; j++) bits[j] = (uint32_t)(b + j);
+        _mm512_storeu_si512(got, _mm512_castps_si512(ds4_expf16(_mm512_castsi512_ps(_mm512_loadu_si512(bits)))));
+        for (uint32_t j = 0; j < 16; j++) {
+            float x, e;
+            uint32_t want;
+            memcpy(&x, &bits[j], sizeof(x));
+            e = expf(x);
+            memcpy(&want, &e, sizeof(want));
+            if (got[j] != want && c->bad++ == 0) c->first = bits[j];
+        }
+    }
+    return NULL;
+}
+
+static void check_expf_lanes(void) {
+    enum { N_THREADS = 8 };
+    const uint64_t total = (uint64_t)1 << 32;
+    pthread_t th[N_THREADS];
+    expf_sweep_ctx ctx[N_THREADS];
+    for (uint32_t i = 0; i < N_THREADS; i++) {
+        ctx[i] = (expf_sweep_ctx){ .lo = total / N_THREADS * i, .hi = total / N_THREADS * (i + 1) };
+        CHECK(pthread_create(&th[i], NULL, expf_sweep_worker, &ctx[i]) == 0);
+    }
+    uint64_t bad = 0;
+    for (uint32_t i = 0; i < N_THREADS; i++) {
+        CHECK(pthread_join(th[i], NULL) == 0);
+        if (ctx[i].bad) {
+            fprintf(stderr, "expf lanes: %" PRIu64 " mismatches from input 0x%08x\n", ctx[i].bad, ctx[i].first);
+        }
+        bad += ctx[i].bad;
+    }
+    CHECK(bad == 0);
+}
+#endif
+
 /* Magnitude mag with signed zeros mixed in, so the score range, the running
  * max and the sign of zero products are all exercised. */
 static float lanes_value(float mag) {
@@ -2733,6 +2778,10 @@ int main(void) {
     puts("CPU indexer row-parallel scoring and top-k selection oracle PASS");
     check_attention_lanes();
     puts("CPU lane-wise decode attention bitwise oracle: 1/3/8 threads PASS");
+#if defined(DS4_NO_GPU) && defined(__AVX512F__)
+    check_expf_lanes();
+    puts("CPU AVX-512 expf bitwise equal to libm expf on all 2^32 inputs PASS");
+#endif
 #if defined(DS4_NO_GPU) && defined(__AVX512VNNI__)
     check_q8_0_scale_f32();
     const uint32_t threads[] = {1, 3, 16};
