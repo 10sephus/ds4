@@ -329,9 +329,14 @@ static ds4_context_memory ds41_cpu_memory(uint32_t ctx) {
         memory.compressed_bytes += cap * (512u + 128u) * sizeof(float);
     }
     const uint64_t blocks = ((uint64_t)ctx + 7u) / 8u;
+    /* The rows a chunk's queries attend, rounded to F16 once per layer:
+     * the raw window, the chunk's rows and at most the compressed rows of
+     * DS41_CPU_BATCH_COMP positions. */
+    const uint64_t rounded = (uint64_t)DS41_CPU_BATCH + 128u +
+        (ctx < DS41_CPU_BATCH_COMP ? ctx : DS41_CPU_BATCH_COMP);
     memory.scratch_bytes = sizeof(ds41_cpu_state) + sizeof(ds41_cpu_attention_state) +
         (uint64_t)DS41_CPU_BATCH * DS41_CPU_BATCH_TOKEN_BYTES +
-        ((uint64_t)DS41_CPU_BATCH + 128u + ctx + 1u) * 512u * sizeof(float) +
+        rounded * 512u * sizeof(float) +
         (uint64_t)DS4_N_VOCAB * (sizeof(uint32_t) + 2u * sizeof(float)) +
         ((uint64_t)ctx + 1u) * sizeof(float) + blocks * (sizeof(float) + sizeof(uint8_t)) +
         (uint64_t)DS4_MAX_THREADS * ds41_cpu_batch_attention_stride(ctx);
