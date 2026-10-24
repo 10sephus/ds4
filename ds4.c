@@ -16243,8 +16243,11 @@ static void kv_cache_push_raw(ds4_layer_cache *cache, const float *kv) {
         return;
     }
 
+    /* The window starts at row first of the 2 * cap rows; compare row counts
+     * rather than form a pointer past the buffer. */
     const uint64_t cap = cache->cap_raw;
-    if (cache->raw_kv + (cap + 1) * DS4_N_HEAD_DIM <= cache->raw_base + 2 * cap * DS4_N_HEAD_DIM) {
+    const uint64_t first = (uint64_t)(cache->raw_kv - cache->raw_base) / DS4_N_HEAD_DIM;
+    if (first + 1 + cap <= 2 * cap) {
         cache->raw_kv += DS4_N_HEAD_DIM;
     } else {
         memmove(cache->raw_base,
