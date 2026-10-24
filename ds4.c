@@ -10739,38 +10739,52 @@ typedef struct {
 } q8_0_tiles_pack_ctx;
 
 /* Work item = (group, tile).  Activations are [token][group][block] as the
- * quantizers lay them out; elements past in_dim pack as zero. */
+ * quantizers lay them out; elements past in_dim pack as zero, padding lanes
+ * as zero activations and scales.  Block by block, so that a block's 512
+ * bytes are written while in L1, and a block without elements past in_dim
+ * moves as eight dwords per lane (the byte loop cost 4-5 times the
+ * quantization it packs). */
 static void q8_0_tiles_pack_worker(void *vctx, uint64_t i0, uint64_t i1) {
     q8_0_tiles_pack_ctx *ctx = vctx;
     const uint64_t blocks = ctx->blocks;
+    const uint64_t full = ctx->in_dim / 32;
 
     for (uint64_t idx = i0; idx < i1; idx++) {
         const uint64_t group = idx / ctx->tiles.n_tiles;
         const uint64_t tile = idx - group * ctx->tiles.n_tiles;
         uint8_t *xq16 = ctx->tiles.xq + idx * blocks * 512;
         float *xs16 = ctx->tiles.xs + idx * blocks * 16;
+        const int8_t *xq[16];
+        const float *xs[16];
+        unsigned n = 0;
+        for (; n < 16 && tile * 16 + n < ctx->tiles.n_tok; n++) {
+            const uint64_t src = ((tile * 16 + n) * ctx->n_groups + group) * blocks;
+            xq[n] = ctx->xq + src * 32;
+            xs[n] = ctx->xscale + src;
+        }
 
-        for (unsigned j = 0; j < 16; j++) {
-            if (tile * 16 + j >= ctx->tiles.n_tok) {
-                /* Padding lane: zero activations and scales. */
-                for (uint64_t b = 0; b < blocks; b++) {
+        for (uint64_t b = 0; b < blocks; b++) {
+            uint8_t *dst = xq16 + b * 512;
+            for (unsigned j = 0; j < 16; j++) {
+                if (j >= n) {
                     xs16[b * 16 + j] = 0.0f;
-                    for (unsigned k = 0; k < 8; k++) {
-                        memset(xq16 + ((b * 8 + k) * 16 + j) * 4, 0x80, 4);
-                    }
+                    for (unsigned k = 0; k < 8; k++) memset(dst + (k * 16 + j) * 4, 0x80, 4);
+                    continue;
                 }
-                continue;
-            }
-            const uint64_t src = ((tile * 16 + j) * ctx->n_groups + group) * blocks;
-            const int8_t *xq = ctx->xq + src * 32;
-            const float *xs = ctx->xscale + src;
-            for (uint64_t b = 0; b < blocks; b++) {
-                xs16[b * 16 + j] = xs[b];
+                xs16[b * 16 + j] = xs[j][b];
+                if (b < full) {
+                    for (unsigned k = 0; k < 8; k++) {
+                        uint32_t v;
+                        memcpy(&v, xq[j] + b * 32 + k * 4, sizeof(v));
+                        v ^= 0x80808080u;
+                        memcpy(dst + (k * 16 + j) * 4, &v, sizeof(v));
+                    }
+                    continue;
+                }
                 for (unsigned k = 0; k < 8; k++) {
-                    uint8_t *dst = xq16 + ((b * 8 + k) * 16 + j) * 4;
                     for (unsigned i = 0; i < 4; i++) {
                         const uint64_t e = b * 32 + k * 4 + i;
-                        dst[i] = (uint8_t)(e < ctx->in_dim ? xq[e] : 0) ^ 0x80u;
+                        dst[(k * 16 + j) * 4 + i] = (uint8_t)(e < ctx->in_dim ? xq[j][e] : 0) ^ 0x80u;
                     }
                 }
             }
