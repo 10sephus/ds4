@@ -641,6 +641,48 @@ static void ds41_cpu_apply16t(__m512 *acc, const __m512 *w, const float *xt,
     }
 }
 
+/* The same for two matrices that read the same inputs (gate and up), up
+ * to eight tokens of both, sixteen chains, per pass over the weights. */
+static inline __attribute__((always_inline)) void ds41_cpu_apply16x2t_group(
+        __m512 *a, __m512 *b, const __m512 *wa, const __m512 *wb, const float *xb,
+        uint32_t nt, uint32_t n, const unsigned g) {
+    __m512 ra[8], rb[8];
+    for (unsigned t = 0; t < g; t++) {
+        ra[t] = a[t];
+        rb[t] = b[t];
+    }
+    for (uint32_t i = 0; i < n; i++, xb += nt) {
+        const __m512 wai = wa[i], wbi = wb[i];
+        for (unsigned t = 0; t < g; t++) {
+            ra[t] = _mm512_add_ps(ra[t], _mm512_mul_ps(wai, _mm512_set1_ps(xb[t])));
+            rb[t] = _mm512_add_ps(rb[t], _mm512_mul_ps(wbi, _mm512_set1_ps(xb[t])));
+        }
+    }
+    for (unsigned t = 0; t < g; t++) {
+        a[t] = ra[t];
+        b[t] = rb[t];
+    }
+}
+
+static void ds41_cpu_apply16x2t(__m512 *a, __m512 *b, const __m512 *wa, const __m512 *wb,
+                                const float *xt, uint32_t nt, uint64_t off, uint32_t n) {
+    for (uint32_t t = 0, groups = (nt + 7) / 8; t < nt; groups--) {
+        const uint32_t g = (nt - t + groups - 1) / groups;
+        const float *xb = xt + off * nt + t;
+        switch (g) {
+        case 8: ds41_cpu_apply16x2t_group(a + t, b + t, wa, wb, xb, nt, n, 8); break;
+        case 7: ds41_cpu_apply16x2t_group(a + t, b + t, wa, wb, xb, nt, n, 7); break;
+        case 6: ds41_cpu_apply16x2t_group(a + t, b + t, wa, wb, xb, nt, n, 6); break;
+        case 5: ds41_cpu_apply16x2t_group(a + t, b + t, wa, wb, xb, nt, n, 5); break;
+        case 4: ds41_cpu_apply16x2t_group(a + t, b + t, wa, wb, xb, nt, n, 4); break;
+        case 3: ds41_cpu_apply16x2t_group(a + t, b + t, wa, wb, xb, nt, n, 3); break;
+        case 2: ds41_cpu_apply16x2t_group(a + t, b + t, wa, wb, xb, nt, n, 2); break;
+        default: ds41_cpu_apply16x2t_group(a + t, b + t, wa, wb, xb, nt, n, 1); break;
+        }
+        t += g;
+    }
+}
+
 static void ds41_cpu_apply16x2(__m512 *a, __m512 *b, const __m512 *wa, const __m512 *wb,
                                const float *const *x, uint32_t nt, uint64_t off, uint32_t n) {
     for (uint32_t t = 0, groups = (nt + 3) / 4; t < nt; groups--) {
@@ -1124,7 +1166,8 @@ static int ds41_cpu_desc_u32(const void *a, const void *b) {
  * in token order, with that expert's rows.  partial is indexed by entry;
  * the mid rows of a pass of nt entries from k0 fill mid from k0 * n_ff_exp
  * transposed, input i of its token t at i * nt + t, for the down worker's
- * broadcasts.  A chunk has at most DS41_CPU_ROUTED_TOKENS tokens, so at most
+ * broadcasts, and the pass's inputs fill xt from k0 * n_embd the same way
+ * for the mid worker's.  A chunk has at most DS41_CPU_ROUTED_TOKENS tokens, so at most
  * DS41_CPU_ROUTED_TASKS tasks. */
 #define DS41_CPU_ROUTED_TOKENS 512u
 #define DS41_CPU_ROUTED_TASKS (DS4_MAX_EXPERT + \
@@ -1135,10 +1178,30 @@ typedef struct {
     uint32_t first[DS41_CPU_ROUTED_TASKS], end[DS41_CPU_ROUTED_TASKS];
     const uint32_t *entry;
     const float *x, *weight;
+    float *xt;
     float *mid, *partial;
     uint64_t x_stride, gate_row_bytes, up_row_bytes, down_row_bytes;
     float clamp;
 } ds41_cpu_routed_batch_ctx;
+
+/* Unit u transposes inputs [256 q, 256 q + 256) of task j's passes, q =
+ * u % (n_embd / 256), into xt. */
+static void ds41_cpu_routed_xt_worker(void *vctx, uint64_t first, uint64_t last) {
+    const ds41_cpu_routed_batch_ctx *c = vctx;
+    const uint32_t chunks = DS4_N_EMBD / 256;
+    for (uint64_t unit = first; unit < last; unit++) {
+        const uint32_t j = (uint32_t)(unit / chunks), i0 = (uint32_t)(unit % chunks) * 256u;
+        for (uint32_t k0 = c->first[j]; k0 < c->end[j]; k0 += DS41_CPU_PASS) {
+            const uint32_t nt = c->end[j] - k0 < DS41_CPU_PASS ? c->end[j] - k0 : DS41_CPU_PASS;
+            float *xt = c->xt + (uint64_t)k0 * DS4_N_EMBD + (uint64_t)i0 * nt;
+            const float *x[DS41_CPU_PASS];
+            for (uint32_t t = 0; t < nt; t++)
+                x[t] = c->x + (uint64_t)(c->entry[k0 + t] / DS4_N_EXPERT_USED) * c->x_stride;
+            for (uint32_t i = i0; i < i0 + 256u; i++)
+                for (uint32_t t = 0; t < nt; t++) *xt++ = x[t][i];
+        }
+    }
+}
 
 static void ds41_cpu_routed_mid_batch_worker(void *vctx, uint64_t first, uint64_t last) {
     const ds41_cpu_routed_batch_ctx *c = vctx;
@@ -1146,7 +1209,6 @@ static void ds41_cpu_routed_mid_batch_worker(void *vctx, uint64_t first, uint64_
     const __m512i og = ds41_cpu_row_offsets(c->gate_row_bytes);
     const __m512i ou = ds41_cpu_row_offsets(c->up_row_bytes);
     __m512 wg[32], wu[32], ag[DS41_CPU_PASS], au[DS41_CPU_PASS];
-    const float *xp[DS41_CPU_PASS];
     for (uint64_t unit = first; unit < last; unit++) {
         const uint32_t j = (uint32_t)(unit / tiles);
         const uint64_t row = (unit % tiles) * 16;
@@ -1154,10 +1216,8 @@ static void ds41_cpu_routed_mid_batch_worker(void *vctx, uint64_t first, uint64_
         const uint8_t *urows = c->up[j] + row * c->up_row_bytes;
         for (uint32_t k0 = c->first[j]; k0 < c->end[j]; k0 += DS41_CPU_PASS) {
             const uint32_t nt = c->end[j] - k0 < DS41_CPU_PASS ? c->end[j] - k0 : DS41_CPU_PASS;
-            for (uint32_t t = 0; t < nt; t++) {
-                ag[t] = au[t] = _mm512_setzero_ps();
-                xp[t] = c->x + (uint64_t)(c->entry[k0 + t] / DS4_N_EXPERT_USED) * c->x_stride;
-            }
+            const float *xt = c->xt + (uint64_t)k0 * DS4_N_EMBD;
+            for (uint32_t t = 0; t < nt; t++) ag[t] = au[t] = _mm512_setzero_ps();
             for (uint64_t b = 0; b < DS4_N_EMBD / QK_K; b++) {
                 const uint8_t *gb = grows + b * sizeof(block_iq2_xxs);
                 const uint8_t *ub = urows + b * sizeof(block_iq2_xxs);
@@ -1168,7 +1228,7 @@ static void ds41_cpu_routed_mid_batch_worker(void *vctx, uint64_t first, uint64_
                 for (unsigned ib = 0; ib < QK_K / 32; ib++) {
                     ds41_cpu_iq2xxs_decode16(wg, gb, ib, dg, og);
                     ds41_cpu_iq2xxs_decode16(wu, ub, ib, du, ou);
-                    ds41_cpu_apply16x2(ag, au, wg, wu, xp, nt, b * QK_K + ib * 32u, 32);
+                    ds41_cpu_apply16x2t(ag, au, wg, wu, xt, nt, b * QK_K + ib * 32u, 32);
                 }
             }
             float *midt = c->mid + (uint64_t)k0 * DS4_N_FF_EXP + row * nt;
@@ -1454,10 +1514,14 @@ static bool ds41_cpu_routed_moe_batch(float *partial, float *mid, uint32_t *entr
     c.weight = weights;
     c.mid = mid;
     c.partial = partial;
+    /* The transposed inputs live in partial until the down pass fills it. */
+    c.xt = partial;
     c.clamp = DS4_SWIGLU_CLAMP_EXP;
     /* The IQ2_XXS code table of the gate/up decoder; the dispatch
      * publishes it to the workers. */
     pthread_once(&ds41_iq2xxs_once, ds41_iq2xxs_tables_init);
+    ds4_parallel_for_min_rows((uint64_t)n_tasks * (DS4_N_EMBD / 256), ds41_cpu_routed_xt_worker,
+                              &c, 1);
     /* Each task is a NUMA group: a node takes the row half placed on it. */
     ds4_pool_dispatch((uint64_t)n_tasks * (DS4_N_FF_EXP / 16), ds41_cpu_routed_mid_batch_worker,
                       &c, DS4_N_FF_EXP / 16, 1, 64);
