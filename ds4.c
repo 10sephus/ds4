@@ -12459,7 +12459,11 @@ static void matvec_iq2_xxs_experts_accum_prequant(
  * per 32-value sub-block) are gathered per lane.  The x16 kernels keep the integer sub-block dots
  * exact and replay the reference dots' per-superblock float sequence lane by
  * lane, so every lane is bitwise identical to the single-row kernels the
- * decode path uses.  Lanes past n carry zeros and are never stored.
+ * decode path uses.  Lanes past n carry zeros and are never stored.  A tile
+ * of at most eight pairs is a pair tile: lanes 2k and 2k + 1 both hold pair
+ * k, and its kernels multiply two weight rows per vpdpbusd (a qword
+ * broadcast of the rows' interleaved dwords), half the instructions for the
+ * same lanes' arithmetic.
  * ========================================================================= */
 
 #if defined(DS4_NO_GPU) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
@@ -12490,7 +12494,8 @@ typedef struct {
     const block_q8_K *row[DS4_MOE_TILE]; /* activation rows, NULL past n */
     const iq2xxs_q8  *iq2[DS4_MOE_TILE]; /* the same rows in the IQ2_XXS pair kernel's layout (gate/up only) */
     uint32_t pair[DS4_MOE_TILE];         /* pair id = token * n_used + slot */
-    uint32_t n;                          /* valid lanes */
+    uint32_t n;                          /* valid pairs */
+    uint32_t rep;                        /* lanes per pair: 2 for a pair tile (n <= 8, see below) */
     uint32_t expert;
     int8_t  *q;                          /* [nb][64][16 lanes][4] */
     float   *d;                          /* [nb][16 lanes] */
@@ -12546,15 +12551,16 @@ static void moe_tile_pack(ds4_moe_tile *t, uint32_t nb, bool iq2_order) {
         const int8_t *qsrc[DS4_MOE_TILE];
         const int16_t *bsrc[DS4_MOE_TILE];
         for (uint32_t lane = 0; lane < DS4_MOE_TILE; lane++) {
-            if (lane >= t->n) {
+            const uint32_t k = lane / t->rep;   /* the pair this lane holds */
+            if (k >= t->n) {
                 d[lane] = 0.0f;
                 qsrc[lane] = zeros;
                 bsrc[lane] = (const int16_t *)zeros;
                 continue;
             }
-            const block_q8_K *b = t->row[lane] + i;
+            const block_q8_K *b = t->row[k] + i;
             d[lane] = b->d;
-            qsrc[lane] = iq2_order ? &t->iq2[lane][i].qs[0][0] : b->qs;
+            qsrc[lane] = iq2_order ? &t->iq2[k][i].qs[0][0] : b->qs;
             bsrc[lane] = b->bsums;
         }
         __m512 v[16];
@@ -12630,26 +12636,41 @@ static inline __m512i moe_bcast_u8x4(const uint8_t *p) {
     return _mm512_set1_epi32(v);
 }
 
-/* Decode nb superblocks of an IQ2_XXS row as row r of a task's decode
- * buffer, which is superblock-major: superblock i of all n_rows rows is one
- * contiguous run of n_rows * 256 weight bytes (43 + w of
- * iq2xxs_block_weights(): vector s, dword m holds elements 16m + s + {0, 4,
- * 8, 12}), and the sub-block scales 2 * nibble + 1 and the superblock scale
- * as f32 are laid out the same way.  The tile kernels take one superblock
- * of a tile against every row before the next, so the tile's superblock
- * stays in L1 while the rows stream from L2 once per tile. */
-static inline void moe_iq2_xxs_decode_row_sb(const block_iq2_xxs *x, uint32_t nb, uint32_t n_rows, uint32_t r,
-                                             uint8_t *w, int32_t *ls, float *ds) {
+/* Interleave the dwords of two 64-byte vectors: lo gets dwords 0..7 of a
+ * and b alternating, hi dwords 8..15. */
+static inline void moe_interleave_dwords(uint8_t *dst, __m512i a, __m512i b) {
+    const __m512i lo = _mm512_set_epi32(23, 7, 22, 6, 21, 5, 20, 4, 19, 3, 18, 2, 17, 1, 16, 0);
+    const __m512i hi = _mm512_set_epi32(31, 15, 30, 14, 29, 13, 28, 12, 27, 11, 26, 10, 25, 9, 24, 8);
+    _mm512_storeu_si512((void *)dst, _mm512_permutex2var_epi32(a, lo, b));
+    _mm512_storeu_si512((void *)(dst + 64), _mm512_permutex2var_epi32(a, hi, b));
+}
+
+/* Decode nb superblocks of the IQ2_XXS rows xa and xb as rows r and r + 1
+ * (r even) of a task's decode buffer, which is superblock-major: superblock
+ * i of all n_rows rows is one run of n_rows * 256 weight bytes, in which a
+ * row pair interleaves its rows by dword: dword j of rows r and r + 1 (43 +
+ * w of iq2xxs_block_weights(): dword j = 16s + m, of vector s, holds
+ * elements 16m + s + {0, 4, 8, 12}) is at bytes 8j and 8j + 4 of the pair's
+ * 512.  One row's dword broadcasts as before, a row pair's as one qword.
+ * The sub-block scales 2 * nibble + 1 and the superblock scales as f32 are
+ * per row, superblock-major.  The tile kernels take one superblock of a
+ * tile against every row before the next, so the tile's superblock stays
+ * in L1 while the rows stream from L2 once per tile. */
+static inline void moe_iq2_xxs_decode_pair_sb(const block_iq2_xxs *xa, const block_iq2_xxs *xb, uint32_t nb,
+                                              uint32_t n_rows, uint32_t r, uint8_t *w, int32_t *ls, float *ds) {
     /* lsv holds each sub-block's scale in both of its dword lanes. */
     const __m512i even = _mm512_set_epi32(14, 12, 10, 8, 6, 4, 2, 0, 14, 12, 10, 8, 6, 4, 2, 0);
     for (uint32_t i = 0; i < nb; i++) {
-        __m512i u[4], lsv;
-        iq2xxs_block_weights(x + i, u, &lsv);
+        __m512i ua[4], ub[4], la, lb;
+        iq2xxs_block_weights(xa + i, ua, &la);
+        iq2xxs_block_weights(xb + i, ub, &lb);
         uint8_t *wi = w + ((size_t)i * n_rows + r) * QK_K;
-        for (int s = 0; s < 4; s++) _mm512_storeu_si512((void *)(wi + s * 64), u[s]);
-        _mm256_storeu_si256((__m256i *)(ls + ((size_t)i * n_rows + r) * (QK_K / 32)),
-                            _mm512_castsi512_si256(_mm512_permutexvar_epi32(even, lsv)));
-        ds[(size_t)i * n_rows + r] = q8_0_scale_f32(x[i].d);
+        for (int s = 0; s < 4; s++) moe_interleave_dwords(wi + s * 128, ua[s], ub[s]);
+        int32_t *li = ls + ((size_t)i * n_rows + r) * (QK_K / 32);
+        _mm256_storeu_si256((__m256i *)li, _mm512_castsi512_si256(_mm512_permutexvar_epi32(even, la)));
+        _mm256_storeu_si256((__m256i *)(li + QK_K / 32), _mm512_castsi512_si256(_mm512_permutexvar_epi32(even, lb)));
+        ds[(size_t)i * n_rows + r] = q8_0_scale_f32(xa[i].d);
+        ds[(size_t)i * n_rows + r + 1] = q8_0_scale_f32(xb[i].d);
     }
 }
 
@@ -12681,19 +12702,32 @@ static inline void moe_q2_k_decode(const block_q2_K *x, uint8_t *w) {
     }
 }
 
-/* Decode a Q2_K row as row r of a superblock-major buffer (see the IQ2_XXS
- * decode), with the sixteen block minimums packed in pairs for the kernel's
- * vpmaddwd and the two superblock scales as f32. */
-static inline void moe_q2_k_decode_row_sb(const block_q2_K *x, uint32_t nb, uint32_t n_rows, uint32_t r,
-                                          uint8_t *w, int32_t *ms, float *dd, float *dm) {
+/* Decode the Q2_K rows xa and xb as rows r and r + 1 (r even) of a
+ * superblock-major buffer interleaved by row pairs like the IQ2_XXS one
+ * (dword j of the two rows at bytes 8j and 8j + 4 of the pair's 512), with
+ * each row's sixteen block minimums packed in pairs for the kernel's
+ * vpmaddwd and its two superblock scales as f32. */
+static inline void moe_q2_k_decode_pair_sb(const block_q2_K *xa, const block_q2_K *xb, uint32_t nb,
+                                           uint32_t n_rows, uint32_t r, uint8_t *w, int32_t *ms,
+                                           float *dd, float *dm) {
+    uint8_t ta[QK_K] __attribute__((aligned(64))), tb[QK_K] __attribute__((aligned(64)));
     for (uint32_t i = 0; i < nb; i++) {
-        moe_q2_k_decode(x + i, w + ((size_t)i * n_rows + r) * QK_K);
-        /* Minimum pair p as one dword: the high nibbles of scales 2p and
-         * 2p + 1 in its two words. */
-        const __m256i mins = _mm256_srli_epi16(_mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)x[i].scales)), 4);
-        _mm256_storeu_si256((__m256i *)(ms + ((size_t)i * n_rows + r) * (QK_K / 32)), mins);
-        dd[(size_t)i * n_rows + r] = q8_0_scale_f32(x[i].d);
-        dm[(size_t)i * n_rows + r] = q8_0_scale_f32(x[i].dmin);
+        moe_q2_k_decode(xa + i, ta);
+        moe_q2_k_decode(xb + i, tb);
+        uint8_t *wi = w + ((size_t)i * n_rows + r) * QK_K;
+        for (int c = 0; c < 4; c++) {
+            moe_interleave_dwords(wi + c * 128, _mm512_load_si512((const void *)(ta + c * 64)),
+                                  _mm512_load_si512((const void *)(tb + c * 64)));
+        }
+        const block_q2_K *x2[2] = { xa + i, xb + i };
+        for (uint32_t k = 0; k < 2; k++) {
+            /* Minimum pair p as one dword: the high nibbles of scales 2p
+             * and 2p + 1 in its two words. */
+            const __m256i mins = _mm256_srli_epi16(_mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)x2[k]->scales)), 4);
+            _mm256_storeu_si256((__m256i *)(ms + ((size_t)i * n_rows + r + k) * (QK_K / 32)), mins);
+            dd[(size_t)i * n_rows + r + k] = q8_0_scale_f32(x2[k]->d);
+            dm[(size_t)i * n_rows + r + k] = q8_0_scale_f32(x2[k]->dmin);
+        }
     }
 }
 #endif
@@ -12717,7 +12751,9 @@ static inline void moe_iq2_xxs_x16_sb4(
         __m512         yd,
         __m512        *sumf) {
     const __m512i bias = _mm512_set1_epi16(43);
-    const uint8_t *wb0 = w, *wb1 = w + QK_K, *wb2 = w + 2 * QK_K, *wb3 = w + 3 * QK_K;
+    /* Rows r..r + 3 are two interleaved row pairs: dword j of row r + k at
+     * byte (k / 2) * 512 + 8j + (k % 2) * 4. */
+    const uint8_t *wb0 = w, *wb1 = w + 4, *wb2 = w + 2 * QK_K, *wb3 = w + 2 * QK_K + 4;
     __m512i bsum0 = _mm512_setzero_si512(), bsum1 = bsum0, bsum2 = bsum0, bsum3 = bsum0;
 
     for (int ib = 0; ib < QK_K / 32; ib++) {
@@ -12730,22 +12766,22 @@ static inline void moe_iq2_xxs_x16_sb4(
             const __m512i xv1 = _mm512_loadu_si512((const void *)(q + (16 + m) * 64));
             const __m512i xv2 = _mm512_loadu_si512((const void *)(q + (32 + m) * 64));
             const __m512i xv3 = _mm512_loadu_si512((const void *)(q + (48 + m) * 64));
-            p0 = _mm512_dpbusd_epi32(p0, moe_bcast_u8x4(wb0 + m * 4), xv0);
-            q0 = _mm512_dpbusd_epi32(q0, moe_bcast_u8x4(wb1 + m * 4), xv0);
-            r0 = _mm512_dpbusd_epi32(r0, moe_bcast_u8x4(wb2 + m * 4), xv0);
-            s0 = _mm512_dpbusd_epi32(s0, moe_bcast_u8x4(wb3 + m * 4), xv0);
-            p1 = _mm512_dpbusd_epi32(p1, moe_bcast_u8x4(wb0 + 64 + m * 4), xv1);
-            q1 = _mm512_dpbusd_epi32(q1, moe_bcast_u8x4(wb1 + 64 + m * 4), xv1);
-            r1 = _mm512_dpbusd_epi32(r1, moe_bcast_u8x4(wb2 + 64 + m * 4), xv1);
-            s1 = _mm512_dpbusd_epi32(s1, moe_bcast_u8x4(wb3 + 64 + m * 4), xv1);
-            p0 = _mm512_dpbusd_epi32(p0, moe_bcast_u8x4(wb0 + 128 + m * 4), xv2);
-            q0 = _mm512_dpbusd_epi32(q0, moe_bcast_u8x4(wb1 + 128 + m * 4), xv2);
-            r0 = _mm512_dpbusd_epi32(r0, moe_bcast_u8x4(wb2 + 128 + m * 4), xv2);
-            s0 = _mm512_dpbusd_epi32(s0, moe_bcast_u8x4(wb3 + 128 + m * 4), xv2);
-            p1 = _mm512_dpbusd_epi32(p1, moe_bcast_u8x4(wb0 + 192 + m * 4), xv3);
-            q1 = _mm512_dpbusd_epi32(q1, moe_bcast_u8x4(wb1 + 192 + m * 4), xv3);
-            r1 = _mm512_dpbusd_epi32(r1, moe_bcast_u8x4(wb2 + 192 + m * 4), xv3);
-            s1 = _mm512_dpbusd_epi32(s1, moe_bcast_u8x4(wb3 + 192 + m * 4), xv3);
+            p0 = _mm512_dpbusd_epi32(p0, moe_bcast_u8x4(wb0 + m * 8), xv0);
+            q0 = _mm512_dpbusd_epi32(q0, moe_bcast_u8x4(wb1 + m * 8), xv0);
+            r0 = _mm512_dpbusd_epi32(r0, moe_bcast_u8x4(wb2 + m * 8), xv0);
+            s0 = _mm512_dpbusd_epi32(s0, moe_bcast_u8x4(wb3 + m * 8), xv0);
+            p1 = _mm512_dpbusd_epi32(p1, moe_bcast_u8x4(wb0 + 128 + m * 8), xv1);
+            q1 = _mm512_dpbusd_epi32(q1, moe_bcast_u8x4(wb1 + 128 + m * 8), xv1);
+            r1 = _mm512_dpbusd_epi32(r1, moe_bcast_u8x4(wb2 + 128 + m * 8), xv1);
+            s1 = _mm512_dpbusd_epi32(s1, moe_bcast_u8x4(wb3 + 128 + m * 8), xv1);
+            p0 = _mm512_dpbusd_epi32(p0, moe_bcast_u8x4(wb0 + 256 + m * 8), xv2);
+            q0 = _mm512_dpbusd_epi32(q0, moe_bcast_u8x4(wb1 + 256 + m * 8), xv2);
+            r0 = _mm512_dpbusd_epi32(r0, moe_bcast_u8x4(wb2 + 256 + m * 8), xv2);
+            s0 = _mm512_dpbusd_epi32(s0, moe_bcast_u8x4(wb3 + 256 + m * 8), xv2);
+            p1 = _mm512_dpbusd_epi32(p1, moe_bcast_u8x4(wb0 + 384 + m * 8), xv3);
+            q1 = _mm512_dpbusd_epi32(q1, moe_bcast_u8x4(wb1 + 384 + m * 8), xv3);
+            r1 = _mm512_dpbusd_epi32(r1, moe_bcast_u8x4(wb2 + 384 + m * 8), xv3);
+            s1 = _mm512_dpbusd_epi32(s1, moe_bcast_u8x4(wb3 + 384 + m * 8), xv3);
         }
         /* (43 + w) . q = w . q + 43 * sum(q) over the sub-block. */
         const __m512i corr = _mm512_madd_epi16(
@@ -12783,7 +12819,8 @@ static inline void moe_q2_k_x16_sb4(
         const int16_t *bs,
         __m512         yd,
         __m512        *sumf) {
-    const uint8_t *wb0 = w, *wb1 = w + QK_K, *wb2 = w + 2 * QK_K, *wb3 = w + 3 * QK_K;
+    /* Rows r..r + 3 are two interleaved row pairs (see the decode). */
+    const uint8_t *wb0 = w, *wb1 = w + 4, *wb2 = w + 2 * QK_K, *wb3 = w + 2 * QK_K + 4;
     __m512i a0 = _mm512_setzero_si512(), a1 = a0, a2 = a0, a3 = a0;
     __m512i b0 = a0, b1 = a0, b2 = a0, b3 = a0;
     __m512i c0 = a0, c1 = a0, c2 = a0, c3 = a0;
@@ -12793,22 +12830,22 @@ static inline void moe_q2_k_x16_sb4(
         const __m512i xv1 = _mm512_loadu_si512((const void *)(q + (m + 1) * 64));
         const __m512i xv2 = _mm512_loadu_si512((const void *)(q + (m + 2) * 64));
         const __m512i xv3 = _mm512_loadu_si512((const void *)(q + (m + 3) * 64));
-        a0 = _mm512_dpbusd_epi32(a0, moe_bcast_u8x4(wb0 + m * 4), xv0);
-        b0 = _mm512_dpbusd_epi32(b0, moe_bcast_u8x4(wb1 + m * 4), xv0);
-        c0 = _mm512_dpbusd_epi32(c0, moe_bcast_u8x4(wb2 + m * 4), xv0);
-        d0 = _mm512_dpbusd_epi32(d0, moe_bcast_u8x4(wb3 + m * 4), xv0);
-        a1 = _mm512_dpbusd_epi32(a1, moe_bcast_u8x4(wb0 + m * 4 + 4), xv1);
-        b1 = _mm512_dpbusd_epi32(b1, moe_bcast_u8x4(wb1 + m * 4 + 4), xv1);
-        c1 = _mm512_dpbusd_epi32(c1, moe_bcast_u8x4(wb2 + m * 4 + 4), xv1);
-        d1 = _mm512_dpbusd_epi32(d1, moe_bcast_u8x4(wb3 + m * 4 + 4), xv1);
-        a2 = _mm512_dpbusd_epi32(a2, moe_bcast_u8x4(wb0 + m * 4 + 8), xv2);
-        b2 = _mm512_dpbusd_epi32(b2, moe_bcast_u8x4(wb1 + m * 4 + 8), xv2);
-        c2 = _mm512_dpbusd_epi32(c2, moe_bcast_u8x4(wb2 + m * 4 + 8), xv2);
-        d2 = _mm512_dpbusd_epi32(d2, moe_bcast_u8x4(wb3 + m * 4 + 8), xv2);
-        a3 = _mm512_dpbusd_epi32(a3, moe_bcast_u8x4(wb0 + m * 4 + 12), xv3);
-        b3 = _mm512_dpbusd_epi32(b3, moe_bcast_u8x4(wb1 + m * 4 + 12), xv3);
-        c3 = _mm512_dpbusd_epi32(c3, moe_bcast_u8x4(wb2 + m * 4 + 12), xv3);
-        d3 = _mm512_dpbusd_epi32(d3, moe_bcast_u8x4(wb3 + m * 4 + 12), xv3);
+        a0 = _mm512_dpbusd_epi32(a0, moe_bcast_u8x4(wb0 + m * 8), xv0);
+        b0 = _mm512_dpbusd_epi32(b0, moe_bcast_u8x4(wb1 + m * 8), xv0);
+        c0 = _mm512_dpbusd_epi32(c0, moe_bcast_u8x4(wb2 + m * 8), xv0);
+        d0 = _mm512_dpbusd_epi32(d0, moe_bcast_u8x4(wb3 + m * 8), xv0);
+        a1 = _mm512_dpbusd_epi32(a1, moe_bcast_u8x4(wb0 + m * 8 + 8), xv1);
+        b1 = _mm512_dpbusd_epi32(b1, moe_bcast_u8x4(wb1 + m * 8 + 8), xv1);
+        c1 = _mm512_dpbusd_epi32(c1, moe_bcast_u8x4(wb2 + m * 8 + 8), xv1);
+        d1 = _mm512_dpbusd_epi32(d1, moe_bcast_u8x4(wb3 + m * 8 + 8), xv1);
+        a2 = _mm512_dpbusd_epi32(a2, moe_bcast_u8x4(wb0 + m * 8 + 16), xv2);
+        b2 = _mm512_dpbusd_epi32(b2, moe_bcast_u8x4(wb1 + m * 8 + 16), xv2);
+        c2 = _mm512_dpbusd_epi32(c2, moe_bcast_u8x4(wb2 + m * 8 + 16), xv2);
+        d2 = _mm512_dpbusd_epi32(d2, moe_bcast_u8x4(wb3 + m * 8 + 16), xv2);
+        a3 = _mm512_dpbusd_epi32(a3, moe_bcast_u8x4(wb0 + m * 8 + 24), xv3);
+        b3 = _mm512_dpbusd_epi32(b3, moe_bcast_u8x4(wb1 + m * 8 + 24), xv3);
+        c3 = _mm512_dpbusd_epi32(c3, moe_bcast_u8x4(wb2 + m * 8 + 24), xv3);
+        d3 = _mm512_dpbusd_epi32(d3, moe_bcast_u8x4(wb3 + m * 8 + 24), xv3);
     }
     const __m512i isum[4] = {
         _mm512_add_epi32(_mm512_add_epi32(a0, a1), _mm512_add_epi32(a2, a3)),
@@ -12824,6 +12861,149 @@ static inline void moe_q2_k_x16_sb4(
         }
         const __m512 dall = _mm512_mul_ps(yd, _mm512_set1_ps(dd[k]));
         const __m512 dmin = _mm512_mul_ps(yd, _mm512_set1_ps(dm[k]));
+        sumf[k] = _mm512_add_ps(sumf[k], _mm512_sub_ps(_mm512_mul_ps(dall, _mm512_cvtepi32_ps(isum[k])),
+                                                      _mm512_mul_ps(dmin, _mm512_cvtepi32_ps(summs))));
+    }
+}
+#endif
+
+#if DS4_MOE_X16
+/* A qword broadcast: dwords a, b in every even, odd lane. */
+static inline __m512i moe_bcast_u8x8(const uint8_t *p) {
+    int64_t v;
+    memcpy(&v, p, sizeof(v));
+    return _mm512_set1_epi64(v);
+}
+
+static inline __m512i moe_pair_i32(int32_t a, int32_t b) {
+    return _mm512_set1_epi64((int64_t)((uint64_t)(uint32_t)a | ((uint64_t)(uint32_t)b << 32)));
+}
+
+/* Two consecutive floats in every even, odd lane, bits unchanged. */
+static inline __m512 moe_pair_f32(const float *p) {
+    int64_t v;
+    memcpy(&v, p, sizeof(v));
+    return _mm512_castsi512_ps(_mm512_set1_epi64(v));
+}
+
+/* moe_iq2_xxs_x16_sb4() for a pair tile: superblock i of four decoded row
+ * pairs (rows r..r + 7) against a tile whose lanes 2k and 2k + 1 both hold
+ * pair k.  Each vpdpbusd takes a pair's two dwords as a qword broadcast, so
+ * lane 2k accumulates the pair's first row and lane 2k + 1 its second
+ * against pair k's activations; the correction, the sub-block scales and
+ * the float step are the x16 kernel's, with each row's own scales in its
+ * lanes.  sumf[a] holds rows r + 2a (even lanes) and r + 2a + 1 (odd lanes),
+ * each lane bitwise the x16 kernel's lane for its (row, pair). */
+static inline void moe_iq2_xxs_x16p_sb4(
+        const uint8_t *w,
+        const int32_t *ls,
+        const float   *ds,
+        const int8_t  *q,
+        const int16_t *bs,
+        __m512         yd,
+        __m512        *sumf) {
+    const __m512i bias = _mm512_set1_epi16(43);
+    const uint8_t *pb0 = w, *pb1 = w + 2 * QK_K, *pb2 = w + 4 * QK_K, *pb3 = w + 6 * QK_K;
+    __m512i bsum0 = _mm512_setzero_si512(), bsum1 = bsum0, bsum2 = bsum0, bsum3 = bsum0;
+
+    for (int ib = 0; ib < QK_K / 32; ib++) {
+        __m512i p0 = _mm512_setzero_si512(), p1 = p0, q0 = p0, q1 = p0;
+        __m512i r0 = p0, r1 = p0, s0 = p0, s1 = p0;
+        for (int m = 2 * ib; m < 2 * ib + 2; m++) {
+            const __m512i xv0 = _mm512_loadu_si512((const void *)(q + m * 64));
+            const __m512i xv1 = _mm512_loadu_si512((const void *)(q + (16 + m) * 64));
+            const __m512i xv2 = _mm512_loadu_si512((const void *)(q + (32 + m) * 64));
+            const __m512i xv3 = _mm512_loadu_si512((const void *)(q + (48 + m) * 64));
+            p0 = _mm512_dpbusd_epi32(p0, moe_bcast_u8x8(pb0 + m * 8), xv0);
+            q0 = _mm512_dpbusd_epi32(q0, moe_bcast_u8x8(pb1 + m * 8), xv0);
+            r0 = _mm512_dpbusd_epi32(r0, moe_bcast_u8x8(pb2 + m * 8), xv0);
+            s0 = _mm512_dpbusd_epi32(s0, moe_bcast_u8x8(pb3 + m * 8), xv0);
+            p1 = _mm512_dpbusd_epi32(p1, moe_bcast_u8x8(pb0 + 128 + m * 8), xv1);
+            q1 = _mm512_dpbusd_epi32(q1, moe_bcast_u8x8(pb1 + 128 + m * 8), xv1);
+            r1 = _mm512_dpbusd_epi32(r1, moe_bcast_u8x8(pb2 + 128 + m * 8), xv1);
+            s1 = _mm512_dpbusd_epi32(s1, moe_bcast_u8x8(pb3 + 128 + m * 8), xv1);
+            p0 = _mm512_dpbusd_epi32(p0, moe_bcast_u8x8(pb0 + 256 + m * 8), xv2);
+            q0 = _mm512_dpbusd_epi32(q0, moe_bcast_u8x8(pb1 + 256 + m * 8), xv2);
+            r0 = _mm512_dpbusd_epi32(r0, moe_bcast_u8x8(pb2 + 256 + m * 8), xv2);
+            s0 = _mm512_dpbusd_epi32(s0, moe_bcast_u8x8(pb3 + 256 + m * 8), xv2);
+            p1 = _mm512_dpbusd_epi32(p1, moe_bcast_u8x8(pb0 + 384 + m * 8), xv3);
+            q1 = _mm512_dpbusd_epi32(q1, moe_bcast_u8x8(pb1 + 384 + m * 8), xv3);
+            r1 = _mm512_dpbusd_epi32(r1, moe_bcast_u8x8(pb2 + 384 + m * 8), xv3);
+            s1 = _mm512_dpbusd_epi32(s1, moe_bcast_u8x8(pb3 + 384 + m * 8), xv3);
+        }
+        const __m512i corr = _mm512_madd_epi16(
+            _mm512_loadu_si512((const void *)(bs + ib * 2 * DS4_MOE_TILE)), bias);
+        const __m512i d0 = _mm512_sub_epi32(_mm512_add_epi32(p0, p1), corr);
+        const __m512i d1 = _mm512_sub_epi32(_mm512_add_epi32(q0, q1), corr);
+        const __m512i d2 = _mm512_sub_epi32(_mm512_add_epi32(r0, r1), corr);
+        const __m512i d3 = _mm512_sub_epi32(_mm512_add_epi32(s0, s1), corr);
+        const int K = QK_K / 32;
+        bsum0 = _mm512_add_epi32(bsum0, _mm512_mullo_epi32(d0, moe_pair_i32(ls[ib], ls[K + ib])));
+        bsum1 = _mm512_add_epi32(bsum1, _mm512_mullo_epi32(d1, moe_pair_i32(ls[2 * K + ib], ls[3 * K + ib])));
+        bsum2 = _mm512_add_epi32(bsum2, _mm512_mullo_epi32(d2, moe_pair_i32(ls[4 * K + ib], ls[5 * K + ib])));
+        bsum3 = _mm512_add_epi32(bsum3, _mm512_mullo_epi32(d3, moe_pair_i32(ls[6 * K + ib], ls[7 * K + ib])));
+    }
+
+    sumf[0] = _mm512_add_ps(sumf[0], _mm512_mul_ps(_mm512_mul_ps(moe_pair_f32(ds + 0), yd), _mm512_cvtepi32_ps(bsum0)));
+    sumf[1] = _mm512_add_ps(sumf[1], _mm512_mul_ps(_mm512_mul_ps(moe_pair_f32(ds + 2), yd), _mm512_cvtepi32_ps(bsum1)));
+    sumf[2] = _mm512_add_ps(sumf[2], _mm512_mul_ps(_mm512_mul_ps(moe_pair_f32(ds + 4), yd), _mm512_cvtepi32_ps(bsum2)));
+    sumf[3] = _mm512_add_ps(sumf[3], _mm512_mul_ps(_mm512_mul_ps(moe_pair_f32(ds + 6), yd), _mm512_cvtepi32_ps(bsum3)));
+}
+
+/* moe_q2_k_x16_sb4() for a pair tile, as the IQ2_XXS one: four row pairs
+ * (rows r..r + 7), sumf[a] holding rows r + 2a and r + 2a + 1 in the even
+ * and odd lanes. */
+static inline void moe_q2_k_x16p_sb4(
+        const uint8_t *w,
+        const int32_t *ms,
+        const float   *dd,
+        const float   *dm,
+        const int8_t  *q,
+        const int16_t *bs,
+        __m512         yd,
+        __m512        *sumf) {
+    const uint8_t *pb0 = w, *pb1 = w + 2 * QK_K, *pb2 = w + 4 * QK_K, *pb3 = w + 6 * QK_K;
+    __m512i a0 = _mm512_setzero_si512(), a1 = a0, a2 = a0, a3 = a0;
+    __m512i b0 = a0, b1 = a0, b2 = a0, b3 = a0;
+    __m512i c0 = a0, c1 = a0, c2 = a0, c3 = a0;
+    __m512i d0 = a0, d1 = a0, d2 = a0, d3 = a0;
+    for (int m = 0; m < QK_K / 4; m += 4) {
+        const __m512i xv0 = _mm512_loadu_si512((const void *)(q + m * 64));
+        const __m512i xv1 = _mm512_loadu_si512((const void *)(q + (m + 1) * 64));
+        const __m512i xv2 = _mm512_loadu_si512((const void *)(q + (m + 2) * 64));
+        const __m512i xv3 = _mm512_loadu_si512((const void *)(q + (m + 3) * 64));
+        a0 = _mm512_dpbusd_epi32(a0, moe_bcast_u8x8(pb0 + m * 8), xv0);
+        b0 = _mm512_dpbusd_epi32(b0, moe_bcast_u8x8(pb1 + m * 8), xv0);
+        c0 = _mm512_dpbusd_epi32(c0, moe_bcast_u8x8(pb2 + m * 8), xv0);
+        d0 = _mm512_dpbusd_epi32(d0, moe_bcast_u8x8(pb3 + m * 8), xv0);
+        a1 = _mm512_dpbusd_epi32(a1, moe_bcast_u8x8(pb0 + m * 8 + 8), xv1);
+        b1 = _mm512_dpbusd_epi32(b1, moe_bcast_u8x8(pb1 + m * 8 + 8), xv1);
+        c1 = _mm512_dpbusd_epi32(c1, moe_bcast_u8x8(pb2 + m * 8 + 8), xv1);
+        d1 = _mm512_dpbusd_epi32(d1, moe_bcast_u8x8(pb3 + m * 8 + 8), xv1);
+        a2 = _mm512_dpbusd_epi32(a2, moe_bcast_u8x8(pb0 + m * 8 + 16), xv2);
+        b2 = _mm512_dpbusd_epi32(b2, moe_bcast_u8x8(pb1 + m * 8 + 16), xv2);
+        c2 = _mm512_dpbusd_epi32(c2, moe_bcast_u8x8(pb2 + m * 8 + 16), xv2);
+        d2 = _mm512_dpbusd_epi32(d2, moe_bcast_u8x8(pb3 + m * 8 + 16), xv2);
+        a3 = _mm512_dpbusd_epi32(a3, moe_bcast_u8x8(pb0 + m * 8 + 24), xv3);
+        b3 = _mm512_dpbusd_epi32(b3, moe_bcast_u8x8(pb1 + m * 8 + 24), xv3);
+        c3 = _mm512_dpbusd_epi32(c3, moe_bcast_u8x8(pb2 + m * 8 + 24), xv3);
+        d3 = _mm512_dpbusd_epi32(d3, moe_bcast_u8x8(pb3 + m * 8 + 24), xv3);
+    }
+    const __m512i isum[4] = {
+        _mm512_add_epi32(_mm512_add_epi32(a0, a1), _mm512_add_epi32(a2, a3)),
+        _mm512_add_epi32(_mm512_add_epi32(b0, b1), _mm512_add_epi32(b2, b3)),
+        _mm512_add_epi32(_mm512_add_epi32(c0, c1), _mm512_add_epi32(c2, c3)),
+        _mm512_add_epi32(_mm512_add_epi32(d0, d1), _mm512_add_epi32(d2, d3)),
+    };
+    const int K = QK_K / 32;
+    for (int k = 0; k < 4; k++) {
+        __m512i summs = _mm512_setzero_si512();
+        for (int p = 0; p < QK_K / 32; p++) {
+            const __m512i bsv = _mm512_loadu_si512((const void *)(bs + p * 2 * DS4_MOE_TILE));
+            summs = _mm512_add_epi32(summs, _mm512_madd_epi16(bsv, moe_pair_i32(ms[2 * k * K + p], ms[(2 * k + 1) * K + p])));
+        }
+        const __m512 dall = _mm512_mul_ps(yd, moe_pair_f32(dd + 2 * k));
+        const __m512 dmin = _mm512_mul_ps(yd, moe_pair_f32(dm + 2 * k));
         sumf[k] = _mm512_add_ps(sumf[k], _mm512_sub_ps(_mm512_mul_ps(dall, _mm512_cvtepi32_ps(isum[k])),
                                                       _mm512_mul_ps(dmin, _mm512_cvtepi32_ps(summs))));
     }
@@ -12976,15 +13156,16 @@ static void moe_mid_tile_worker(void *vctx, uint64_t task0, uint64_t task1) {
         const uint8_t *gate = ctx->gate + (uint64_t)tiles->expert * ctx->out_dim * ctx->gate_row_bytes;
         const uint8_t *up = ctx->up + (uint64_t)tiles->expert * ctx->out_dim * ctx->up_row_bytes;
 #if DS4_MOE_X16
-        /* Kernel rows: gate and up of every pair, padded to passes of four
-         * with the last pair (its padding results are never stored). */
-        const uint32_t n_rows = (2 * n_pairs + 3) & ~3u;
+        /* Kernel rows: gate and up of every pair (rows 2p and 2p + 1, one
+         * interleaved row pair), padded to passes of eight with the last
+         * pair (its padding results are never stored). */
+        const uint32_t n_rows = (2 * n_pairs + 7) & ~7u;
         if (tiles->n >= DS4_MOE_X16_MIN_LANES) {
-            for (uint32_t r = 0; r < n_rows; r++) {
+            for (uint32_t r = 0; r < n_rows; r += 2) {
                 const uint64_t p = r / 2 < n_pairs ? r / 2 : n_pairs - 1;
-                const uint8_t *src = (r & 1) ? up + (row0 + p) * ctx->up_row_bytes
-                                             : gate + (row0 + p) * ctx->gate_row_bytes;
-                moe_iq2_xxs_decode_row_sb((const block_iq2_xxs *)src, nb, DS4_MOE_MID_ROWS, r, w, ls, ds);
+                moe_iq2_xxs_decode_pair_sb((const block_iq2_xxs *)(gate + (row0 + p) * ctx->gate_row_bytes),
+                                           (const block_iq2_xxs *)(up + (row0 + p) * ctx->up_row_bytes),
+                                           nb, DS4_MOE_MID_ROWS, r, w, ls, ds);
             }
         }
 #endif
@@ -12993,7 +13174,8 @@ static void moe_mid_tile_worker(void *vctx, uint64_t task0, uint64_t task1) {
             const ds4_moe_tile *t = tiles + ti;
 #if DS4_MOE_X16
             if (t->n >= DS4_MOE_X16_MIN_LANES) {
-                for (uint32_t r = 0; r < n_rows; r++) sumf[r] = _mm512_setzero_ps();
+                const uint32_t n_acc = t->rep == 2 ? n_rows / 2 : n_rows;
+                for (uint32_t r = 0; r < n_acc; r++) sumf[r] = _mm512_setzero_ps();
                 for (uint32_t i = 0; i < nb; i++) {
                     const int8_t *q = t->q + (size_t)i * DS4_MOE_TILE_Q_STRIDE;
                     const int16_t *bs = t->bsums + (size_t)i * DS4_MOE_TILE_BS_STRIDE;
@@ -13001,15 +13183,33 @@ static void moe_mid_tile_worker(void *vctx, uint64_t task0, uint64_t task1) {
                     const uint8_t *wi = w + (size_t)i * DS4_MOE_MID_ROWS * QK_K;
                     const int32_t *li = ls + (size_t)i * DS4_MOE_MID_ROWS * (QK_K / 32);
                     const float *di = ds + (size_t)i * DS4_MOE_MID_ROWS;
+                    if (t->rep == 2) {
+                        for (uint32_t r = 0; r < n_rows; r += 8) {
+                            moe_iq2_xxs_x16p_sb4(wi + (size_t)r * QK_K, li + (size_t)r * (QK_K / 32), di + r,
+                                                 q, bs, yd, sumf + r / 2);
+                        }
+                        continue;
+                    }
                     for (uint32_t r = 0; r < n_rows; r += 4) {
                         moe_iq2_xxs_x16_sb4(wi + (size_t)r * QK_K, li + (size_t)r * (QK_K / 32), di + r,
                                             q, bs, yd, sumf + r);
                     }
                 }
                 const __m512 eighth = _mm512_set1_ps(0.125f);
-                for (uint32_t p = 0; p < n_pairs; p++) {
-                    _mm512_storeu_ps(gv[p], _mm512_mul_ps(eighth, sumf[2 * p]));
-                    _mm512_storeu_ps(uv[p], _mm512_mul_ps(eighth, sumf[2 * p + 1]));
+                if (t->rep == 2) {
+                    /* Pair p's gate and up rows are the even and odd lanes of
+                     * sumf[p]: lane k of each gets pair k's. */
+                    const __m512i even = _mm512_set_epi32(14, 12, 10, 8, 6, 4, 2, 0, 14, 12, 10, 8, 6, 4, 2, 0);
+                    const __m512i odd = _mm512_set_epi32(15, 13, 11, 9, 7, 5, 3, 1, 15, 13, 11, 9, 7, 5, 3, 1);
+                    for (uint32_t p = 0; p < n_pairs; p++) {
+                        _mm512_storeu_ps(gv[p], _mm512_mul_ps(eighth, _mm512_permutexvar_ps(even, sumf[p])));
+                        _mm512_storeu_ps(uv[p], _mm512_mul_ps(eighth, _mm512_permutexvar_ps(odd, sumf[p])));
+                    }
+                } else {
+                    for (uint32_t p = 0; p < n_pairs; p++) {
+                        _mm512_storeu_ps(gv[p], _mm512_mul_ps(eighth, sumf[2 * p]));
+                        _mm512_storeu_ps(uv[p], _mm512_mul_ps(eighth, sumf[2 * p + 1]));
+                    }
                 }
                 moe_mid_store_x16(ctx, t, row0, n_pairs, gv, uv);
                 continue;
@@ -13065,12 +13265,14 @@ static void moe_down_tile_worker(void *vctx, uint64_t task0, uint64_t task1) {
         const uint32_t n_task_rows = (uint32_t)(row1 - row0);
         const uint8_t *down = ctx->down + (uint64_t)tiles->expert * ctx->out_dim * ctx->row_bytes;
 #if DS4_MOE_X16
-        const uint32_t n_rows = (n_task_rows + 3) & ~3u;   /* padded with the last row */
+        const uint32_t n_rows = (n_task_rows + 7) & ~7u;   /* padded with the last row */
         if (tiles->n >= DS4_MOE_X16_MIN_LANES) {
-            for (uint32_t r = 0; r < n_rows; r++) {
-                const uint64_t p = r < n_task_rows ? r : n_task_rows - 1;
-                moe_q2_k_decode_row_sb((const block_q2_K *)(down + (row0 + p) * ctx->row_bytes), nb,
-                                       DS4_MOE_DOWN_ROW_BLOCK, r, w, ms, dd, dm);
+            for (uint32_t r = 0; r < n_rows; r += 2) {
+                const uint64_t pa = r < n_task_rows ? r : n_task_rows - 1;
+                const uint64_t pb = r + 1 < n_task_rows ? r + 1 : n_task_rows - 1;
+                moe_q2_k_decode_pair_sb((const block_q2_K *)(down + (row0 + pa) * ctx->row_bytes),
+                                        (const block_q2_K *)(down + (row0 + pb) * ctx->row_bytes), nb,
+                                        DS4_MOE_DOWN_ROW_BLOCK, r, w, ms, dd, dm);
             }
         }
 #endif
@@ -13079,7 +13281,8 @@ static void moe_down_tile_worker(void *vctx, uint64_t task0, uint64_t task1) {
             const ds4_moe_tile *t = tiles + ti;
 #if DS4_MOE_X16
             if (t->n >= DS4_MOE_X16_MIN_LANES) {
-                for (uint32_t r = 0; r < n_rows; r++) sumf[r] = _mm512_setzero_ps();
+                const uint32_t n_acc = t->rep == 2 ? n_rows / 2 : n_rows;
+                for (uint32_t r = 0; r < n_acc; r++) sumf[r] = _mm512_setzero_ps();
                 for (uint32_t i = 0; i < nb; i++) {
                     const int8_t *q = t->q + (size_t)i * DS4_MOE_TILE_Q_STRIDE;
                     const int16_t *bs = t->bsums + (size_t)i * DS4_MOE_TILE_BS_STRIDE;
@@ -13088,16 +13291,30 @@ static void moe_down_tile_worker(void *vctx, uint64_t task0, uint64_t task1) {
                     const int32_t *mi = ms + (size_t)i * DS4_MOE_DOWN_ROW_BLOCK * (QK_K / 32);
                     const float *ddi = dd + (size_t)i * DS4_MOE_DOWN_ROW_BLOCK;
                     const float *dmi = dm + (size_t)i * DS4_MOE_DOWN_ROW_BLOCK;
+                    if (t->rep == 2) {
+                        for (uint32_t r = 0; r < n_rows; r += 8) {
+                            moe_q2_k_x16p_sb4(wi + (size_t)r * QK_K, mi + (size_t)r * (QK_K / 32), ddi + r, dmi + r,
+                                              q, bs, yd, sumf + r / 2);
+                        }
+                        continue;
+                    }
                     for (uint32_t r = 0; r < n_rows; r += 4) {
                         moe_q2_k_x16_sb4(wi + (size_t)r * QK_K, mi + (size_t)r * (QK_K / 32), ddi + r, dmi + r,
                                          q, bs, yd, sumf + r);
                     }
                 }
-                /* Each lane's rows are contiguous in down_pair. */
+                /* Each lane's rows are contiguous in down_pair; in a pair
+                 * tile row r of pair k is lane 2k + r % 2 of sumf[r / 2]. */
                 const float *v = (const float *)sumf;
                 for (uint32_t lane = 0; lane < t->n; lane++) {
                     float *out = ctx->down_pair + (uint64_t)t->pair[lane] * ctx->out_dim + row0;
-                    for (uint32_t r = 0; r < n_task_rows; r++) out[r] = v[(size_t)r * DS4_MOE_TILE + lane];
+                    if (t->rep == 2) {
+                        for (uint32_t r = 0; r < n_task_rows; r++) {
+                            out[r] = v[(size_t)(r / 2) * DS4_MOE_TILE + 2 * lane + (r & 1)];
+                        }
+                    } else {
+                        for (uint32_t r = 0; r < n_task_rows; r++) out[r] = v[(size_t)r * DS4_MOE_TILE + lane];
+                    }
                 }
                 continue;
             }
@@ -13234,6 +13451,7 @@ static void moe_grouped_ffn(
             ds4_moe_tile *t = tiles + ti;
             const uint32_t left = counts[e + 1] - off;
             t->n = left < DS4_MOE_TILE ? left : DS4_MOE_TILE;
+            t->rep = DS4_MOE_X16 && t->n >= DS4_MOE_X16_MIN_LANES && 2 * t->n <= DS4_MOE_TILE ? 2 : 1;
             t->expert = e;
             for (uint32_t lane = 0; lane < DS4_MOE_TILE; lane++) {
                 t->pair[lane] = lane < t->n ? pair_ids[off + lane] : 0;
