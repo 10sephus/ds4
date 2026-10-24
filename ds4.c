@@ -1166,6 +1166,7 @@ typedef struct {
     float *index_q;
     float *index_qt;
     uint32_t *index_head_done;   /* staged attention: indexer query groups done per head */
+    uint32_t *index_group_done;  /* staged attention: indexer heads done per group of 16, a line each */
     float *index_weights;
     float *index_scores;
     indexer_candidate *index_cand;
@@ -1513,6 +1514,15 @@ static void *xrealloc(void *ptr, size_t size) {
     ds4_alloc_guard_check("realloc", size);
     void *p = realloc(ptr, size);
     if (!p) ds4_die("out of memory");
+    return p;
+}
+
+/* size bytes on whole cache lines: counters and score lines that different
+ * threads update then share no line with their neighbours. */
+static void *xmalloc_lines(size_t size) {
+    ds4_alloc_guard_check("malloc", size);
+    void *p = NULL;
+    if (posix_memalign(&p, 64, size ? (size + 63) / 64 * 64 : 64) != 0) ds4_die("out of memory");
     return p;
 }
 
@@ -16010,6 +16020,7 @@ static void cpu_decode_scratch_init(ds4_cpu_decode_scratch *scratch, uint32_t ct
     scratch->index_q = xmalloc((size_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
     scratch->index_qt = xmalloc((size_t)DS4_N_INDEXER_HEAD * DS4_N_INDEXER_HEAD_DIM * sizeof(float));
     scratch->index_head_done = xcalloc(DS4_N_INDEXER_HEAD, sizeof(uint32_t));
+    scratch->index_group_done = xmalloc_lines((size_t)64u * ((DS4_N_INDEXER_HEAD + 15u) / 16u));
     scratch->index_weights = xmalloc((size_t)DS4_N_INDEXER_HEAD * sizeof(float));
     scratch->index_scores = xmalloc((size_t)comp_cap * sizeof(float));
     scratch->index_cand = xmalloc((size_t)comp_cap * sizeof(indexer_candidate));
@@ -16071,6 +16082,7 @@ static void cpu_decode_scratch_free(ds4_cpu_decode_scratch *scratch) {
     free(scratch->index_cand);
     free(scratch->index_scores);
     free(scratch->index_weights);
+    free(scratch->index_group_done);
     free(scratch->index_head_done);
     free(scratch->index_qt);
     free(scratch->index_q);
@@ -18143,7 +18155,8 @@ static void layer_attention_raw_swa_batch(
  *   4  indexer head weights (F16)   after 0 (ratio-4 layers past top-k only)
  *   5  indexer query (F16)          after 1; the claim that completes a
  *                                   head runs its RoPE and FP4 round trip,
- *                                   then the transpose
+ *                                   the one that completes sixteen heads
+ *                                   their transpose
  *   6  q tail (16-head groups)      after 3: head norms, RoPE, transpose
  *   7  attention scores             after 2, 6, with the chunk maxima; once
  *                                   the indexer selects, of every raw and
@@ -18325,25 +18338,29 @@ static void attn_graph_index_q_tail_worker(void *vctx, uint64_t r0, uint64_t r1)
  * straddle a head.  Each claim counts its groups into their heads, and the
  * claim that completes a head runs that head's tail right away, so the round
  * trips overlap the rest of the stream instead of waiting for all of it.
- * The acquire-release count makes every group of the head visible to the
- * thread that runs the tail, and the stage is done only after every claim,
- * tails included, has returned. */
+ * The heads count in turn into groups of sixteen, and the tail that
+ * completes a group transposes it (the transpose works group by group).
+ * The acquire-release counts make every row the tail or the transpose reads
+ * visible to the thread that runs it, and the stage is done only after
+ * every claim, tails and transposes included, has returned. */
 static void attn_graph_index_q_worker(void *vctx, uint64_t g0, uint64_t g1) {
     attn_graph_ctx *g = vctx;
+    ds4_cpu_decode_scratch *scratch = g->scratch;
     const uint64_t per_head = DS4_N_INDEXER_HEAD_DIM / DS4_F16_ROWS;
     matvec_f16_group_worker(&g->index_q, g0, g1);
     for (uint64_t h = g0 / per_head; h * per_head < g1; h++) {
         const uint64_t a = h * per_head > g0 ? h * per_head : g0;
         const uint64_t b = (h + 1) * per_head < g1 ? (h + 1) * per_head : g1;
-        if (__atomic_add_fetch(&g->scratch->index_head_done[h], (uint32_t)(b - a), __ATOMIC_ACQ_REL) == per_head) {
-            attn_graph_index_q_tail_worker(g, h, h + 1);
+        if (__atomic_add_fetch(&scratch->index_head_done[h], (uint32_t)(b - a), __ATOMIC_ACQ_REL) != per_head) continue;
+        attn_graph_index_q_tail_worker(g, h, h + 1);
+        const uint32_t h0 = (uint32_t)h / 16 * 16;
+        const uint32_t n = h0 + 16 < DS4_N_INDEXER_HEAD ? 16 : DS4_N_INDEXER_HEAD - h0;
+        if (__atomic_add_fetch(&scratch->index_group_done[h0], 1, __ATOMIC_ACQ_REL) == n) {
+            attn_lanes_transpose_q(scratch->index_qt + (uint64_t)h0 * DS4_N_INDEXER_HEAD_DIM,
+                                   scratch->index_q + (uint64_t)h0 * DS4_N_INDEXER_HEAD_DIM,
+                                   n, DS4_N_INDEXER_HEAD_DIM);
         }
     }
-}
-
-static void attn_graph_index_qt(void *vctx) {
-    attn_graph_ctx *g = vctx;
-    attn_lanes_transpose_q(g->scratch->index_qt, g->scratch->index_q, DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM);
 }
 
 /* The attention rows in order: the raw window, then the visible compressed
@@ -18536,6 +18553,7 @@ static void layer_attention_graph(
     };
     if (g.top_k) {
         memset(scratch->index_head_done, 0, DS4_N_INDEXER_HEAD * sizeof(scratch->index_head_done[0]));
+        memset(scratch->index_group_done, 0, (size_t)64u * ((DS4_N_INDEXER_HEAD + 15u) / 16u));
         g.index_weights = (matvec_f16_ctx) {
             .out = scratch->index_weights,
             .data = tensor_data(model, layer->indexer_proj),
@@ -18634,8 +18652,7 @@ static void layer_attention_graph(
           .n_rows = g.top_k ? n_weight_groups : 0, .group_rows = n_weight_groups,
           .deps = 1u << 0, .finish = g.top_k ? attn_graph_index_weights : NULL, .finish_ctx = &g },
         { .fn = attn_graph_index_q_worker, .ctx = &g,
-          .n_rows = g.top_k ? n_index_groups : 0, .group_rows = n_index_groups,
-          .deps = 1u << 1, .finish = g.top_k ? attn_graph_index_qt : NULL, .finish_ctx = &g },
+          .n_rows = g.top_k ? n_index_groups : 0, .group_rows = n_index_groups, .deps = 1u << 1 },
         { .fn = attn_graph_q_tail_worker, .ctx = &g,
           .n_rows = head_groups, .group_rows = head_groups,
           .deps = 1u << 3, .finish = mark, .finish_ctx = &g.mark[2] },
