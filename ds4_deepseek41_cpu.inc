@@ -1135,7 +1135,7 @@ static void ds41_cpu_batch_attention_token(ds41_cpu_batch_ctx *c,
         .n_chunks = (n_rows + ATTN_LANES_ROWS_PER_ITEM - 1) / ATTN_LANES_ROWS_PER_ITEM,
         .n_dim_chunks = 512 / 16,
     };
-    if (n_rows) attn_lanes_score_worker(&ctx, 0, 4u * ctx.n_chunks);
+    ds41_cpu_attention_scores(&ctx);
     ds41_cpu_attention_weight_worker(&ctx, 0, 64);
     attn_lanes_sum_worker(&ctx, 0, 4u * ctx.n_dim_chunks);
     ds41_cpu_bf16_rows(heads, 64u * 512u);

@@ -453,6 +453,50 @@ static bool ds41_cpu_proj_graph_run(ds41_cpu_attention_state *s, const ds4_model
 }
 #endif
 
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+/* The scores of two head groups (heads h0 .. h0 + 31) for n <= 8 staged
+ * rows from r0: each row value broadcast feeds both groups, sixteen chains.
+ * Per head and row these are the products and sums of
+ * attn_lanes_score_block in the same order, then the same scaling. */
+static void ds41_cpu_attention_score2(const layer_attention_lanes_ctx *ctx, uint32_t h0,
+                                      uint32_t r0, uint32_t n) {
+    const float kq_scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
+    const float *qa = ctx->qt + (uint64_t)h0 * DS4_N_HEAD_DIM, *qb = qa + 16u * DS4_N_HEAD_DIM;
+    const float *k[8];
+    __m512 a[8], b[8];
+    for (uint32_t j = 0; j < 8; j++) {
+        k[j] = ctx->rows[r0 + (j < n ? j : n - 1)];
+        a[j] = b[j] = _mm512_setzero_ps();
+    }
+    for (uint32_t i = 0; i < DS4_N_HEAD_DIM; i++) {
+        const __m512 qva = _mm512_loadu_ps(qa + (uint64_t)i * 16);
+        const __m512 qvb = _mm512_loadu_ps(qb + (uint64_t)i * 16);
+        for (uint32_t j = 0; j < 8; j++) {
+            const __m512 kv = _mm512_set1_ps(k[j][i]);
+            a[j] = _mm512_add_ps(a[j], _mm512_mul_ps(qva, kv));
+            b[j] = _mm512_add_ps(b[j], _mm512_mul_ps(qvb, kv));
+        }
+    }
+    const __m512 scale = _mm512_set1_ps(kq_scale);
+    for (uint32_t j = 0; j < n; j++) {
+        _mm512_storeu_ps(attn_lanes_score(ctx, h0, r0 + j), _mm512_mul_ps(a[j], scale));
+        _mm512_storeu_ps(attn_lanes_score(ctx, h0 + 16, r0 + j), _mm512_mul_ps(b[j], scale));
+    }
+}
+#endif
+
+/* Every score of the 64 staged heads over the staged rows, as
+ * attn_lanes_score_worker computes them. */
+static void ds41_cpu_attention_scores(const layer_attention_lanes_ctx *ctx) {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+    for (uint32_t h = 0; h < 64; h += 32)
+        for (uint32_t r = 0; r < ctx->n_rows; r += 8)
+            ds41_cpu_attention_score2(ctx, h, r, ctx->n_rows - r < 8 ? ctx->n_rows - r : 8);
+#else
+    if (ctx->n_rows) attn_lanes_score_worker((void *)ctx, 0, 4u * ctx->n_chunks);
+#endif
+}
+
 /* Pass B1 of layer_attention_lanes with this path's running peak: fmaxf
  * from the sink, then the expf chain and the denominator in row order.  The
  * score and weighted-sum passes are the V4 ones: per head and row the same

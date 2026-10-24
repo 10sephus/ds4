@@ -833,6 +833,34 @@ static void check_index_scores(void) {
     free(qt); free(b); free(a); free(keys); free(q);
 }
 
+/* The staged-row scores of 64 heads, two head groups at a time, against
+ * the lane items of attn_lanes_score_worker. */
+static void check_attention_scores(void) {
+    const uint32_t rows[] = {1, 7, 8, 9, 133, 640};
+    float *kv = malloc((size_t)640 * 512 * sizeof(float)), *qt = malloc(64u * 512u * sizeof(float));
+    float *a = malloc(4u * 640u * 16u * sizeof(float)), *b = malloc(4u * 640u * 16u * sizeof(float));
+    const float *ptr[640];
+    CHECK(kv && qt && a && b);
+    for (size_t i = 0; i < (size_t)640 * 512; i++) kv[i] = test_float();
+    for (size_t i = 0; i < 64u * 512u; i++) qt[i] = test_float() * 0.1f;
+    for (uint32_t r = 0; r < 640; r++) ptr[r] = kv + (size_t)((r * 37u) % 640u) * 512u;
+    for (size_t ri = 0; ri < sizeof(rows) / sizeof(*rows); ri++) {
+        const uint32_t n_rows = rows[ri];
+        memset(a, 0, 4u * 640u * 16u * sizeof(float));
+        memset(b, 0, 4u * 640u * 16u * sizeof(float));
+        layer_attention_lanes_ctx ca = {.qt = qt, .rows = ptr, .score = a, .n_head = 64,
+                                        .score_stride = 640, .n_rows = n_rows,
+                                        .n_chunks = (n_rows + ATTN_LANES_ROWS_PER_ITEM - 1) /
+                                                    ATTN_LANES_ROWS_PER_ITEM};
+        layer_attention_lanes_ctx cb = ca;
+        cb.score = b;
+        ds41_cpu_attention_scores(&ca);
+        attn_lanes_score_worker(&cb, 0, 4u * cb.n_chunks);
+        test_equal("attention scores", a, b, 4u * 640u * 16u);
+    }
+    free(b); free(a); free(qt); free(kv);
+}
+
 /* The sink softmax weights of 64 heads in head groups against the scalar
  * loop one head at a time, with -inf, huge and tiny scores. */
 static void check_attention_weights(void) {
@@ -874,6 +902,7 @@ int main(void) {
     check_q4_tails();
     check_expf_fmaxf();
     check_index_scores();
+    check_attention_scores();
     check_attention_weights();
 #endif
     /* Both pool layouts: NUMA halves per group (on a two-node host) and one cursor. */
