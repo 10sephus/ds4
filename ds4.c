@@ -1147,6 +1147,7 @@ typedef struct {
     float *attn_cmax;
     float *attn_inv;
     float *attn_hmax;   /* staged attention: head maxima for the sums' denominators */
+    uint32_t *attn_hmax_ready;   /* staged attention: attn_hmax of each head group is set */
     /* Staged attention on a ratio-4 layer whose indexer selects: every raw and
      * compressed row is scored while the indexer runs (attn_rows_all, its
      * scores in attn_score), and the weights of the rows the indexer keeps go
@@ -16033,6 +16034,7 @@ static void cpu_decode_scratch_init(ds4_cpu_decode_scratch *scratch, uint32_t ct
                                  16u * sizeof(float));
     scratch->attn_inv = xmalloc((size_t)DS4_N_HEAD * sizeof(float));
     scratch->attn_hmax = xmalloc((size_t)16u * ((DS4_N_HEAD + 15u) / 16u) * sizeof(float));
+    scratch->attn_hmax_ready = xmalloc_lines((size_t)((DS4_N_HEAD + 15u) / 16u) * sizeof(uint32_t));
     scratch->attn_rows_all = xmalloc((size_t)attn_score_cap * sizeof(float *));
     scratch->attn_weight = xmalloc_lines((size_t)16u * ((DS4_N_HEAD + 15u) / 16u) * attn_score_cap * sizeof(float));
     scratch->attn_pick = xmalloc((size_t)attn_score_cap * sizeof(uint32_t));
@@ -16124,6 +16126,7 @@ static void cpu_decode_scratch_free(ds4_cpu_decode_scratch *scratch) {
     free(scratch->attn_pick);
     free(scratch->attn_weight);
     free(scratch->attn_rows_all);
+    free(scratch->attn_hmax_ready);
     free(scratch->attn_hmax);
     free(scratch->attn_inv);
     free(scratch->attn_cmax);
@@ -17097,8 +17100,11 @@ typedef struct layer_attention_lanes_ctx {
     uint32_t              n_raw;
     /* NULL, or n_head floats where stage B's first chunk of each group puts
      * the head maxima, so that stage D runs the denominator chain itself
-     * (stage C's arithmetic, row by row beside the sums) and inv is unused. */
+     * (stage C's arithmetic, row by row beside the sums) and inv is unused;
+     * once hmax_ready[g] is set, the other chunks of group g take them from
+     * there instead of folding the chunk maxima again. */
     float               * hmax;
+    uint32_t            * hmax_ready;
 } layer_attention_lanes_ctx;
 
 static inline float *attn_lanes_score(const layer_attention_lanes_ctx *ctx, uint32_t h, uint32_t r) {
@@ -17239,8 +17245,15 @@ static void attn_lanes_weight_worker(void *vctx, uint64_t item0, uint64_t item1)
         const uint32_t r1 = r0 + ATTN_LANES_ROWS_PER_ITEM < ctx->n_rows ? r0 + ATTN_LANES_ROWS_PER_ITEM : ctx->n_rows;
         const uint32_t n = g * 16 + 16 < ctx->n_head ? 16 : ctx->n_head - g * 16;
         float max[16];
-        attn_lanes_head_max(ctx, g, max);
-        if (ctx->hmax && r0 == 0) memcpy(ctx->hmax + g * 16, max, n * sizeof(max[0]));
+        if (ctx->hmax && r0 != 0 && __atomic_load_n(&ctx->hmax_ready[g], __ATOMIC_ACQUIRE)) {
+            memcpy(max, ctx->hmax + g * 16, n * sizeof(max[0]));
+        } else {
+            attn_lanes_head_max(ctx, g, max);
+        }
+        if (ctx->hmax && r0 == 0) {
+            memcpy(ctx->hmax + g * 16, max, n * sizeof(max[0]));
+            __atomic_store_n(&ctx->hmax_ready[g], 1, __ATOMIC_RELEASE);
+        }
         for (uint32_t r = r0; r < r1; r++) {
             float *w = attn_lanes_score(ctx, g * 16, r);
             const float *s = ctx->all ? attn_lanes_score(ctx->all, g * 16, ctx->pick[r]) : w;
@@ -18582,6 +18595,7 @@ static void layer_attention_graph(
         .row0 = 0,
         .blocks = DS4_N_LORA_Q / 32,
     };
+    memset(scratch->attn_hmax_ready, 0, head_groups * sizeof(scratch->attn_hmax_ready[0]));
     if (g.top_k) {
         memset(scratch->index_head_done, 0, DS4_N_INDEXER_HEAD * sizeof(scratch->index_head_done[0]));
         memset(scratch->index_group_done, 0, (size_t)64u * ((DS4_N_INDEXER_HEAD + 15u) / 16u));
@@ -18628,6 +18642,7 @@ static void layer_attention_graph(
         .n_chunks = (g.n_raw + n_visible + ATTN_LANES_ROWS_PER_ITEM - 1) / ATTN_LANES_ROWS_PER_ITEM,
         .n_dim_chunks = (head_dim + 15) / 16,
         .hmax = scratch->attn_hmax,
+        .hmax_ready = scratch->attn_hmax_ready,
     };
     if (g.top_k) {
         g.lanes_all = g.lanes;
