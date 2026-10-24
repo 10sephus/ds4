@@ -806,9 +806,8 @@ static void check_layer_graph(test_layer *tl, const ds4_layer_weights *l) {
     }
 }
 #endif
-/* The batched prefill kernels against the one-token ones, token by token:
- * Q8_0 with BF16 rounding and row groups, then the routed experts grouped
- * by expert with the slots added in order. */
+/* The batched Q8_0 prefill kernel against the one-token one, token by
+ * token, with BF16 rounding and row groups. */
 static void check_q8_batch(void) {
     const uint64_t dims[] = {32, 64, 256, 1280};
     const uint64_t rows[] = {16, 48, 512, 1024};
@@ -919,27 +918,8 @@ static void check_f32_batch(void) {
     }
 }
 
-/* The batch's mid rows back in entry order: the dispatcher splits each
- * expert's entries into nearly equal runs of at most DS41_CPU_PASS, and a
- * run of len entries from k0 holds them transposed from k0 * hidden. */
-static void routed_mid_rows(float *rows, const float *mid, const uint32_t *entry,
-                            const int *selected, uint32_t pairs, uint32_t hidden) {
-    for (uint32_t k = 0; k < pairs;) {
-        uint32_t e = k;
-        while (e < pairs && selected[entry[e]] == selected[entry[k]]) e++;
-        const uint32_t runs = (e - k + DS41_CPU_PASS - 1) / DS41_CPU_PASS;
-        for (uint32_t r = 0, k0 = k; r < runs; r++) {
-            const uint32_t len = (e - k0 + runs - r - 1) / (runs - r);
-            for (uint32_t t = 0; t < len; t++)
-                for (uint32_t i = 0; i < hidden; i++)
-                    rows[(size_t)entry[k0 + t] * hidden + i] =
-                        mid[(size_t)k0 * hidden + (size_t)i * len + t];
-            k0 += len;
-        }
-        k = e;
-    }
-}
-
+/* The Q8_K prefill experts, moe_grouped_ffn grouped by expert, against
+ * the one-token Q8_K path token by token. */
 static void check_routed_batch(uint32_t embd, uint32_t hidden, float clamp) {
     g_ds4_shape = DS4_SHAPE_FLASH41;
     g_ds4_shape.n_embd = embd;
@@ -963,22 +943,18 @@ static void check_routed_batch(uint32_t embd, uint32_t hidden, float clamp) {
     down.bytes = dbytes;
     down.dim[0] = hidden; down.dim[1] = embd;
     ds4_layer_weights l = {.ffn_gate_exps = &gate, .ffn_up_exps = &up, .ffn_down_exps = &down};
-    /* Up to 160 tokens: experts with more than one pass of tokens, and
-     * token groups of every size. */
+    /* Up to 160 tokens: experts with more pairs than one tile of lanes
+     * holds, and tails of every size. */
     const uint32_t tokens[] = {1, 2, 3, 5, 9, 17, 40, 77, 160};
     for (size_t tk = 0; tk < sizeof(tokens) / sizeof(*tokens); tk++) {
         const uint32_t nt = tokens[tk];
         float *x = malloc((size_t)nt * embd * sizeof(float));
-        float *ma = malloc((size_t)nt * 3 * hidden * sizeof(float));
-        float *mb = malloc((size_t)nt * 3 * hidden * sizeof(float));
-        float *mr = malloc((size_t)nt * 3 * hidden * sizeof(float));
+        float *mid = malloc((size_t)3 * hidden * sizeof(float));
         float *oa = malloc((size_t)nt * embd * sizeof(float));
         float *ob = malloc((size_t)nt * embd * sizeof(float));
-        float *partial = malloc((size_t)nt * 3 * embd * sizeof(float));
         float *weights = malloc((size_t)nt * 3 * sizeof(float));
         int *selected = malloc((size_t)nt * 3 * sizeof(int));
-        uint32_t *entry = malloc((size_t)nt * 3 * sizeof(uint32_t));
-        CHECK(x && ma && mb && mr && oa && ob && partial && weights && selected && entry);
+        CHECK(x && mid && oa && ob && weights && selected);
         for (uint32_t i = 0; i < nt * embd; i++) x[i] = test_float();
         for (uint32_t t = 0; t < nt; t++) {
             /* Three distinct experts, mostly 0..2 so that experts are shared. */
@@ -990,29 +966,12 @@ static void check_routed_batch(uint32_t embd, uint32_t hidden, float clamp) {
             if (selected[t * 3] == selected[t * 3 + 2]) selected[t * 3 + 2] = (selected[t * 3 + 2] + 1) % 7;
             if (selected[t * 3 + 1] == selected[t * 3 + 2]) selected[t * 3 + 2] = (selected[t * 3 + 2] + 1) % 7;
             if (selected[t * 3] == selected[t * 3 + 2]) selected[t * 3 + 2] = (selected[t * 3 + 2] + 1) % 7;
-            ds41_cpu_routed_moe(oa + (size_t)t * embd, ma + (size_t)t * 3 * hidden, &m, &l,
-                                x + (size_t)t * embd, selected + t * 3, weights + t * 3);
-        }
-        if (ds41_cpu_routed_moe_batch(partial, mb, entry, &m, &l, x, embd, nt, selected, weights)) {
-            for (uint32_t t = 0; t < nt; t++)
-                for (uint32_t i = 0; i < embd; i++) {
-                    float sum = 0.0f;
-                    for (uint32_t k = 0; k < 3; k++)
-                        sum = sum + partial[((size_t)t * 3 + k) * embd + i];
-                    ob[(size_t)t * embd + i] = sum;
-                }
-            routed_mid_rows(mr, mb, entry, selected, nt * 3, hidden);
-            test_equal("routed batch mid", ma, mr, (size_t)nt * 3 * hidden);
-            test_equal("routed batch out", oa, ob, (size_t)nt * embd);
-        }
-        /* The Q8_K prefill experts against the one-token Q8_K path. */
-        for (uint32_t t = 0; t < nt; t++)
-            CHECK(ds41_cpu_routed_moe_q8k(oa + (size_t)t * embd, ma, &m, &l, x + (size_t)t * embd,
+            CHECK(ds41_cpu_routed_moe_q8k(oa + (size_t)t * embd, mid, &m, &l, x + (size_t)t * embd,
                                           selected + t * 3, weights + t * 3));
+        }
         CHECK(ds41_cpu_routed_moe_q8k_batch(ob, &m, &l, x, nt, selected, weights));
         test_equal("Q8_K routed batch out", oa, ob, (size_t)nt * embd);
-        free(entry); free(selected); free(weights); free(partial);
-        free(ob); free(oa); free(mr); free(mb); free(ma); free(x);
+        free(selected); free(weights); free(ob); free(oa); free(mid); free(x);
     }
     test_free(w);
 }

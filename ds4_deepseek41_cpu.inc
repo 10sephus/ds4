@@ -223,7 +223,7 @@ static void ds41_cpu_hc_post_norm(void *vctx) {
 #define DS41_CPU_BATCH_COMP 16384u
 #define DS41_CPU_BATCH_TOKEN_BYTES (4u * (3u * 4u * 5120u + 4u * 5120u + 52u + 1280u + \
     2u * 64u * 512u + 512u + 8192u + 2u * 24u * 256u + 5u * 5120u + 3u * 2304u + \
-    6u * (2304u + 5120u + 1u) + 6u + 48u + 6u + 512u + 24u + 384u + 2u * 4u * 5120u + \
+    2u * 6u + 48u + 512u + 24u + 384u + 2u * 4u * 5120u + \
     2u * 512u + 32u * 128u + 32u + 2u * 24u * 256u + 48u))
 /* The Q2 experts' chunk workspace, moe_grouped_ffn's pf_buf slots, which
  * ds41_cpu_prefill frees on return as V4's prefill does: per token the Q8_K
@@ -267,7 +267,7 @@ typedef struct ds41_cpu_batch {
     float *residual, *after_attn, *flat, *x, *norm, *block, *shared;
     float *pre, *attn_split, *ffn_split, *qr, *q, *kv, *heads, *low;
     float *rows, *engram_kv, *shared_gate, *shared_up, *shared_mid;
-    float *mid, *partial, *weight, *mix, *probs, *ckv, *cscore, *iq, *iw;
+    float *weight, *mix, *probs, *ckv, *cscore, *iq, *iw;
     float *prev_window;
     /* The rows the chunk's queries attend, rounded to F16 once per layer:
      * the raw window before the chunk, then the chunk's own KV rows, and
@@ -288,7 +288,7 @@ typedef struct ds41_cpu_batch {
     bool ahead_live;
     double *xt;
     int *selected;
-    uint32_t *ids, *entry, *sel;
+    uint32_t *ids, *sel;
 } ds41_cpu_batch;
 
 /* The query side's scratch of one pool thread: the scratch struct, the
@@ -949,7 +949,7 @@ typedef struct {
     const ds4_layer_weights *l;
     uint32_t il, n;
     bool mixed;     /* mix holds the HC mixer projections */
-    bool routed;    /* probs holds the router, partial the routed experts */
+    bool routed;    /* probs holds the router projections */
     int failed;
 } ds41_cpu_batch_ctx;
 
@@ -967,8 +967,8 @@ static void ds41_cpu_batch_free(ds41_cpu_batch *b) {
     free(b->attn_split); free(b->ffn_split); free(b->qr); free(b->q);
     free(b->kv); free(b->heads); free(b->low); free(b->rows);
     free(b->engram_kv); free(b->shared_gate); free(b->shared_up);
-    free(b->shared_mid); free(b->mid); free(b->partial); free(b->weight);
-    free(b->selected); free(b->ids); free(b->entry); free(b->sel);
+    free(b->shared_mid); free(b->weight);
+    free(b->selected); free(b->ids); free(b->sel);
     free(b->mix); free(b->probs); free(b->xt);
     free(b->ckv); free(b->cscore); free(b->iq); free(b->iw);
     free(b->prev_window); free(b->rounded_raw); free(b->rounded_comp);
@@ -1013,14 +1013,11 @@ static ds41_cpu_batch *ds41_cpu_batch_create(uint32_t ctx) {
     b->shared_gate = malloc(n * 2304u * f);
     b->shared_up = malloc(n * 2304u * f);
     b->shared_mid = malloc(n * 2304u * f);
-    b->mid = malloc(pairs * 2304u * f);
-    b->partial = malloc(pairs * 5120u * f);
     b->weight = malloc(pairs * f);
     b->selected = malloc(pairs * sizeof(int));
     b->ids = malloc(n * 2u * DS4_ENGRAM_COLS * sizeof(uint32_t));
     b->next_rows = malloc(n * 2u * DS4_ENGRAM_COLS * DS4_ENGRAM_DIM * f);
     b->next_ids = malloc(n * 2u * DS4_ENGRAM_COLS * sizeof(uint32_t));
-    b->entry = malloc(pairs * sizeof(uint32_t));
     b->sel = malloc(n * 512u * sizeof(uint32_t));
     b->mix = malloc(n * 24u * f);
     b->probs = malloc(n * DS4_N_EXPERT * f);
@@ -1039,7 +1036,7 @@ static ds41_cpu_batch *ds41_cpu_batch_create(uint32_t ctx) {
         !b->block || !b->shared || !b->pre || !b->attn_split || !b->ffn_split ||
         !b->qr || !b->q || !b->kv || !b->heads || !b->low || !b->rows ||
         !b->engram_kv || !b->shared_gate || !b->shared_up || !b->shared_mid ||
-        !b->mid || !b->partial || !b->weight || !b->selected || !b->ids || !b->entry ||
+        !b->weight || !b->selected || !b->ids ||
         !b->sel || !b->mix || !b->probs || !b->xt || !b->ckv || !b->cscore ||
         !b->iq || !b->iw || !b->prev_window || !b->rounded_raw || !b->attn ||
         !b->next_rows || !b->next_ids) {
@@ -1272,23 +1269,13 @@ static void ds41_cpu_batch_swiglu_worker(void *vctx, uint64_t t0, uint64_t t1) {
     }
 }
 
-/* Routed slots added in slot order, as ds41_cpu_down_worker, then the
- * shared expert and the FFN HC expansion. */
+/* The shared expert added to the routed block, then the FFN HC expansion. */
 static void ds41_cpu_batch_ffn_out_worker(void *vctx, uint64_t t0, uint64_t t1) {
     ds41_cpu_batch_ctx *c = vctx;
     ds41_cpu_batch *b = c->b;
     for (uint64_t t = t0; t < t1; t++) {
         float *block = b->block + t * 5120u;
         const float *shared = b->shared + t * 5120u;
-        if (c->routed) {
-            const float *p = b->partial + t * DS4_N_EXPERT_USED * 5120u;
-            for (uint32_t i = 0; i < 5120; i++) {
-                float sum = 0.0f;
-                for (uint32_t slot = 0; slot < DS4_N_EXPERT_USED; slot++)
-                    sum = sum + p[(size_t)slot * 5120u + i];
-                block[i] = sum;
-            }
-        }
         for (uint32_t i = 0; i < 5120; i++) block[i] = ds41_cpu_bf16(block[i] + shared[i]);
         ds41_cpu_hc_expand(b->residual + t * 4u * 5120u, block,
                           b->after_attn + t * 4u * 5120u, b->ffn_split + t * 24u);
@@ -1570,12 +1557,8 @@ static bool ds41_cpu_prefill_layer(ds41_cpu_state *s, uint32_t il, uint32_t n,
     if (!ds41_cpu_matmul(b->shared, 5120, m, l->ffn_down_shexp, b->shared_mid, 2304, n, true))
         return false;
     DS41_PHASE(5);
-    /* Q2 experts write block; the F32 batch writes the partials. */
-    const bool q8k = ds41_cpu_routed_moe_q8k_batch(b->block, m, l, b->norm, n,
-                                                   b->selected, b->weight);
-    c.routed = !q8k && ds41_cpu_routed_moe_batch(b->partial, b->mid, b->entry, m, l, b->norm,
-                                                 5120, n, b->selected, b->weight);
-    if (!q8k && !c.routed) {
+    /* Q2 experts grouped by expert; the other types one token at a time. */
+    if (!ds41_cpu_routed_moe_q8k_batch(b->block, m, l, b->norm, n, b->selected, b->weight)) {
         for (uint32_t i = 0; i < n; i++)
             ds41_cpu_routed_moe(b->block + (size_t)i * 5120u, s->expert_mid, m, l,
                                 b->norm + (size_t)i * 5120u,
