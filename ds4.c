@@ -12657,9 +12657,44 @@ typedef struct {
 
 /* SwiGLU of a tile's lanes for the pairs [row0, row0 + n_pairs) from their
  * gate and up dots: the same clamp, silu and router weight as the decode
- * path, lane by lane so each lane's outputs are written contiguously. */
+ * path, then each lane's outputs written contiguously.  With the x16
+ * kernels the sixteen lanes of a pair go together: the clamps and the
+ * sign test of sigmoid_stable are masks (a NaN fails every compare, as in
+ * the scalar code), the lanes' expf calls stay scalar, and the divisions
+ * and products are the single-lane IEEE operations in the scalar order,
+ * x * sigmoid, * up, * weight, so every value is the scalar path's. */
 static inline void moe_mid_store(const moe_mid_tile_ctx *ctx, const ds4_moe_tile *t, uint64_t row0, uint32_t n_pairs,
                                  const float (*gv)[DS4_MOE_TILE], const float (*uv)[DS4_MOE_TILE]) {
+#if DS4_MOE_X16
+    float res[DS4_MOE_ROW_BLOCK][DS4_MOE_TILE];
+    float pw[DS4_MOE_TILE], arg[DS4_MOE_TILE], e[DS4_MOE_TILE];
+    for (uint32_t lane = 0; lane < DS4_MOE_TILE; lane++) pw[lane] = ctx->pair_weight[t->pair[lane]];
+    const __m512 pwv = _mm512_loadu_ps(pw);
+    const __m512 zero = _mm512_setzero_ps(), one = _mm512_set1_ps(1.0f), sign = _mm512_set1_ps(-0.0f);
+    const __m512 clampv = _mm512_set1_ps(ctx->clamp), nclampv = _mm512_set1_ps(-ctx->clamp);
+    const bool clamp = ctx->clamp > 1.0e-6f;
+    for (uint32_t p = 0; p < n_pairs; p++) {
+        __m512 g = _mm512_loadu_ps(gv[p]), u = _mm512_loadu_ps(uv[p]);
+        if (clamp) {
+            g = _mm512_mask_blend_ps(_mm512_cmp_ps_mask(g, clampv, _CMP_GT_OQ), g, clampv);
+            u = _mm512_mask_blend_ps(_mm512_cmp_ps_mask(u, clampv, _CMP_GT_OQ), u, clampv);
+            u = _mm512_mask_blend_ps(_mm512_cmp_ps_mask(u, nclampv, _CMP_LT_OQ), u, nclampv);
+        }
+        /* sigmoid_stable: 1 / (1 + expf(-x)) for x >= 0, else e / (1 + e)
+         * with e = expf(x); the negation is the sign flip. */
+        const __mmask16 nonneg = _mm512_cmp_ps_mask(g, zero, _CMP_GE_OQ);
+        _mm512_storeu_ps(arg, _mm512_mask_blend_ps(nonneg, g, _mm512_xor_ps(g, sign)));
+        for (uint32_t lane = 0; lane < DS4_MOE_TILE; lane++) e[lane] = expf(arg[lane]);
+        const __m512 ev = _mm512_loadu_ps(e);
+        const __m512 den = _mm512_add_ps(one, ev);
+        const __m512 sg = _mm512_mask_blend_ps(nonneg, _mm512_div_ps(ev, den), _mm512_div_ps(one, den));
+        _mm512_storeu_ps(res[p], _mm512_mul_ps(_mm512_mul_ps(_mm512_mul_ps(g, sg), u), pwv));
+    }
+    for (uint32_t lane = 0; lane < t->n; lane++) {
+        float *out = ctx->mid + (uint64_t)t->pair[lane] * ctx->out_dim + row0;
+        for (uint32_t p = 0; p < n_pairs; p++) out[p] = res[p][lane];
+    }
+#else
     for (uint32_t lane = 0; lane < t->n; lane++) {
         float *out = ctx->mid + (uint64_t)t->pair[lane] * ctx->out_dim + row0;
         const float pw = ctx->pair_weight[t->pair[lane]];
@@ -12674,6 +12709,7 @@ static inline void moe_mid_store(const moe_mid_tile_ctx *ctx, const ds4_moe_tile
             out[p] = silu(gate_v) * up_v * pw;
         }
     }
+#endif
 }
 
 /* The task's gate/up row pairs are decoded once into the thread's buffer,
