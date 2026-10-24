@@ -2072,8 +2072,10 @@ static void check_attn_graph(void) {
     attn_test_fill(dirs, 4 * E, 0.01f);
 
     /* top_k 0 keeps the indexer's 6; the attention scores every row while
-     * the indexer selects, so the cases with more compressed rows have
-     * chunks of them with no, some and all of their rows listed. */
+     * the indexer selects when at most ATTN_SCORE_ALL_DROP_MAX rows drop
+     * out, so the cases with more compressed rows have chunks of them with
+     * no, some and all of their rows listed, and 6 of 61 waits for the
+     * selection. */
     const struct { int r; uint32_t pos, n_raw, n_comp; bool steer; uint32_t top_k; } cases[] = {
         {0, 5, 5, 0, false, 0},       /* dense layer, window filling */
         {1, 131, 16, 20, false, 0},   /* ratio 4: full window, compression, 21 > top-k rows: indexer */

@@ -17728,6 +17728,12 @@ static void indexer_select_first(indexer_candidate *cand, uint32_t n, uint32_t k
  * after a replacement. */
 #define INDEXER_DROP_MAX 32
 
+/* Stage 8 of layer_attention_graph() scores every raw and compressed row
+ * beside the indexer only while at most this many rows drop out: each one
+ * costs a score the listed rows never need, so past 2176 tokens the scores
+ * wait for the selection again and score the listed rows only. */
+#define ATTN_SCORE_ALL_DROP_MAX INDEXER_DROP_MAX
+
 /* Same allowed set as the reference selection, top_k argmax rounds each taking
  * the lowest index with the strictly greatest score among the rows not yet
  * chosen, starting from DS4_NEG_INF: a row that never compares greater than
@@ -18235,10 +18241,13 @@ static void layer_attention_raw_swa_batch(
  *                                   their transpose
  *   6  q tail (16-head groups)      after 3: head norms, RoPE, transpose
  *   7  indexer scores               after 2, 4, 5, then top-k and the row list
- *   8  attention scores             after 2, 6, with the chunk maxima; once
- *                                   the indexer selects, of every raw and
- *                                   compressed row, beside stage 7, and run
- *                                   ahead by threads waiting for its inputs
+ *   8  attention scores             after 2, 6, with the chunk maxima, run
+ *                                   ahead by threads waiting for their
+ *                                   inputs; once the indexer selects, of
+ *                                   every raw and compressed row beside
+ *                                   stage 7 while at most
+ *                                   ATTN_SCORE_ALL_DROP_MAX rows drop out,
+ *                                   else of the listed rows after 7
  *   9  softmax weights              after 7, 8 (the head maxima from the
  *                                   chunk maxima, as layer_attention_lanes()
  *                                   does, of the listed rows only)
@@ -18353,7 +18362,7 @@ static void attn_graph_kv_worker(void *vctx, uint64_t i0, uint64_t i1) {
     /* The push may slide the window, so the rows are listed after it (the
      * rows the indexer keeps after its selection, which runs later). */
     if (!g->top_k) attn_graph_rows(g);
-    else attn_graph_rows_all(g);
+    else if (g->lanes.all) attn_graph_rows_all(g);
     if (g->ratio == 0) return;
     if (compressor_update_one(scratch->comp, model,
                               layer->attn_compressor_ape, layer->attn_compressor_norm,
@@ -18441,9 +18450,9 @@ static void attn_graph_index_q_worker(void *vctx, uint64_t g0, uint64_t g1) {
 }
 
 /* The attention rows in order: the raw window, then the visible compressed
- * rows, as layer_attention_lanes() lists them.  Once the indexer selects,
- * also where each sits among all the rows stage 7 scored, and how many of
- * each chunk of those are listed. */
+ * rows, as layer_attention_lanes() lists them.  When stage 8 scored every
+ * row beside the indexer, also where each sits among them and how many of
+ * each chunk of them are listed. */
 static void attn_graph_rows(attn_graph_ctx *g) {
     const ds4_layer_cache *cache = g->cache;
     ds4_cpu_decode_scratch *scratch = g->scratch;
@@ -18461,7 +18470,7 @@ static void attn_graph_rows(attn_graph_ctx *g) {
         rows[n++] = cache->attn_comp_kv + (uint64_t)r * DS4_N_HEAD_DIM;
     }
     g->lanes.n_rows = n;
-    if (allowed) {
+    if (g->lanes.all) {
         memset(scratch->attn_listed, 0, g->lanes_all.n_chunks);
         for (uint32_t r = 0; r < n; r++) scratch->attn_listed[pick[r] / ATTN_LANES_ROWS_PER_ITEM]++;
     }
@@ -18658,16 +18667,19 @@ static void layer_attention_graph(
     /* n_chunks covers every row that may be listed: the raw window and the
      * compressed rows, or the top-k of them once the indexer selects; items
      * past the rows actually listed do nothing, so the list may shrink in
-     * stage 7.  Then every row is scored into attn_score as lanes_all, and
-     * the listed rows' weights go to attn_weight. */
+     * stage 7.  While at most ATTN_SCORE_ALL_DROP_MAX rows drop out, every
+     * row is scored into attn_score as lanes_all beside the indexer, and the
+     * listed rows' weights go to attn_weight; past that the scores wait for
+     * the selection and score the listed rows only, as the base order does. */
     const uint32_t n_visible = g.top_k && g.top_k < g.n_comp ? g.top_k : g.n_comp;
+    const bool score_all = g.top_k && g.n_comp - n_visible <= ATTN_SCORE_ALL_DROP_MAX;
     g.lanes = (layer_attention_lanes_ctx) {
         .out_heads = scratch->heads,
         .sinks = tensor_data(model, layer->attn_sinks),
         .q = scratch->q,
         .qt = scratch->attn_qt,
         .rows = scratch->attn_rows,
-        .score = g.top_k ? scratch->attn_weight : scratch->attn_score,
+        .score = score_all ? scratch->attn_weight : scratch->attn_score,
         .cmax = scratch->attn_cmax,
         .inv = scratch->attn_inv,
         .n_head = n_head,
@@ -18677,7 +18689,7 @@ static void layer_attention_graph(
         .hmax = scratch->attn_hmax,
         .hmax_ready = scratch->attn_hmax_ready,
     };
-    if (g.top_k) {
+    if (score_all) {
         g.lanes_all = g.lanes;
         g.lanes_all.rows = scratch->attn_rows_all;
         g.lanes_all.score = scratch->attn_score;
@@ -18713,7 +18725,7 @@ static void layer_attention_graph(
     const uint64_t n_weight_groups = (DS4_N_INDEXER_HEAD + DS4_F16_ROWS - 1) / DS4_F16_ROWS;
     const uint64_t n_index_items = (g.n_index + INDEXER_SCORE_ROWS - 1) / INDEXER_SCORE_ROWS;
     const uint64_t n_score = (uint64_t)head_groups * g.lanes.n_chunks;
-    const uint64_t n_score_all = g.top_k ? (uint64_t)head_groups * g.lanes_all.n_chunks : n_score;
+    const uint64_t n_score_all = score_all ? (uint64_t)head_groups * g.lanes_all.n_chunks : n_score;
     const uint64_t n_sum = (uint64_t)head_groups * g.lanes.n_dim_chunks;
     void (*mark)(void *) = g.profile ? attn_graph_mark : NULL;
     ds4_pool_stage stages[15] = {
@@ -18739,8 +18751,9 @@ static void layer_attention_graph(
           .n_rows = g.top_k ? n_index_items : 0, .group_rows = g.top_k ? n_index_items : 1,
           .deps = (1u << 2) | (1u << 4) | (1u << 5),
           .finish = g.top_k ? attn_graph_index_select : NULL, .finish_ctx = &g },
-        { .fn = attn_lanes_score_worker, .ctx = g.top_k ? &g.lanes_all : &g.lanes,
-          .n_rows = n_score_all, .group_rows = n_score_all, .deps = (1u << 2) | (1u << 6), .ahead = true },
+        { .fn = attn_lanes_score_worker, .ctx = score_all ? &g.lanes_all : &g.lanes,
+          .n_rows = n_score_all, .group_rows = n_score_all,
+          .deps = (1u << 2) | (1u << 6) | (g.top_k && !score_all ? 1u << 7 : 0u), .ahead = true },
         { .fn = attn_lanes_weight_worker, .ctx = &g.lanes,
           .n_rows = n_score, .group_rows = n_score, .deps = (1u << 7) | (1u << 8) },
         { .fn = attn_lanes_sum_worker, .ctx = &g.lanes,
