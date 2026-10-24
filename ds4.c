@@ -16740,36 +16740,9 @@ static void compressor_emit_deferred(
     ds4_parallel_for_min_rows(n_emit, compressor_emit_worker, &ctx, 1);
 }
 
-/* Streaming compressor update for one token.  It projects kv/score rows,
- * updates the rolling state, and emits a compressed KV row on ratio boundaries. */
-static bool compressor_decode_one(
-        float                   * out_comp,
-        const ds4_model         * model,
-        const ds4_tensor        * wkv,
-        const ds4_tensor        * wgate,
-        const ds4_tensor        * ape,
-        const ds4_tensor        * norm,
-        const float             * x,
-        float                   * state_kv,
-        float                   * state_score,
-        uint32_t                  head_dim,
-        uint32_t                  compress_ratio,
-        uint32_t                  il,
-        uint32_t                  pos) {
-    const uint32_t width = (compress_ratio == 4 ? 2u : 1u) * head_dim;
-    float *kv_cur = xmalloc((size_t)width * sizeof(kv_cur[0]));
-    float *sc_cur = xmalloc((size_t)width * sizeof(sc_cur[0]));
-
-    compressor_project_one(kv_cur, sc_cur, model, wkv, wgate, x);
-    const bool emitted = compressor_update_one(out_comp, model, ape, norm, kv_cur, sc_cur,
-                                               state_kv, state_score,
-                                               head_dim, compress_ratio, il, pos);
-
-    free(sc_cur);
-    free(kv_cur);
-    return emitted;
-}
-
+/* Streaming compressor update for one token.  It projects kv/score rows into
+ * the decode scratch, updates the rolling state, and emits a compressed KV row
+ * on ratio boundaries. */
 static bool compressor_decode_one_decode_scratch(
         float                  * out_comp,
         const ds4_model        * model,
