@@ -1431,6 +1431,29 @@ static void check_hc_pre_batch(void) {
     g_ds4_shape = saved;
 }
 
+/* The batched shared-expert SwiGLU against swiglu(), with and without the
+ * clamp, for a vector-sized and a ragged width, with signed zeros, values
+ * at and past the clamp, huge and tiny magnitudes, infinities and a NaN. */
+static void check_swiglu_batch(void) {
+    enum { N = 1000, T = 3 };
+    float *g = malloc(T * N * sizeof(float)), *u = malloc(T * N * sizeof(float));
+    float *a = malloc(T * N * sizeof(float)), *b = malloc(T * N * sizeof(float));
+    CHECK(g && u && a && b);
+    for (unsigned c = 0; c < 8; c++) {
+        const uint64_t n = c & 1 ? N : 992;
+        const float clamp = c & 2 ? 10.0f : 0.0f;
+        const float mag = c & 4 ? 60.0f : 4.0f;
+        for (uint64_t i = 0; i < T * n; i++) { g[i] = glue_random(mag); u[i] = glue_random(mag); }
+        g[1] = -0.0f; g[2] = 0.0f; g[3] = 10.0f; u[4] = -10.0f; g[5] = 1e30f; g[6] = -1e30f;
+        g[7] = 1e-40f; u[8] = INFINITY; g[9] = -INFINITY; g[10] = NAN; g[11] = 88.8f; g[12] = -104.0f;
+        for (uint64_t t = 0; t < T; t++) swiglu(a + t * n, g + t * n, u + t * n, n, clamp);
+        swiglu_batch_ctx ctx = { .mid = b, .gate = g, .up = u, .n = n, .clamp = clamp };
+        swiglu_batch_worker(&ctx, 0, T);
+        glue_equal("SwiGLU batch", a, b, T * n * sizeof(float), c);
+    }
+    free(b); free(a); free(u); free(g);
+}
+
 /* Batched prefill routing (token-lane router logits for whole tiles, the
  * per-token matvec for the rest) against per-token routing: experts and
  * router weights bitwise, for top-k and hash layers, with and without tiles,
@@ -2985,6 +3008,8 @@ int main(void) {
     puts("CPU batched HC pre (sixteen-token lanes) bitwise with the per-token path PASS");
     check_route_batch();
     puts("CPU batched prefill routing (token-lane router logits) bitwise with per-token routing PASS");
+    check_swiglu_batch();
+    puts("CPU batched shared-expert SwiGLU bitwise with the scalar SwiGLU PASS");
     /* nb_in > nb_mid with a partial last row block, then nb_in < nb_mid,
      * then a full down row block followed by a partial one. */
     check_grouped_ffn(2 * QK_K, QK_K, 2 * DS4_MOE_ROW_BLOCK + 6);

@@ -15000,14 +15000,38 @@ typedef struct {
     float clamp;
 } swiglu_batch_ctx;
 
+/* swiglu() sixteen elements at a time: the clamps and the sign test of
+ * sigmoid_stable are masks (a NaN fails every compare, as in the scalar
+ * code), expf is ds41_cpu_expf16 (glibc's, bit for bit), and the division
+ * and products are the scalar ones in the scalar order, x * sigmoid, * up;
+ * the tail keeps the scalar loop. */
 static void swiglu_batch_worker(void *vctx, uint64_t t0, uint64_t t1) {
     swiglu_batch_ctx *ctx = vctx;
     for (uint64_t t = t0; t < t1; t++) {
-        swiglu(ctx->mid + t * ctx->n,
-               ctx->gate + t * ctx->n,
-               ctx->up + t * ctx->n,
-               ctx->n,
-               ctx->clamp);
+        float *out = ctx->mid + t * ctx->n;
+        const float *gate = ctx->gate + t * ctx->n, *up = ctx->up + t * ctx->n;
+        uint64_t i = 0;
+#if defined(DS4_NO_GPU) && defined(__AVX512F__) && defined(__AVX512BW__)
+        const bool clamp = ctx->clamp > 1.0e-6f;
+        const __m512 hi = _mm512_set1_ps(ctx->clamp), lo = _mm512_set1_ps(-ctx->clamp);
+        const __m512 zero = _mm512_setzero_ps(), one = _mm512_set1_ps(1.0f);
+        const __m512i sign = _mm512_set1_epi32((int)0x80000000u);
+        for (; i + 16 <= ctx->n; i += 16) {
+            __m512 g = _mm512_loadu_ps(gate + i), u = _mm512_loadu_ps(up + i);
+            if (clamp) {
+                g = _mm512_mask_mov_ps(g, _mm512_cmp_ps_mask(g, hi, _CMP_GT_OQ), hi);
+                u = _mm512_mask_mov_ps(u, _mm512_cmp_ps_mask(u, hi, _CMP_GT_OQ), hi);
+                u = _mm512_mask_mov_ps(u, _mm512_cmp_ps_mask(u, lo, _CMP_LT_OQ), lo);
+            }
+            const __mmask16 nonneg = _mm512_cmp_ps_mask(g, zero, _CMP_GE_OQ);
+            const __m512 neg = _mm512_castsi512_ps(_mm512_xor_si512(_mm512_castps_si512(g), sign));
+            const __m512 e = ds41_cpu_expf16(_mm512_mask_mov_ps(g, nonneg, neg));
+            const __m512 sg = _mm512_mask_mov_ps(_mm512_div_ps(e, _mm512_add_ps(one, e)), nonneg,
+                                                 _mm512_div_ps(one, _mm512_add_ps(one, e)));
+            _mm512_storeu_ps(out + i, _mm512_mul_ps(_mm512_mul_ps(g, sg), u));
+        }
+#endif
+        if (i < ctx->n) swiglu(out + i, gate + i, up + i, ctx->n - i, ctx->clamp);
     }
 }
 
