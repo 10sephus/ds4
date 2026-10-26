@@ -228,10 +228,11 @@ static void ds41_cpu_hc_post_norm(void *vctx) {
 /* The Q2 experts' chunk workspace, moe_grouped_ffn's pf_buf slots, which
  * ds41_cpu_prefill frees on return as V4's prefill does: per token the Q8_K
  * and IQ2_XXS-order input, the six mids, their Q8_K rows and the six down
- * rows; per pool thread the tile scratch. */
+ * rows; per pool thread the tile scratch, a row block's gate and up rows
+ * with their sub-block and superblock scales (larger than the down rows'). */
 #define DS41_CPU_Q8K_TOKEN_BYTES (20u * (sizeof(block_q8_K) + sizeof(iq2xxs_q8)) + \
     6u * (2304u * 4u + 9u * sizeof(block_q8_K) + 5120u * 4u))
-#define DS41_CPU_Q8K_THREAD_BYTES (2u * DS4_MOE_ROW_BLOCK * 20u * (QK_K + QK_K / 32u * 4u))
+#define DS41_CPU_Q8K_THREAD_BYTES (2u * DS4_MOE_ROW_BLOCK * 20u * (QK_K + QK_K / 32u * 4u + 4u))
 /* The query side's scratch of one pool thread (see
  * ds41_cpu_batch_attention_worker): the attended row list, the transposed
  * query, the head scores, the index scores and the top-k heap. */
@@ -344,8 +345,20 @@ static ds4_context_memory ds41_cpu_memory(uint32_t ctx) {
      * DS41_CPU_BATCH_COMP positions. */
     const uint64_t rounded = (uint64_t)DS41_CPU_BATCH + 128u +
         (ctx < DS41_CPU_BATCH_COMP ? ctx : DS41_CPU_BATCH_COMP);
+    /* moe_grouped_ffn's expert tiles of a chunk, at most the full tiles of
+     * its pairs and one partial tile per expert, each with the x16 copy of
+     * its 20 input superblocks (quants, scales and sums); the expert
+     * groups and the pair order. */
+    const uint64_t pairs = (uint64_t)DS41_CPU_BATCH * DS4_N_EXPERT_USED;
+    const uint64_t tiles = (pairs + (DS4_MOE_TILE - 1u) *
+                            (pairs < DS4_N_EXPERT ? pairs : (uint64_t)DS4_N_EXPERT)) / DS4_MOE_TILE;
+    const uint64_t tile_bytes = sizeof(ds4_moe_tile) + (DS4_MOE_X16 ? 20u *
+        (DS4_MOE_TILE_Q_STRIDE + DS4_MOE_TILE * sizeof(float) +
+         DS4_MOE_TILE_BS_STRIDE * sizeof(int16_t)) : 0u);
     memory.scratch_bytes = sizeof(ds41_cpu_state) + sizeof(ds41_cpu_attention_state) +
         (uint64_t)DS41_CPU_BATCH * (DS41_CPU_BATCH_TOKEN_BYTES + DS41_CPU_Q8K_TOKEN_BYTES) +
+        tiles * tile_bytes + (uint64_t)DS4_N_EXPERT * sizeof(moe_expert_tiles) +
+        pairs * sizeof(uint32_t) +
         (uint64_t)DS4_MAX_THREADS * DS41_CPU_Q8K_THREAD_BYTES +
         rounded * 512u * sizeof(float) +
         (uint64_t)DS4_N_VOCAB * (sizeof(uint32_t) + 2u * sizeof(float)) +
