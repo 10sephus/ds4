@@ -723,7 +723,7 @@ static uint32_t ds41_cpu_out_graph_stages(ds41_cpu_out_graph *gp, ds41_cpu_atten
         { .fn = attn_lanes_score_worker, .ctx = &g->lanes, .n_rows = scores,
           .group_rows = scores, .deps = (1u << 0) | (1u << 1) },
         { .fn = ds41_cpu_attention_weight_worker, .ctx = &g->lanes,
-          .n_rows = 64, .group_rows = 64, .deps = 1u << 2 },
+          .n_rows = 64, .group_rows = 64, .min_chunk = 16, .deps = 1u << 2 },
         { .fn = ds41_cpu_out_sum_worker, .ctx = g, .n_rows = sums, .group_rows = sums,
           .deps = 1u << 3 },
         { .fn = ds41_cpu_q8_bf16_worker, .ctx = &g->out_a, .n_rows = 8192 / 16,
