@@ -262,6 +262,12 @@ static void check_f16_round(void) {
     }
 }
 
+/* assert() of a value whose call must run with NDEBUG too. */
+static void ensure(bool ok) {
+    assert(ok);
+    (void)ok;
+}
+
 /* One chunk's Engram rows through ds41_cpu_engram_batch_take: hash the
  * tokens after *h into b->ids, take the read ahead or read them, and
  * compare the rows with a plain ds4_engram_read of every token's ids. */
@@ -270,16 +276,18 @@ static void engram_chunk(ds41_cpu_batch *b, const ds4_engram_layout *l, ds4_engr
                          bool ahead) {
     const size_t cols = DS4_ENGRAM_COLS, dim = DS4_ENGRAM_DIM;
     for (uint32_t i = 0; i < n; i++)
-        assert(ds4_engram_hash(l, h, &tokens[i], NULL, 1, b->ids + (size_t)i * 2u * cols));
+        ensure(ds4_engram_hash(l, h, &tokens[i], NULL, 1, b->ids + (size_t)i * 2u * cols));
     ds41_cpu_engram_batch own, *e = ds41_cpu_engram_batch_take(b, tab, n, &own);
     assert((e == &b->ahead) == ahead && !b->ahead_live);
-    assert(ds41_cpu_engram_batch_wait(e, 0) && ds41_cpu_engram_batch_wait(e, 1));
+    const bool read0 = ds41_cpu_engram_batch_wait(e, 0);
+    const bool read1 = ds41_cpu_engram_batch_wait(e, 1);
+    ensure(read0 && read1);
     ds41_cpu_engram_batch_finish(e, false);
     float *ref = malloc((size_t)n * 2u * cols * dim * sizeof(float));
     assert(ref);
     for (uint32_t t = 0; t < n; t++)
         for (uint32_t i = 0; i < 2; i++)
-            assert(ds4_engram_read(&tab[i], b->ids + ((size_t)t * 2u + i) * cols, cols,
+            ensure(ds4_engram_read(&tab[i], b->ids + ((size_t)t * 2u + i) * cols, cols,
                                    ref + ((size_t)t * 2u + i) * cols * dim));
     assert(!memcmp(ref, b->rows, (size_t)n * 2u * cols * dim * sizeof(float)));
     free(ref);
@@ -304,9 +312,12 @@ static void check_engram_read_ahead(void) {
     }
     assert(ds4_engram_layout_valid(&l));
     /* Two tables back to back; every row decodes (no NaN code, no 255 scale). */
-    char path[] = "/tmp/ds41-engram-XXXXXX";
+    const char *dir = getenv("TMPDIR");
+    if (!dir || !dir[0]) dir = "/tmp";
+    char path[4096];
+    ensure(snprintf(path, sizeof(path), "%s/ds41-engram-XXXXXX", dir) < (int)sizeof(path));
     const int fd = mkstemp(path);
-    assert(fd >= 0);
+    ensure(fd >= 0);
     for (uint32_t t = 0; t < 2; t++) {
         for (uint32_t r = 0; r < l.rows[t]; r++) {
             uint8_t row[DS4_ENGRAM_ROW_BYTES];
@@ -314,13 +325,14 @@ static void check_engram_read_ahead(void) {
                 row[j] = (uint8_t)((r * 7u + j * 13u + t * 5u) % 127u) | (uint8_t)((j & 1u) << 7);
             for (uint32_t k = 0; k < 8; k++)
                 row[DS4_ENGRAM_DIM + k] = (uint8_t)(120u + (r + k + t) % 12u);
-            assert(write(fd, row, sizeof(row)) == (ssize_t)sizeof(row));
+            ensure(write(fd, row, sizeof(row)) == (ssize_t)sizeof(row));
         }
     }
     ds4_engram_table tab[2];
-    assert(ds4_engram_table_open(&tab[0], path, 0, l.rows[0]));
-    assert(ds4_engram_table_open(&tab[1], path, (uint64_t)l.rows[0] * DS4_ENGRAM_ROW_BYTES,
+    ensure(ds4_engram_table_open(&tab[0], path, 0, l.rows[0]));
+    ensure(ds4_engram_table_open(&tab[1], path, (uint64_t)l.rows[0] * DS4_ENGRAM_ROW_BYTES,
                                  l.rows[1]));
+    /* The tables hold their own descriptors: the file goes now. */
     unlink(path);
     close(fd);
     enum { N = 80 };
