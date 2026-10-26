@@ -403,7 +403,9 @@ int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
-#if defined(DS4_NO_GPU) && defined(__AVX2__)
+/* The CPU backend's x86 SIMD blocks are guarded by DS4_NO_GPU, the V4.1
+ * CPU path's (ds4_deepseek41_cpu*.inc) are compiled in every build. */
+#if defined(__AVX2__) || defined(__AVX512F__)
 #include <immintrin.h>
 #endif
 #if defined(DS4_NO_GPU) && defined(__AVX512F__) && defined(__AVX512BW__)
@@ -9972,7 +9974,7 @@ static void head_rms_norm_inplace(float *x, uint32_t n_head, uint32_t head_dim, 
         const uint32_t n = n_head - h0 < GROUP ? n_head - h0 : GROUP;
         float *heads = x + (uint64_t)h0 * head_dim;
         double ss[GROUP] = { 0.0 };
-#if defined(__AVX512F__)
+#if defined(DS4_NO_GPU) && defined(__AVX512F__)
         /* One double lane per head: each 8x8 block of the eight heads is
          * transposed (as in dot_f16_rows) so that lane h still adds
          * (double)v * v for i = 0, 1, ... in order, with the same exact
@@ -14273,7 +14275,7 @@ static void hc_post_one(
         float *out = out_hc + (uint64_t)dst * n_embd;
         const float p = post[dst];
         uint32_t d0 = 0;
-#if defined(__AVX512F__)
+#if defined(DS4_NO_GPU) && defined(__AVX512F__)
         /* The four-stream case keeps each 16-element slice in a register
          * across the block term and all sources instead of storing and
          * reloading the row five times: same operations, same order. */
@@ -14400,7 +14402,7 @@ static void hc_post_sum_batch_worker(void *vctx, uint64_t t0, uint64_t t1) {
 
         for (uint32_t dst = 0; dst < ctx->n_hc; dst++) {
             uint32_t d0 = 0;
-#if defined(__AVX512F__)
+#if defined(DS4_NO_GPU) && defined(__AVX512F__)
             /* Four streams: sixteen elements at a time, each through the
              * scalar loop's operations in its order (the sum of the two
              * expert outputs times post, then the sources in order). */
