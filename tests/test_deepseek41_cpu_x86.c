@@ -1021,10 +1021,10 @@ static void check_routed_batch(uint32_t embd, uint32_t hidden, float clamp) {
     test_free(w);
 }
 
-#if defined(__AVX512F__) && defined(__AVX512BW__)
+#if defined(__AVX512F__)
 /* The vector expf against the C library's on every float, 2^16 patterns a
- * pool row, and the vector fmaxf against fmaxf(score, peak) called through
- * a pointer, as the scalar weight loop calls it. */
+ * pool row.  It needs AVX512F alone, like the V4 attention lanes that use
+ * it, so a build without BW still sweeps it. */
 static void check_expf_worker(void *vctx, uint64_t first, uint64_t last) {
     int *bad = vctx;
     float in[16] __attribute__((aligned(64))), out[16] __attribute__((aligned(64)));
@@ -1041,11 +1041,18 @@ static void check_expf_worker(void *vctx, uint64_t first, uint64_t last) {
     }
 }
 
-static void check_expf_fmaxf(void) {
+static void check_expf(void) {
     int bad = 0;
     ds4_parallel_for(1u << 16, check_expf_worker, &bad);
     ds4_threads_shutdown();
     CHECK(!bad);
+}
+#endif
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+/* The vector fmaxf against fmaxf(score, peak) called through a pointer, as
+ * the scalar weight loop calls it. */
+static void check_fmaxf(void) {
     const uint32_t specials[16] = {
         0x00000000u, 0x80000000u, 0x7f800000u, 0xff800000u, 0x7fc00000u, 0xffc00001u,
         0x7f800001u, 0xff800123u, 0x42b17217u, 0x42b17218u, 0xc2cff1b4u, 0xc2cff1b5u,
@@ -1191,13 +1198,16 @@ static void check_attention_weights(void) {
 
 int main(void) {
     const ds4_shape saved = g_ds4_shape;
+#if defined(__AVX512F__)
+    check_expf();
+#endif
 #if defined(__AVX512F__) && defined(__AVX512BW__)
     CHECK(pthread_once(&ds41_iq2xxs_once, ds41_iq2xxs_tables_init) == 0);
     check_half();
     check_iq2xxs_pair();
     check_q2k_pair();
     check_q4_tails();
-    check_expf_fmaxf();
+    check_fmaxf();
     check_swiglu16();
     check_index_scores();
     check_attention_scores();
