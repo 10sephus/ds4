@@ -18418,8 +18418,9 @@ static inline float indexer_score_lanes(const indexer_score_ctx *ctx, const __m5
 
 /* The scores of sixteen rows from their dot vectors dots[r * 64 + h], row r
  * in lane r: each lane runs indexer_score_lanes()'s sequence, the heads in
- * order, a negative dot (never NaN) replaced by zero, then the product with
- * the head weight added to the running score from +0.0f. */
+ * order, a dot below zero replaced by +0.0f (a NaN or -0.0f dot fails the
+ * ordered compare and is kept, as it fails the scalar dot < 0.0f), then the
+ * product with the head weight added to the running score from +0.0f. */
 static inline __m512 indexer_score_rows16(const indexer_score_ctx *ctx, const float *dots) {
     __m512 s = _mm512_setzero_ps();
     for (uint32_t g = 0; g < 4; g++) {
