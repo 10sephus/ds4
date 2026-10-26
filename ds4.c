@@ -18996,7 +18996,9 @@ static void layer_attention_raw_swa_batch(
     for (uint32_t t = 0; t < n_tok && ratio != 0; t++) {
         if ((pos0 + t + 1) % ratio == 0) n_seen++;
         comp_counts[t] = n_comp0 + n_seen;
-        if (ratio != 4) continue;
+        /* Up to top_k index rows the indexer allows every row, which an
+         * unset mask already says. */
+        if (ratio != 4 || n_index0 + n_seen <= DS4_N_INDEXER_TOP_K) continue;
         tx = profile ? now_sec() : 0.0;
         bool *comp_allowed = indexer_allowed_decode_one(model, layer,
                                                         attn_norm + (uint64_t)t * DS4_N_EMBD,
