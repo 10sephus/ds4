@@ -1166,7 +1166,11 @@ static void check_attention_scores(void) {
 }
 
 /* The sink softmax weights of 64 heads in head groups against the scalar
- * loop one head at a time, with -inf, huge and tiny scores. */
+ * loop one head at a time, with -inf, huge and tiny scores.  Heads 1, 5, 9,
+ * ... also see a quiet NaN with a payload in a few rows, heads 2, 6, 10, ...
+ * +inf, and heads 3, 7, 11, ... only non-positive scores with +0 and -0 rows
+ * and a signed-zero sink, so the peak is a tie of zeros; one sink is a NaN
+ * and one +inf.  The comparison is bitwise, NaN payloads included. */
 static void check_attention_weights(void) {
     const uint32_t rows[] = {1, 7, 16, 133, 640};
     for (size_t ri = 0; ri < sizeof(rows) / sizeof(*rows); ri++) {
@@ -1175,13 +1179,23 @@ static void check_attention_weights(void) {
         float *a = malloc(cells * sizeof(float)), *b = malloc(cells * sizeof(float));
         float sinks[64], inv_a[64], inv_b[64];
         CHECK(a && b);
+        const uint32_t qnan_bits = 0x7fc12345u;
+        float qnan;
+        memcpy(&qnan, &qnan_bits, sizeof(qnan));
         for (size_t i = 0; i < cells; i++) {
             const uint32_t pick = test_random() % 64;
+            const uint32_t h = (uint32_t)(i / (640u * 16u)) * 16u + (uint32_t)(i % 16u);
             a[i] = pick == 0 ? -INFINITY : pick == 1 ? -1.0e30f : pick == 2 ? 1.0e-40f :
                    test_float() * (pick < 8 ? 120.0f : 8.0f);
+            if (h % 4 == 1 && pick == 3) a[i] = qnan;
+            if (h % 4 == 2 && pick == 3) a[i] = INFINITY;
+            if (h % 4 == 3) a[i] = pick < 16 ? ((pick & 1) ? -0.0f : 0.0f) : -fabsf(a[i]);
         }
         memcpy(b, a, cells * sizeof(float));
-        for (int h = 0; h < 64; h++) sinks[h] = test_float() * 4.0f;
+        for (int h = 0; h < 64; h++)
+            sinks[h] = h % 4 == 3 ? ((h & 4) ? -0.0f : 0.0f) : test_float() * 4.0f;
+        sinks[17] = qnan;
+        sinks[22] = INFINITY;
         layer_attention_lanes_ctx ca = {.sinks = sinks, .score = a, .inv = inv_a, .n_head = 64,
                                         .score_stride = 640, .n_rows = n_rows};
         layer_attention_lanes_ctx cb = ca;
