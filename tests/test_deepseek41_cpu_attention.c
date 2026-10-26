@@ -295,8 +295,9 @@ static void engram_chunk(ds41_cpu_batch *b, const ds4_engram_layout *l, ds4_engr
 
 /* The next chunk's rows read ahead are the bytes its own ids read, a chunk
  * with other ids or another length stops the read ahead and reads its own,
- * an invalid token starts none, and a batch freed with reads in flight
- * joins them. */
+ * an invalid token starts none, a read ahead stopped (as an error, a reset
+ * or an interrupted prompt stops it) is joined and not taken, and a batch
+ * freed with reads in flight joins them. */
 static void check_engram_read_ahead(void) {
     static uint32_t map[256];
     for (uint32_t i = 0; i < 256; i++) map[i] = i / 2u;
@@ -369,6 +370,12 @@ static void check_engram_read_ahead(void) {
     const int bad[2] = {3, 256};
     ds41_cpu_engram_batch_ahead(b, &l, h, tab, bad, 2);
     assert(!b->ahead_live);
+    ds41_cpu_engram_batch_ahead(b, &l, h, tab, next, 70);
+    ds41_cpu_engram_ahead_stop(b);
+    assert(!b->ahead_live);
+    ds41_cpu_engram_ahead_stop(b);
+    h2 = h;
+    engram_chunk(b, &l, &h2, tab, next, 70, false);
     ds41_cpu_engram_batch_ahead(b, &l, h, tab, next, N);
     ds41_cpu_batch_free(b);
     ds4_engram_table_close(&tab[0]);

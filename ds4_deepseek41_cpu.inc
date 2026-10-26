@@ -371,6 +371,7 @@ static bool ds41_cpu_read_array(const ds4_model *m, const char *key,
 }
 
 static void ds41_cpu_batch_free(ds41_cpu_batch *b);
+static void ds41_cpu_engram_ahead_stop(ds41_cpu_batch *b);
 
 static void ds41_cpu_free(ds41_cpu_state *s) {
     if (!s) return;
@@ -385,6 +386,7 @@ static void ds41_cpu_free(ds41_cpu_state *s) {
 
 static void ds41_cpu_reset(ds41_cpu_state *s) {
     if (!s) return;
+    ds41_cpu_engram_ahead_stop(s->batch);
     s->pos = 0;
     s->valid = true;
     ds4_engram_history_reset(&s->history);
@@ -961,7 +963,7 @@ static void ds41_cpu_engram_batch_finish(ds41_cpu_engram_batch *e, bool stop);
 
 static void ds41_cpu_batch_free(ds41_cpu_batch *b) {
     if (!b) return;
-    if (b->ahead_live) ds41_cpu_engram_batch_finish(&b->ahead, true);
+    ds41_cpu_engram_ahead_stop(b);
     free(b->residual); free(b->after_attn); free(b->flat); free(b->x);
     free(b->norm); free(b->block); free(b->shared); free(b->pre);
     free(b->attn_split); free(b->ffn_split); free(b->qr); free(b->q);
@@ -1114,6 +1116,15 @@ static void ds41_cpu_engram_batch_finish(ds41_cpu_engram_batch *e, bool stop) {
     pthread_mutex_destroy(&e->mutex);
 }
 
+/* Stop and join the read ahead, if any: its rows serve only the batched
+ * chunk that follows, and an error, a reset, an interrupted prompt or the
+ * free means that chunk is not coming. */
+static void ds41_cpu_engram_ahead_stop(ds41_cpu_batch *b) {
+    if (!b || !b->ahead_live) return;
+    b->ahead_live = false;
+    ds41_cpu_engram_batch_finish(&b->ahead, true);
+}
+
 /* The readers of a chunk's rows, b->ids of n tokens: the read ahead when it
  * read these very ids, whose rows become b->rows (they are the bytes reading
  * the ids now returns), else own started on them once any other read ahead
@@ -1121,17 +1132,15 @@ static void ds41_cpu_engram_batch_finish(ds41_cpu_engram_batch *e, bool stop) {
 static ds41_cpu_engram_batch *ds41_cpu_engram_batch_take(ds41_cpu_batch *b,
                                                          const ds4_engram_table table[2],
                                                          uint32_t n, ds41_cpu_engram_batch *own) {
-    if (b->ahead_live) {
+    if (b->ahead_live && b->next_n == n &&
+        !memcmp(b->next_ids, b->ids, (size_t)n * 2u * DS4_ENGRAM_COLS * sizeof(*b->ids))) {
         b->ahead_live = false;
-        if (b->next_n == n &&
-            !memcmp(b->next_ids, b->ids, (size_t)n * 2u * DS4_ENGRAM_COLS * sizeof(*b->ids))) {
-            float *rows = b->rows;
-            b->rows = b->next_rows;
-            b->next_rows = rows;
-            return &b->ahead;
-        }
-        ds41_cpu_engram_batch_finish(&b->ahead, true);
+        float *rows = b->rows;
+        b->rows = b->next_rows;
+        b->next_rows = rows;
+        return &b->ahead;
     }
+    ds41_cpu_engram_ahead_stop(b);
     ds41_cpu_engram_batch_start(own, table, b->ids, b->rows, n);
     return own;
 }
@@ -1589,7 +1598,12 @@ static bool ds41_cpu_prefill_batched(uint32_t pos, uint32_t n) {
 static bool ds41_cpu_prefill(ds41_cpu_state *s, const int *tokens, uint32_t n,
                              const int *next, uint32_t next_n,
                              float *logits, char *error, size_t cap) {
-    if (!s || !s->valid) return ds41_cpu_error(error, cap, "invalid V4.1 CPU state; reset required");
+    if (!s) return ds41_cpu_error(error, cap, "invalid V4.1 CPU state; reset required");
+    /* A read ahead left by the previous chunk is taken below, or stopped
+     * by every other return. */
+    if (!s->valid || n > DS41_CPU_BATCH || n > s->ctx - s->pos ||
+        !ds41_cpu_prefill_batched(s->pos, n)) ds41_cpu_engram_ahead_stop(s->batch);
+    if (!s->valid) return ds41_cpu_error(error, cap, "invalid V4.1 CPU state; reset required");
     if (n > DS41_CPU_BATCH) return ds41_cpu_error(error, cap, "V4.1 CPU prefill chunk too large");
     if (n > s->ctx - s->pos) return ds41_cpu_error(error, cap, "V4.1 CPU context is full");
     if (!ds41_cpu_prefill_batched(s->pos, n)) {
@@ -1598,9 +1612,12 @@ static bool ds41_cpu_prefill(ds41_cpu_state *s, const int *tokens, uint32_t n,
                 return false;
         return true;
     }
-    for (uint32_t i = 0; i < n; i++)
-        if (tokens[i] < 0 || (uint32_t)tokens[i] >= DS4_N_VOCAB)
+    for (uint32_t i = 0; i < n; i++) {
+        if (tokens[i] < 0 || (uint32_t)tokens[i] >= DS4_N_VOCAB) {
+            ds41_cpu_engram_ahead_stop(s->batch);
             return ds41_cpu_error(error, cap, "V4.1 CPU token is outside vocabulary");
+        }
+    }
     if (!s->batch && !(s->batch = ds41_cpu_batch_create(s->ctx)))
         return ds41_cpu_error(error, cap, "cannot allocate V4.1 CPU prefill batch");
     ds41_cpu_batch *b = s->batch;
@@ -1610,8 +1627,10 @@ static bool ds41_cpu_prefill(ds41_cpu_state *s, const int *tokens, uint32_t n,
     ds4_engram_history history = s->history;
     for (uint32_t i = 0; i < n; i++)
         if (!ds4_engram_hash(&s->engram, &history, &tokens[i], NULL, 1,
-                             b->ids + (size_t)i * 2u * DS4_ENGRAM_COLS))
+                             b->ids + (size_t)i * 2u * DS4_ENGRAM_COLS)) {
+            ds41_cpu_engram_ahead_stop(b);
             return ds41_cpu_error(error, cap, "V4.1 Engram hash failed");
+        }
     ds41_cpu_engram_batch own, *rows = ds41_cpu_engram_batch_take(b, s->table, n, &own);
     double read_seconds = profile ? now_sec() - started : 0;
     for (uint32_t i = 0; i < n; i++) {
@@ -1642,6 +1661,7 @@ static bool ds41_cpu_prefill(ds41_cpu_state *s, const int *tokens, uint32_t n,
             ds41_cpu_engram_batch_ahead(b, &s->engram, history, s->table, next, next_n);
         if (!ds41_cpu_prefill_layer(s, il, n, profile ? phase : NULL)) {
             if (il < 14) ds41_cpu_engram_batch_finish(rows, true);
+            ds41_cpu_engram_ahead_stop(b);
             pf_bufs_free();
             s->valid = false;
             if (error && cap) snprintf(error, cap, "V4.1 CPU prefill layer %u failed at token position %u", il, s->pos);
@@ -1653,6 +1673,7 @@ static bool ds41_cpu_prefill(ds41_cpu_state *s, const int *tokens, uint32_t n,
     memcpy(s->pre, b->pre + (size_t)(n - 1u) * 4u, sizeof(s->pre));
     const double head_started = profile ? now_sec() : 0;
     if (logits && !ds41_cpu_logits(s, logits)) {
+        ds41_cpu_engram_ahead_stop(b);
         s->valid = false;
         return ds41_cpu_error(error, cap, "V4.1 CPU output projection failed");
     }

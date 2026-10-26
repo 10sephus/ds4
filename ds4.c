@@ -80890,6 +80890,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         s->mtp_draft_valid = false;
         for (int i = s->checkpoint.len; i < prompt->len;) {
             if (ds4_session_cancelled(s)) {
+                ds41_cpu_engram_ahead_stop(g->batch);
                 snprintf(err, errlen, "interrupted");
                 return DS4_SESSION_SYNC_INTERRUPTED;
             }
