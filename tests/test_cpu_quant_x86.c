@@ -2533,6 +2533,71 @@ static void check_attn_graph(void) {
     g_ds4_shape = saved;
 }
 
+/* The per-token attention over raw SWA rows plus optional compressed rows,
+ * the oracle of layer_attention_prefix_batch().  Ratio-4 layers pass an
+ * indexer mask to hide compressed rows not selected for this token. */
+static void layer_attention_mixed_one(
+        float             * out_heads,
+        const ds4_model   * model,
+        const ds4_layer_weights * layer,
+        const float       * q,
+        const float       * raw_kv,
+        uint32_t            n_raw,
+        const float       * comp_kv,
+        uint32_t            n_comp,
+        const bool        * comp_allowed) {
+    const float *sinks = tensor_data(model, layer->attn_sinks);
+    const float kq_scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
+    const uint32_t n_total = n_raw + n_comp;
+    float score_stack[512];
+    float *score = n_total <= 512 ? score_stack : xmalloc((size_t)n_total * sizeof(score[0]));
+
+    for (uint32_t h = 0; h < DS4_N_HEAD; h++) {
+        const float *qh = q + (uint64_t)h * DS4_N_HEAD_DIM;
+        float max_score = sinks[h];
+        uint32_t idx = 0;
+
+        for (uint32_t r = 0; r < n_raw; r++, idx++) {
+            const float *kv = raw_kv + (uint64_t)r * DS4_N_HEAD_DIM;
+            score[idx] = dot_f32(qh, kv, DS4_N_HEAD_DIM) * kq_scale;
+            if (score[idx] > max_score) max_score = score[idx];
+        }
+        for (uint32_t r = 0; r < n_comp; r++, idx++) {
+            if (comp_allowed && !comp_allowed[r]) {
+                score[idx] = DS4_NEG_INF;
+                continue;
+            }
+            const float *kv = comp_kv + (uint64_t)r * DS4_N_HEAD_DIM;
+            score[idx] = dot_f32(qh, kv, DS4_N_HEAD_DIM) * kq_scale;
+            if (score[idx] > max_score) max_score = score[idx];
+        }
+
+        float *oh = out_heads + (uint64_t)h * DS4_N_HEAD_DIM;
+        memset(oh, 0, (size_t)DS4_N_HEAD_DIM * sizeof(oh[0]));
+
+        float denom = expf(sinks[h] - max_score);
+        idx = 0;
+        for (uint32_t r = 0; r < n_raw; r++, idx++) {
+            const float weight = expf(score[idx] - max_score);
+            const float *kv = raw_kv + (uint64_t)r * DS4_N_HEAD_DIM;
+            denom += weight;
+            axpy_f32(oh, kv, weight, DS4_N_HEAD_DIM);
+        }
+        for (uint32_t r = 0; r < n_comp; r++, idx++) {
+            if (score[idx] <= DS4_NEG_INF * 0.5f) continue;
+            const float weight = expf(score[idx] - max_score);
+            const float *kv = comp_kv + (uint64_t)r * DS4_N_HEAD_DIM;
+            denom += weight;
+            axpy_f32(oh, kv, weight, DS4_N_HEAD_DIM);
+        }
+
+        const float inv = 1.0f / denom;
+        scale_f32(oh, inv, DS4_N_HEAD_DIM);
+    }
+
+    if (score != score_stack) free(score);
+}
+
 /* Prefix prefill attention must match the per-token attention each token
  * would run against its raw window and the compressed rows pushed so far,
  * with and without an indexer mask, for a fresh prompt and for one that
