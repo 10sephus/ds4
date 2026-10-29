@@ -1111,7 +1111,10 @@ static void check_swiglu16(void) {
                 }
                 /* With weight 1 the shared expert's swiglu: silu(g) * u alone. */
                 const float ref = weight == 1.0f ? silu(gg) * uu : silu(gg) * uu * weight;
-                CHECK(memcmp(&ref, &out[k], sizeof(ref)) == 0);
+                /* g = -inf with u = NaN makes NaN on both sides, with the
+                 * payload of whichever operand the compiler put first: clang
+                 * commutes the multiply, so compare NaN results as NaN. */
+                CHECK(memcmp(&ref, &out[k], sizeof(ref)) == 0 || (isnan(ref) && isnan(out[k])));
             }
         }
     }
