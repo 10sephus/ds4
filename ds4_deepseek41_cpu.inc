@@ -40,6 +40,12 @@ static void ds41_prof(int phase) {
     ds41_prof_phase = phase;
 }
 
+/* The bytes the decode reads for one routed expert of a layer. */
+static uint64_t ds41_cpu_routed_expert_bytes(const ds4_layer_weights *l) {
+    return (l->ffn_gate_exps->bytes + l->ffn_up_exps->bytes + l->ffn_down_exps->bytes) /
+        DS4_N_EXPERT;
+}
+
 static bool ds41_cpu_matvec(float *out, const ds4_model *m,
                            const ds4_tensor *weight, const float *in, bool round) {
     if (!out || !m || !weight || !in || weight->ndim < 2 ||
@@ -416,9 +422,7 @@ static bool ds41_cpu_moe(ds41_cpu_state *s, const ds4_layer_weights *l) {
      * routing weights before down projection. Shared experts round to BF16. */
     ds41_prof(DS41_PROF_ROUTED);
     if (ds41_prof_on)
-        ds41_prof_bytes[DS41_PROF_ROUTED] += DS4_N_EXPERT_USED *
-            ((l->ffn_gate_exps->bytes + l->ffn_up_exps->bytes +
-              l->ffn_down_exps->bytes) / DS4_N_EXPERT);
+        ds41_prof_bytes[DS41_PROF_ROUTED] += DS4_N_EXPERT_USED * ds41_cpu_routed_expert_bytes(l);
     ds41_cpu_routed_moe(s->block, s->expert_mid, s->model, l,
                        s->norm, selected, expert_weight);
     for (uint32_t i = 0; i < 5120; i++) s->block[i] = ds41_cpu_bf16(s->block[i] + s->shared[i]);
@@ -531,8 +535,7 @@ static void ds41_cpu_ffn_graph_run(ds41_cpu_state *s, const ds4_layer_weights *l
     if (ds41_prof_on)
         ds41_prof_bytes[DS41_PROF_FFN] += l->hc_ffn_fn->bytes + l->ffn_gate_inp->bytes +
             l->ffn_gate_shexp->bytes + l->ffn_up_shexp->bytes + l->ffn_down_shexp->bytes +
-            DS4_N_EXPERT_USED * ((l->ffn_gate_exps->bytes + l->ffn_up_exps->bytes +
-                                  l->ffn_down_exps->bytes) / DS4_N_EXPERT);
+            DS4_N_EXPERT_USED * ds41_cpu_routed_expert_bytes(l);
 }
 #endif
 
