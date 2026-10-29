@@ -2503,7 +2503,11 @@ static void check_attn_graph(void) {
                 attn_test_equal("attention graph HC post", hc0, scratch.after_attn_hc, hc_dim);
                 if (indexed) {
                     attn_test_equal("attention graph indexer query", iq0, scratch.index_q, IH * ID);
+#if defined(__AVX512F__)
+                    /* Only the AVX-512 scoring kernel reads the transposed
+                     * query; attn_lanes_transpose_q() writes nothing else. */
                     attn_test_equal("attention graph indexer query transpose", iqt0, scratch.index_qt, IH * ID);
+#endif
                     attn_test_equal("attention graph indexer scores", isc0, scratch.index_scores, n_index);
                 }
                 attn_test_cache_equal(&ca[r], &cb[r]);
