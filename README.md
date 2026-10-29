@@ -23,6 +23,9 @@ The repository also includes tools and data for GGUF, imatrix, quality, and spee
 * **Metal**, the primary target, on Macs with 64 GB (for Qwen Flash next) and 96 GB or more (for DeepSeek and GLM). Smaller machines can use SSD streaming. SSD streaming is also needed in order to run very large models such as full GLM 5.x (not Flash) on 128GB systems.
 * **NVIDIA CUDA**, the DGX Spark is our main gaol. DwarfStar also supports multi-GPU systems that are not supported by other backends, for instance it can run DeepSeek v4 Flash on Ada Lovelace cards.
 * **ROCm** on Strix Halo systems such as the Framework Desktop.
+* **CPU only** on x86-64 Linux as a reference path, with AVX-512 kernels that
+  reach about 10 tokens/s for Flash Q2 on a dual-socket Xeon; see
+  [CPU inference](docs/CPU.md).
 
 This project would not exist without **llama.cpp and GGML**, make sure to read
 the acknowledgements section, a big thank you to Georgi Gerganov and all the
@@ -256,6 +259,7 @@ DGX Spark results, comparison conditions, and benchmark commands.
 - [Serving](docs/SERVER.md): APIs, images, batching, and disk KV caches.
 - [Coding agent clients](docs/CLIENTS.md): Pi, OpenCode, Codex CLI, and Claude Code.
 - [Performance](docs/PERFORMANCE.md): reproducible measurements and recorded baselines.
+- [CPU inference](docs/CPU.md): the x86-64 reference path, threads, NUMA, and its arithmetic.
 - [Testing and development](docs/TESTING.md): regression tests, debugging, and model-building tools.
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before sending a pull request.
