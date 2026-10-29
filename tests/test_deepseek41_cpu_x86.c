@@ -231,9 +231,26 @@ static void check_half(void) {
     }
 }
 
+/* Equal bits, or both NaN: a NaN activation's payload may be any of the
+ * NaNs the operation order produces. */
+static void test_equal_nan(const char *what, const float *a, const float *b, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        uint32_t aa, bb;
+        memcpy(&aa, a + i, sizeof(aa));
+        memcpy(&bb, b + i, sizeof(bb));
+        if (aa != bb && !(isnan(a[i]) && isnan(b[i]))) {
+            fprintf(stderr, "%s[%zu]: %08x != %08x (%g != %g)\n",
+                    what, i, aa, bb, a[i], b[i]);
+            exit(1);
+        }
+    }
+}
+
 /* The IQ2_XXS pair kernel against the scalar dot, row by row: every grid
  * index and every sign index in each of the four positions of a sub-block,
- * all scale nibbles, edge-case F16 scales and signed zero activations. */
+ * all scale nibbles, edge-case F16 scales, signed zero and subnormal
+ * activations, then NaN and infinite activations (equal up to the NaN
+ * payload). */
 static void check_iq2xxs_pair(void) {
     const uint64_t k = 5120, rows = 64, stride = k / QK_K * sizeof(block_iq2_xxs);
     test_buffer g = test_alloc(rows * stride), u = test_alloc(rows * stride);
@@ -242,6 +259,7 @@ static void check_iq2xxs_pair(void) {
     for (uint64_t i = 0; i < k; i++) {
         x[i] = test_float();
         if (test_random() % 61 == 0) x[i] = (test_random() & 1) ? -0.0f : 0.0f;
+        if (test_random() % 89 == 0) x[i] = (test_random() & 1) ? 1.0e-40f : -3.0e-42f;
     }
     uint32_t n = 0;
     for (unsigned m = 0; m < 2; m++) {
@@ -261,28 +279,43 @@ static void check_iq2xxs_pair(void) {
             }
         }
     }
-    for (uint64_t row = 0; row < rows; row += 16) {
-        __m512 sums[2];
-        float a[2][16], b[2][16];
-        ds41_cpu_iq2xxs_pair16(sums, g.data + row * stride, stride,
-                               u.data + row * stride, stride, x, k);
-        _mm512_storeu_ps(b[0], sums[0]);
-        _mm512_storeu_ps(b[1], sums[1]);
-        for (unsigned lane = 0; lane < 16; lane++) {
-            a[0][lane] = ds4_vec_dot_iq2_xxs_f32((int)k,
-                (const block_iq2_xxs *)(g.data + (row + lane) * stride), x);
-            a[1][lane] = ds4_vec_dot_iq2_xxs_f32((int)k,
-                (const block_iq2_xxs *)(u.data + (row + lane) * stride), x);
+    for (int round = 0; round < 2; round++) {
+        if (round) {
+            /* NaN, infinite and signaling-NaN activations. */
+            for (uint64_t i = 0; i < k; i += 97) x[i] = (i & 1) ? -INFINITY : INFINITY;
+            for (uint64_t i = 3; i < k; i += 131) x[i] = NAN;
+            const uint32_t snan = 0x7f800001u;
+            memcpy(&x[5], &snan, sizeof(snan));
         }
-        test_equal("IQ2_XXS pair gate", a[0], b[0], 16);
-        test_equal("IQ2_XXS pair up", a[1], b[1], 16);
+        for (uint64_t row = 0; row < rows; row += 16) {
+            __m512 sums[2];
+            float a[2][16], b[2][16];
+            ds41_cpu_iq2xxs_pair16(sums, g.data + row * stride, stride,
+                                   u.data + row * stride, stride, x, k);
+            _mm512_storeu_ps(b[0], sums[0]);
+            _mm512_storeu_ps(b[1], sums[1]);
+            for (unsigned lane = 0; lane < 16; lane++) {
+                a[0][lane] = ds4_vec_dot_iq2_xxs_f32((int)k,
+                    (const block_iq2_xxs *)(g.data + (row + lane) * stride), x);
+                a[1][lane] = ds4_vec_dot_iq2_xxs_f32((int)k,
+                    (const block_iq2_xxs *)(u.data + (row + lane) * stride), x);
+            }
+            if (round) {
+                test_equal_nan("IQ2_XXS pair gate (NaN)", a[0], b[0], 16);
+                test_equal_nan("IQ2_XXS pair up (NaN)", a[1], b[1], 16);
+            } else {
+                test_equal("IQ2_XXS pair gate", a[0], b[0], 16);
+                test_equal("IQ2_XXS pair up", a[1], b[1], 16);
+            }
+        }
     }
     test_free(xb); test_free(u); test_free(g);
 }
 
 /* The Q2_K pair kernel against the scalar dot, row by row, two matrices
  * with their own inputs: random quants and scale bytes, edge-case F16 d and
- * dmin, signed zero activations. */
+ * dmin, signed zero and subnormal activations, then NaN and infinite
+ * activations (equal up to the NaN payload). */
 static void check_q2k_pair(void) {
     const uint64_t k = 2304, rows = 48, stride = k / QK_K * sizeof(block_q2_K);
     test_buffer w0 = test_alloc(rows * stride), w1 = test_alloc(rows * stride);
@@ -291,24 +324,36 @@ static void check_q2k_pair(void) {
     for (uint64_t i = 0; i < 2 * k; i++) {
         x[i] = test_float();
         if (test_random() % 61 == 0) x[i] = (test_random() & 1) ? -0.0f : 0.0f;
+        if (test_random() % 89 == 0) x[i] = (test_random() & 1) ? 1.0e-40f : -3.0e-42f;
     }
     test_fill_quants(w0.data, rows * stride, DS4_TENSOR_Q2_K);
     test_fill_quants(w1.data, rows * stride, DS4_TENSOR_Q2_K);
-    for (uint64_t row = 0; row < rows; row += 16) {
-        __m512 sums[2];
-        float a[2][16], b[2][16];
-        ds41_cpu_q2k_pair16(sums, w0.data + row * stride, stride, x,
-                            w1.data + row * stride, stride, x + k, k);
-        _mm512_storeu_ps(b[0], sums[0]);
-        _mm512_storeu_ps(b[1], sums[1]);
-        for (unsigned lane = 0; lane < 16; lane++) {
-            a[0][lane] = ds4_vec_dot_q2_K_f32((int)k,
-                (const block_q2_K *)(w0.data + (row + lane) * stride), x);
-            a[1][lane] = ds4_vec_dot_q2_K_f32((int)k,
-                (const block_q2_K *)(w1.data + (row + lane) * stride), x + k);
+    for (int round = 0; round < 2; round++) {
+        if (round) {
+            for (uint64_t i = 0; i < 2 * k; i += 97) x[i] = (i & 1) ? -INFINITY : INFINITY;
+            for (uint64_t i = 3; i < 2 * k; i += 131) x[i] = NAN;
         }
-        test_equal("Q2_K pair 0", a[0], b[0], 16);
-        test_equal("Q2_K pair 1", a[1], b[1], 16);
+        for (uint64_t row = 0; row < rows; row += 16) {
+            __m512 sums[2];
+            float a[2][16], b[2][16];
+            ds41_cpu_q2k_pair16(sums, w0.data + row * stride, stride, x,
+                                w1.data + row * stride, stride, x + k, k);
+            _mm512_storeu_ps(b[0], sums[0]);
+            _mm512_storeu_ps(b[1], sums[1]);
+            for (unsigned lane = 0; lane < 16; lane++) {
+                a[0][lane] = ds4_vec_dot_q2_K_f32((int)k,
+                    (const block_q2_K *)(w0.data + (row + lane) * stride), x);
+                a[1][lane] = ds4_vec_dot_q2_K_f32((int)k,
+                    (const block_q2_K *)(w1.data + (row + lane) * stride), x + k);
+            }
+            if (round) {
+                test_equal_nan("Q2_K pair 0 (NaN)", a[0], b[0], 16);
+                test_equal_nan("Q2_K pair 1 (NaN)", a[1], b[1], 16);
+            } else {
+                test_equal("Q2_K pair 0", a[0], b[0], 16);
+                test_equal("Q2_K pair 1", a[1], b[1], 16);
+            }
+        }
     }
     test_free(xb); test_free(w1); test_free(w0);
 }
