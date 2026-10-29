@@ -2163,11 +2163,16 @@ typedef void (*ds4_parallel_fn)(void *ctx, uint64_t row0, uint64_t row1);
  * a polling worker picks the next one up for the cost of a cache miss instead
  * of a futex round trip.  The bound covers the serial hyper-connection and
  * norm work between dispatches (a few hundred microseconds); the condvar
- * still frees the core across the serial attention loop and between tokens. */
+ * still frees the core across the serial attention loop and between tokens.
+ * The GPU builds run only small helpers on the pool and park at once. */
+#if defined(DS4_NO_GPU)
 #define DS4_POOL_SPIN_US 1000
+#else
+#define DS4_POOL_SPIN_US 0
+#endif
 
 /* NUMA topology of the CPUs this process may run on.  On a two-socket host
- * the pool splits every row range between the sockets and keeps each worker
+ * the CPU-only build splits every row range between the sockets and keeps each worker
  * on its home socket, so weights placed by model_place_weights() stream over
  * the local memory controller instead of the interconnect.  One node (or a
  * cpuset inside one node), more than two nodes, and DS4_NUMA=0 run the plain
@@ -2503,7 +2508,7 @@ static void *ds4_worker_main(void *arg) {
     }
 }
 
-#if defined(__linux__)
+#if defined(__linux__) && defined(DS4_NO_GPU)
 static int ds4_cpu_topology_id(int cpu, const char *name) {
     char path[96];
     snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%d/topology/%s", cpu, name);
@@ -2580,8 +2585,13 @@ static void ds4_numa_init(void) {}
 
 /* One thread per physical core this process may run on.  A hyperthread
  * sibling adds nothing to a bandwidth-bound matvec, and more polling threads
- * than free cores would cost more than the condvar pool they replaced. */
+ * than free cores would cost more than the condvar pool they replaced.  The
+ * GPU builds keep a dozen threads for their helpers. */
 static uint32_t ds4_default_threads(void) {
+#if !defined(DS4_NO_GPU)
+    const long online = sysconf(_SC_NPROCESSORS_ONLN);
+    return online > 0 && online < 12 ? (uint32_t)online : 12;
+#else
     uint32_t cores = 0;
     uint32_t cpus = 0;
 #if defined(__linux__)
@@ -2603,6 +2613,7 @@ static uint32_t ds4_default_threads(void) {
     }
     if (cpus > 0 && cores > cpus) cores = cpus;
     return cores < DS4_MAX_THREADS ? cores : DS4_MAX_THREADS;
+#endif
 }
 
 /* Create the persistent CPU worker pool.  Decode reuses these threads instead
